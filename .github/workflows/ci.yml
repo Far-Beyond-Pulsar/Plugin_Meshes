@@ -2,7 +2,7 @@ name: CI
 
 # This plugin builds as part of the Pulsar-Native workspace: its crates use
 # `workspace = true` dependencies and Helio comes from Pulsar's submodule. CI
-# checks out Pulsar-Native's main with its submodules, puts this commit at the
+# checks out Pulsar-Native with its submodules, puts this commit at the
 # path Pulsar vendors the plugin under, and checks this plugin's own packages
 # the way Pulsar's CI checks its own (rustfmt, clippy, nextest's `ci` profile,
 # which leaves out the suites that render real frames).
@@ -48,9 +48,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
+      # A change that spans repositories uses one branch name in each (the
+      # rewrite's batches are rewrite/pN-* everywhere): build against
+      # Pulsar-Native's branch of the same name when it has one, so its pins
+      # (Helio, the other plugins) match; otherwise against its main.
+      - name: Pick the Pulsar-Native branch
+        id: pulsar
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          if git ls-remote --exit-code --heads https://github.com/Far-Beyond-Pulsar/Pulsar-Native "refs/heads/$BRANCH" > /dev/null; then
+            echo "ref=$BRANCH" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: Far-Beyond-Pulsar/Pulsar-Native
+          ref: ${{ steps.pulsar.outputs.ref }}
           submodules: recursive
           persist-credentials: false
           path: pulsar
