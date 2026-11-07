@@ -34,7 +34,6 @@ outdoor_volcano     = []
 space_station       = []
 light_benchmark     = []
 hlfs_benchmark      = []
-sdf_demo            = ["dep:helio-pass-sdf"]
 vhs_backrooms       = ["dep:helio-pass-postprocess"]
 load_fbx            = []
 load_fbx_embedded   = []
@@ -63,7 +62,6 @@ helio-core          = { workspace = true }
 helio-presets = { workspace = true }
 helio-asset-compat  = { workspace = true }
 pulsar_scenedb      = { workspace = true }
-helio-pass-sdf      = { workspace = true, optional = true }
 helio-pass-fxaa     = { workspace = true, optional = true }
 helio-pass-postprocess = { workspace = true, optional = true }
 wgpu                = { workspace = true }

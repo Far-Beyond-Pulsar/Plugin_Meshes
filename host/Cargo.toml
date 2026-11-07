@@ -13,7 +13,6 @@ gpu = []
 [dependencies]
 helio-light-host = { workspace = true }
 helio-light-api = { workspace = true }
-helio-scene-derivations = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 glam = { workspace = true }
 helio = { workspace = true }
