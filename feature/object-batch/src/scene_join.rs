@@ -41,7 +41,7 @@ pub use helio_core::{
 };
 
 pub use helio_scene_join::{
-    join_source, GENERATION_ROW_BYTES, HIDDEN_ROW_BYTES, MESH_BOUNDS_ROW_BYTES, OWNER_ROW_BYTES,
+    join_source, GENERATION_ROW_BYTES, HIDDEN_ROW_BYTES, OWNER_BOUNDS_ROW_BYTES, OWNER_ROW_BYTES,
     TRANSFORM_ROW_BYTES,
 };
 use helio_scene_join::{origin_bits, origin_pair};
@@ -672,7 +672,7 @@ impl SceneDerivation for SceneJoin {
         let world_transforms = self.input(inputs, keys.transforms, TRANSFORM_ROW_BYTES);
         let vertex_handles = self.input(inputs, keys.vertex_handles, HANDLE_ROW_BYTES);
         let index_handles = self.input(inputs, keys.index_handles, HANDLE_ROW_BYTES);
-        let mesh_bounds = self.input(inputs, keys.mesh_bounds, MESH_BOUNDS_ROW_BYTES);
+        let mesh_bounds = self.input(inputs, keys.mesh_bounds, OWNER_BOUNDS_ROW_BYTES);
         let mesh_flags = self.input(inputs, keys.mesh_flags, MESH_FLAGS_ROW_BYTES);
         let section_handles = self.input(inputs, keys.section_handles, HANDLE_ROW_BYTES);
         let skin_handles = self.input(inputs, keys.skin_handles, HANDLE_ROW_BYTES);

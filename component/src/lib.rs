@@ -375,7 +375,7 @@ mod tests {
             size_of::<super::MeshSectionDraw>() as u64,
             join::MESH_SECTION_ROW_BYTES
         );
-        assert_eq!(size_of::<[f32; 4]>() as u64, join::MESH_BOUNDS_ROW_BYTES);
+        assert_eq!(size_of::<[f32; 4]>() as u64, join::OWNER_BOUNDS_ROW_BYTES);
         assert_eq!(size_of::<u32>() as u64, join::MESH_FLAGS_ROW_BYTES);
         assert_eq!(
             size_of::<helio_mats::instance::MaterialKeyComponent>() as u64,

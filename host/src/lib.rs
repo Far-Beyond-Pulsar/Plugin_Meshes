@@ -16,6 +16,7 @@
 
 pub mod ray_proxies;
 pub mod ray_tracing;
+pub mod texture_means;
 /// The meshes' row components (helio-mesh-api's `host_rows`, where
 /// their rows are defined).
 pub use helio_mesh_api::host_rows::{MeshComponent, RenderGroupComponent, StaticObjectComponent};

@@ -27,6 +27,9 @@ mod pack;
 mod partition;
 mod reader;
 mod simplify;
+// meshopt's C++ allocator on wasm32 (no C++ standard library there).
+#[cfg(target_arch = "wasm32")]
+mod wasm_cpp_alloc;
 
 pub use dag::{build_dag, ClusterNode, Dag, Group, NONE};
 pub use file::{

@@ -23,9 +23,11 @@ impl Feature for ShadowDrawers {
     }
 
     fn register(&self, registrar: &mut FeatureRegistrar<'_>) {
-        // What shader hot reload may swap without rebuilding the graph.
+        // What shader hot reload may swap without rebuilding the graph: the
+        // dirty pass holds the lights' dirty flags (whose passes declare the
+        // same handle) and shares its face buffers with the shadow pass.
+        registrar.swap_shares::<LightDirtyFlags, ShadowDirtyPass>();
         registrar.swap_group(&[
-            helio_core::graph::type_name_of::<helio_pass_shadow_matrix::ShadowMatrixPass>(),
             helio_core::graph::type_name_of::<ShadowDirtyPass>(),
             helio_core::graph::type_name_of::<ShadowPass>(),
         ]);

@@ -51,7 +51,7 @@ draw phases and api crates.
 - **Requires**: nothing. A project enables or disables the plugin in its
   `Pulsar.toml` (`[plugins]`); disabled, the kind is absent and the frame
   draws without it.
-- **Reads other kinds through**: `helio-light-api, helio-pass-shadow-matrix` (lights); `helio-mats` (materials).
+- **Reads other kinds through**: `helio-light-api` (lights); `helio-mats` (materials).
 - **Its standalone hosts also compose**: `helio-light-api, helio-light-host, helio-pass-billboard, helio-pass-deferred-light, helio-pass-hlfs, helio-pass-light-cull` (lights); `helio-mats, helio-pass-materials` (materials) (demos and GPU tests
   draw a whole scene; the plugin itself does not depend on these).
 

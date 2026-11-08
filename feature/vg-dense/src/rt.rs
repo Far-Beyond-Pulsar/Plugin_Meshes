@@ -690,7 +690,7 @@ impl DenseRtPass {
         let tlas_inputs: Vec<TlasInstanceInput> = chosen
             .iter()
             .map(|&(ri, l, _)| TlasInstanceInput {
-                mesh_id: proxy_mesh_id(requests[ri].asset_key, l),
+                geometry_id: proxy_mesh_id(requests[ri].asset_key, l),
                 transform: requests[ri].transform,
             })
             .collect();

@@ -152,7 +152,7 @@ pub struct SceneDbRayTracing {
     changes: Vec<ComponentChange>,
     /// Base colour textures' means: a hit's colour is its material's factor
     /// times its texture's mean.
-    texture_means: helio_scene_derivations::texture_means::TextureMeans,
+    texture_means: crate::texture_means::TextureMeans,
 }
 impl SceneDbRayTracing {
     /// The scene's shadow casters, all of them: an object the projection
@@ -178,7 +178,7 @@ impl SceneDbRayTracing {
     fn with_partial(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, partial: bool) -> Self {
         Self {
             untraced: Vec::new(),
-            texture_means: helio_scene_derivations::texture_means::TextureMeans::new(&device),
+            texture_means: crate::texture_means::TextureMeans::new(&device),
             blas: BlasManager::new(device.clone()),
             tlas: TlasManager::new(device.clone(), 1),
             device,
@@ -688,7 +688,7 @@ impl SceneDbRayTracing {
             self.caster_slots.insert(object_entity, self.casters.len());
             self.casters.push((object_entity, CasterKey::of(object)));
             instances.push(TlasInstanceInput {
-                mesh_id: id,
+                geometry_id: id,
                 transform: tlas_transform(object),
             });
         }

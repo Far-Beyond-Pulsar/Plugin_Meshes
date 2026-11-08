@@ -256,7 +256,7 @@ impl RenderPass for VgShadePass {
                 .map_or(0, |lights| lights.row_capacity()),
             ambient_intensity,
             ambient_color,
-            csm_splits: helio_pass_shadow_matrix_splits(),
+            csm_splits: helio_light_api::CSM_SPLITS,
             debug_mode: self.debug_mode,
             screen_width: ctx.width as f32,
             screen_height: ctx.height as f32,
@@ -379,9 +379,4 @@ impl RenderPass for VgShadePass {
         );
         Ok(())
     }
-}
-
-/// The classic G-buffer's cascade splits (`helio_light_api::CSM_SPLITS`).
-fn helio_pass_shadow_matrix_splits() -> [f32; 4] {
-    helio_light_api::CSM_SPLITS
 }
