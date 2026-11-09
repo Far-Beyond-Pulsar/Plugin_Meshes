@@ -523,13 +523,13 @@ fn choose_bin(tris: u32, ic: InstCtx, cw: vec3<f32>, rw: f32, key: u32) -> u32 {
     if lock == 1u { return hw_bin; }
     if lock == 2u { return VGC_BIN_SW; }
     if lock == 3u { return VGC_BIN_DENSE; }
-    // Hysteresis on the SW/HW edge test: a cluster that was software last frame
-    // stays so until its edge exceeds the threshold by `VGC_EDGE_HYST`, and a
-    // hardware one only turns software below it by the same margin.
+    // Hysteresis on the SW/HW edge test: a cluster becomes software at `sw_edge_px`
+    // (the stateless rule) and one that was software last frame stays so until its
+    // edge exceeds the threshold by `VGC_EDGE_HYST`.
     let edge = VGC_EDGE_FACTOR * r_px / sqrt(f32(max(tris, 1u)));
     let sw_key = vg_hash(key, SALT_SW);
     let was_sw = hyst_test(sw_key);
-    if edge <= params.sw_edge_px * select(1.0 - VGC_EDGE_HYST, 1.0 + VGC_EDGE_HYST, was_sw) {
+    if edge <= params.sw_edge_px * select(1.0, 1.0 + VGC_EDGE_HYST, was_sw) {
         hyst_mark(sw_key);
         if (params.flags & VGC_FLAG_DENSE_MASK) != 0u && dense_overlap(cw, r_px) {
             return VGC_BIN_DENSE;
@@ -648,9 +648,14 @@ fn try_cluster(inst: u32, cs: u32, ic: InstCtx) {
 }
 
 // `gidx` is an asset-local group-ref index.
-fn do_group(inst: u32, gidx: u32, ic: InstCtx) {
+// `demanded`: the group's own error is above tau, so the cut needs its page. A
+// group reached only through the hysteresis band of the entry test is drawn when
+// its page is resident but never requested (that is the prefetch band's job).
+fn do_group(inst: u32, gidx: u32, ic: InstCtx, demanded: bool) {
     let g = vg_group_refs[vg_group_ref_base(ic.asset) + gidx];
-    let slot = vg_use_or_request_page(vg_global_page(ic.asset, g));
+    let page = vg_global_page(ic.asset, g);
+    if !demanded && !vg_page_resident(page) { return; }
+    let slot = vg_use_or_request_page(page);
     if slot == VG_PAGE_NOT_RESIDENT { return; }
     let first = g.first_cluster_count & 0xffffu;
     let count = g.first_cluster_count >> 16u;
@@ -725,9 +730,9 @@ fn try_root_shortcut(inst: u32, hdr: VgAssetHeader) -> bool {
     let ic = load_inst(inst);
     if !root_leaf_ok(ic, l0) || !root_leaf_ok(ic, l1) || !root_leaf_ok(ic, l2) { return false; }
     stat_add(VGC_STAT_ROOT_SHORTCUT);
-    do_group(inst, l0 - 1u, ic);
-    if l1 != 0u { do_group(inst, l1 - 1u, ic); }
-    if l2 != 0u { do_group(inst, l2 - 1u, ic); }
+    do_group(inst, l0 - 1u, ic, true);
+    if l1 != 0u { do_group(inst, l1 - 1u, ic, true); }
+    if l2 != 0u { do_group(inst, l2 - 1u, ic, true); }
     return true;
 }
 
@@ -764,7 +769,8 @@ fn job_asset_item(job: vec2<u32>) {
     // Enter only while something below may still need drawing, against the
     // smallest threshold a group below may be held at (hysteresis).
     let mpe = vg_nodes[parent].max_parent_error[slot];
-    if proj_err(mpe * ic.err_scale * ic.scale, cw, rw) <= ic.tau * VGC_TAU_HOLD {
+    let mpe_px = proj_err(mpe * ic.err_scale * ic.scale, cw, rw);
+    if mpe_px <= ic.tau * VGC_TAU_HOLD {
         stat_add(VGC_STAT_CULLED_SSE);
         return;
     }
@@ -777,7 +783,7 @@ fn job_asset_item(job: vec2<u32>) {
     if pol == POLICY_DROP { stat_add(VGC_STAT_CULLED_OCCLUSION); return; }
     history_mark(job_key(job));
     if (child & VG_NODE_LEAF_BIT) != 0u {
-        do_group(job.x, child & ~VG_NODE_LEAF_BIT, ic);
+        do_group(job.x, child & ~VG_NODE_LEAF_BIT, ic, mpe_px > ic.tau);
     } else {
         let gchild = vg_node_base(ic.asset) + child;
         let kids = vg_nodes[gchild].children;

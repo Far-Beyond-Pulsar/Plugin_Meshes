@@ -594,8 +594,10 @@ fn single_phase_matches_the_reference_over_taus_and_residencies() {
             VgCullConfig {
                 two_phase_occlusion: false,
                 initial_bin_capacity: 4096,
-                // The reference is the stateless cut: no overdraw valve.
+                // The reference is the stateless cut, requesting only what the
+                // cut needs: no overdraw valve, no prefetch band.
                 tile_density_limit: 0.0,
+                prefetch_factor: 1.0,
                 ..Default::default()
             },
         );
@@ -1323,17 +1325,29 @@ fn hysteresis_keeps_the_cut_still_under_jitter_and_releases_it_outside_the_band(
         assert_eq!(out.items, fine, "still frame {frame} lost the held detail");
     }
     // Far outside the band (error well below tau / (1 + TAU_HYST)) it releases.
-    let d_far = d_coarse * (1.0 + helio_pass_vg_cull::TAU_HYST) * 1.3;
+    // The levels are discrete: find the first distance whose stateless cut is
+    // coarser than `coarse`, then go a clear margin beyond the hold band of the
+    // groups that cut released.
+    let mut d_far = d_coarse * (1.0 + helio_pass_vg_cull::TAU_HYST);
+    while {
+        let v = set_camera(&g, &r, [-87.0, 0.0, d_far]);
+        let want = expected(&s, &v, 1.0, VgMode::Auto).0;
+        triangle_count(&s, &want) >= triangle_count(&s, &coarse)
+    } {
+        d_far *= 1.02;
+        assert!(d_far < 1.0e7, "no coarser cut beyond the band");
+    }
+    d_far *= (1.0 + helio_pass_vg_cull::TAU_HYST) * 1.1;
     let far_want = {
         let v = set_camera(&g, &r, [-87.0, 0.0, d_far]);
         expected(&s, &v, 1.0, VgMode::Auto).0
     };
+    assert!(triangle_count(&s, &far_want) < triangle_count(&s, &coarse));
     let mut released = BTreeSet::new();
     for _ in 0..3 {
         released = frame_at(&g, &mut core, &r, [-87.0, 0.0, d_far]).0.items;
     }
     assert_eq!(released, far_want, "the hold never releases");
-    assert!(triangle_count(&s, &far_want) < triangle_count(&s, &coarse));
 }
 
 #[test]
@@ -1370,10 +1384,13 @@ fn the_sw_hw_edge_test_has_hysteresis() {
     let (d_a, d_b, n_a, n_b) =
         found.expect("the SW class never changes over the scanned distances");
     // Jitter across that threshold: after the first frame the classes stay put.
+    // Start on the software side (a cluster becomes software at the threshold and
+    // is held there); a stateless classifier would flip on every frame.
+    let (first, second) = if n_a > n_b { (d_a, d_b) } else { (d_b, d_a) };
     flush_history(&g, &mut core, &r);
     let mut seen = Vec::new();
     for frame in 0..12 {
-        let d = if frame % 2 == 0 { d_a } else { d_b };
+        let d = if frame % 2 == 0 { first } else { second };
         let (out, _) = frame_at(&g, &mut core, &r, [-87.0, 0.0, d]);
         seen.push(
             out.items

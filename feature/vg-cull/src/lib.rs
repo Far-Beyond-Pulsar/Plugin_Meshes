@@ -33,7 +33,8 @@
 //! * **Hysteresis** ([`TAU_HYST`], [`EDGE_HYST`]). A group refined last frame
 //!   stays refined until its error drops under `tau / (1 + TAU_HYST)`, so the
 //!   `error <= tau` bound always holds and only the finer side is held; the
-//!   SW/HW edge test has the same band around `sw_edge_px`. The memory is the
+//!   SW/HW edge test is held the same way: software class at `edge <= sw_edge_px`,
+//!   kept until `edge <= sw_edge_px * (1 + EDGE_HYST)`. The memory is the
 //!   visibility hash set, salted per decision, keyed by the group's (identical on
 //!   both sides) sphere and error, so the two sides of a decision always agree.
 //! * **Prefetch** ([`VgCullDynamic::prefetch_factor`]). Child pages are
@@ -232,7 +233,8 @@ pub const EDGE_FACTOR: f32 = 2.7;
 /// a still camera and of one pixel of camera motion, and costs at most that much
 /// extra detail (never less than `tau` requires).
 pub const TAU_HYST: f32 = 0.25;
-/// Hysteresis of the software/hardware edge test, as a fraction of `sw_edge_px`.
+/// Hysteresis of the software/hardware edge test: a software-class cluster stays
+/// software up to this fraction above `sw_edge_px` (entry stays at `sw_edge_px`).
 pub const EDGE_HYST: f32 = 0.15;
 /// Overdraw valve: a tile coarsens above `limit * (1 + TILE_BAND)` triangles per
 /// covered pixel, relaxes below `limit / (1 + TILE_BAND)`, holds in between.
