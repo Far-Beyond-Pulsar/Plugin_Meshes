@@ -22,7 +22,7 @@ use std::sync::{Mutex, OnceLock};
 /// Strongly-typed wrapper for mesh asset paths.
 ///
 /// Using this as a field type causes the reflection property inspector to render
-/// a mesh-asset search browser (via `MeshAssetPicker`) instead of a plain text box.
+/// a mesh-asset search browser (via `AssetPicker`) instead of a plain text box.
 ///
 /// Serialises transparently as a JSON string so existing scene files require no
 /// migration.
@@ -555,13 +555,13 @@ const BUILTIN_MESHES: &[&str] = &[
 
 /// Property editor for [`MeshAssetPath`] — a searchable mesh-asset browser.
 ///
-/// Owns its [`MeshAssetPicker`](ui_common::asset_picker::MeshAssetPicker) child
+/// Owns its [`AssetPicker`](ui_common::asset_picker::AssetPicker) child
 /// entity and the subscription that turns a pick into a write-back.
 pub struct MeshAssetEditor {
     label: String,
     id_prefix: String,
     prop_name: String,
-    picker: gpui::Entity<ui_common::asset_picker::MeshAssetPicker>,
+    picker: gpui::Entity<ui_common::asset_picker::AssetPicker>,
     path: String,
     write_back: pulsar_reflection::PropertyWriteBack,
     _subs: Vec<gpui::Subscription>,
@@ -574,7 +574,7 @@ impl MeshAssetEditor {
         cx: &mut gpui::Context<Self>,
     ) -> Self {
         use gpui::AppContext as _;
-        use ui_common::asset_picker::{AssetPickedEvent, AssetQuery, MeshAssetPicker};
+        use ui_common::asset_picker::{AssetPickedEvent, AssetPicker, AssetQuery};
 
         let path = args
             .current_value
@@ -592,7 +592,7 @@ impl MeshAssetEditor {
         ];
 
         let picker = cx.new(|cx| {
-            MeshAssetPicker::new(
+            AssetPicker::new(
                 path.clone(),
                 BUILTIN_MESHES.iter().map(|s| s.to_string()).collect(),
                 project_root,
@@ -676,7 +676,7 @@ impl gpui::Render for MeshAssetEditor {
                     .child(self.label.clone()),
             )
             .child(
-                Popover::<ui_common::asset_picker::MeshAssetPicker>::new(format!(
+                Popover::<ui_common::asset_picker::AssetPicker>::new(format!(
                     "mesh-asset-picker-{}-{}",
                     self.id_prefix, self.prop_name
                 ))
@@ -745,7 +745,7 @@ struct MaterialSlotPickerRow {
     path: String,
     /// The mesh asset's default for this slot, shown while `path` is empty.
     inherited: String,
-    picker: gpui::Entity<ui_common::asset_picker::MeshAssetPicker>,
+    picker: gpui::Entity<ui_common::asset_picker::AssetPicker>,
 }
 
 struct StaticMeshMaterialSlotsEditor {
@@ -789,7 +789,7 @@ impl StaticMeshMaterialSlotsEditor {
         cx: &mut gpui::Context<Self>,
     ) {
         use gpui::AppContext as _;
-        use ui_common::asset_picker::{AssetPickedEvent, AssetQuery, MeshAssetPicker};
+        use ui_common::asset_picker::{AssetPickedEvent, AssetPicker, AssetQuery};
 
         self.rows.clear();
         self.subscriptions.clear();
@@ -802,7 +802,7 @@ impl StaticMeshMaterialSlotsEditor {
         for (index, slot) in value.slots.iter().enumerate() {
             let key = (slot.source_material, index);
             let picker = cx.new(|cx| {
-                MeshAssetPicker::new(
+                AssetPicker::new(
                     slot.material_asset.clone(),
                     Vec::new(),
                     project_root.clone(),
@@ -1007,7 +1007,7 @@ impl gpui::Render for StaticMeshMaterialSlotsEditor {
                     .gap_2()
                     .child(gpui::div().text_xs().child(row.name.clone()))
                     .child(
-                        Popover::<ui_common::asset_picker::MeshAssetPicker>::new(format!(
+                        Popover::<ui_common::asset_picker::AssetPicker>::new(format!(
                             "material-slot-picker-{}-{}-{index}",
                             self.id_prefix, self.prop_name
                         ))

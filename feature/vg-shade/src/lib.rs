@@ -1386,7 +1386,7 @@ mod tests {
             max_sampled_textures_per_shader_stage: if mode
                 == helio_mats::MaterialBindingMode::Expanded
             {
-                (max_textures + helio_mats::EXPANDED_MATERIAL_TEXTURE_RESERVE) as u32
+                (max_textures + helio_core::TEXTURE_TABLE_RESERVE) as u32
             } else {
                 256
             },

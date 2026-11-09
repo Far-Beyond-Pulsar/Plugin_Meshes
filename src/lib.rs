@@ -30,6 +30,7 @@
 // the plugin; a project enables it or not (`pulsar_plugins`).
 pulsar_plugins::installed!("pulsar-plugin.toml");
 
+pub use helio_mesh_api;
 pub use meshes_component;
 #[cfg(feature = "editor")]
 pub use meshes_editor;

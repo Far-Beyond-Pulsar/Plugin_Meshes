@@ -200,6 +200,7 @@ inventory::submit! {
         entries: Some(meshes_component::records::fold_material_override),
         from_props: None,
         stale_props: &[],
+        retired_fields: &[],
     }
 }
 
@@ -211,6 +212,7 @@ inventory::submit! {
         entries: None,
         from_props: Some(meshes_component::records::mesh_from_props),
         stale_props: &["mesh_asset"],
+        retired_fields: &[],
     }
 }
 

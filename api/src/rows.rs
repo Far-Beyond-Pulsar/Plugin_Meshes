@@ -1,5 +1,5 @@
-//! The rows the meshes' components author (objects, render groups, sublevel
-//! placements) and the mesh pools they address. The object batch projects
+//! The rows the meshes' components author (objects, render groups) and the
+//! mesh pools they address. The object batch projects
 //! them into transient instance and coordinate-space inputs.
 
 /// Mesh vertices: a pool shared by every mesh. A [`StaticObjectRow`]'s
@@ -28,56 +28,6 @@ unsafe impl pulsar_scenedb::Pod for RenderGroupRow {}
 /// (a SceneDB component stored under this key, or a scene derivation).
 pub const RENDER_GROUPS: helio_core::BufferContract<RenderGroupRow> =
     helio_core::BufferContract::new("render_groups");
-
-/// Stable content-space index for an authored sublevel.
-///
-/// Sublevels are indexed content spaces rather than SceneDB entities. Index
-/// zero is the default level and always denotes identity/world space. The
-/// index is intentionally a plain scalar here: resolving an index to content
-/// and projecting it into a transient GPU coordinate-space slot belongs to a
-/// later scene-runtime phase.
-pub type SubLevelIndex = u32;
-
-/// The default level's authored sublevel index.
-pub const DEFAULT_SUBLEVEL_INDEX: SubLevelIndex = 0;
-
-/// Placement of an indexed sublevel inside its owning level: the portal
-/// resolver's CPU input (`helio_pass_portal_cull::SubLevelResolver`).
-///
-/// This is the direct-instancing primitive for reusable content (for example,
-/// an aircraft or room). It is deliberately separate from portal data:
-/// portals display a peer portal's context through an aperture and do not
-/// become sublevel actors. No pass reads it on the GPU, so it is not a buffer
-/// contract; hosts keep it wherever they keep authored placements (a plain
-/// SceneDB component is fine).
-#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy, Debug, PartialEq)]
-#[repr(C)]
-pub struct SubLevelActorRow {
-    pub sublevel_index: SubLevelIndex,
-    pub flags: u32,
-    pub transform: [[f32; 4]; 4],
-}
-
-impl SubLevelActorRow {
-    /// Bit in [`Self::flags`] that enables this actor instance.
-    pub const FLAG_ENABLED: u32 = 1 << 0;
-
-    pub fn new(sublevel_index: SubLevelIndex, transform: glam::Mat4) -> Self {
-        Self {
-            sublevel_index,
-            flags: Self::FLAG_ENABLED,
-            transform: transform.to_cols_array_2d(),
-        }
-    }
-
-    pub fn transform(&self) -> glam::Mat4 {
-        glam::Mat4::from_cols_array_2d(&self.transform)
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.flags & Self::FLAG_ENABLED != 0
-    }
-}
 
 /// A single-mesh static-object placement: SceneDB-owned mesh/material row
 /// indices, a world transform, a culling bound, and the static draw
@@ -255,16 +205,5 @@ mod tests {
     #[test]
     fn component_layouts_are_stable() {
         assert_eq!(std::mem::size_of::<RenderGroupRow>(), 8);
-        assert_eq!(std::mem::size_of::<SubLevelActorRow>(), 72);
-        assert_eq!(std::mem::align_of::<SubLevelActorRow>(), 4);
-    }
-
-    #[test]
-    fn sublevel_actor_round_trips_index_and_transform() {
-        let actor =
-            SubLevelActorRow::new(7, glam::Mat4::from_translation(glam::vec3(3.0, 4.0, 5.0)));
-        assert_eq!(actor.sublevel_index, 7);
-        assert_eq!(actor.flags, SubLevelActorRow::FLAG_ENABLED);
-        assert_eq!(actor.transform().w_axis, glam::vec4(3.0, 4.0, 5.0, 1.0));
     }
 }

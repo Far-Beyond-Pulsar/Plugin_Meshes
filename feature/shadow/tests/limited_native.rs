@@ -4,8 +4,7 @@ use std::sync::Arc;
 use glam::Vec3;
 use helio::{required_wgpu_limits, Camera, RendererBuilder, RendererConfig};
 use helio_mats::{
-    MaterialBindingConfig, MaterialBindingMode, BINDLESS_MATERIAL_FEATURES,
-    EXPANDED_MATERIAL_TEXTURE_RESERVE, MAX_MATERIAL_TEXTURES,
+    MaterialBindingConfig, MaterialBindingMode, BINDLESS_MATERIAL_FEATURES, MAX_MATERIAL_TEXTURES,
 };
 
 const PORTABLE_SAMPLED_TEXTURE_LIMIT: u32 = 16;
@@ -36,7 +35,7 @@ fn default_graph_renders_on_a_native_non_bindless_device_at_the_16_texture_bound
             wgpu::Features::INDIRECT_FIRST_INSTANCE,
             limits,
             MaterialBindingMode::Expanded,
-            PORTABLE_SAMPLED_TEXTURE_LIMIT as usize - EXPANDED_MATERIAL_TEXTURE_RESERVE,
+            PORTABLE_SAMPLED_TEXTURE_LIMIT as usize - helio_core::TEXTURE_TABLE_RESERVE,
             "Limited Native",
         )
         .await;

@@ -17,7 +17,7 @@ use helio::{
     required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera, Renderer,
     RendererBuilder, RendererConfig,
 };
-use helio_mats::texture_mips::{mip_chain, TexelKind};
+use helio_core::texture_mips::{mip_chain, TexelKind};
 use pulsar_scenedb::SceneDb;
 use v3_demo_common::{
     cube_mesh, directional_light, make_material, new_scene_db_with_gpu_mirror, point_light,
@@ -106,7 +106,7 @@ fn generate_brick_textures() -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Uploads a `BRICK_TEX_SIZE`-square RGBA8 texture with a full mip chain
-/// filtered as `texels` says (`helio_mats::texture_mips`).
+/// filtered as `texels` says (`helio_core::texture_mips`).
 fn upload_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
