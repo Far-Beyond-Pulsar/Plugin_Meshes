@@ -419,6 +419,17 @@ $env:VG_STRESS_CAPTURE = 'out'; $env:VG_STRESS_CAPTURE_ONLY = 'tier3-tier2,tier3
 $env:HELIO_VG_PROFILE = '1'; cargo vg-stress
 ```
 
+`VG_STRESS_SHOTS=<file>` (relative to this directory) replaces `assets/vg_stress/shots.json`.
+`vg_stress_shots/vg_runtime.json` is the fixed before/after list of the VG runtime
+work (hero close-ups, forest crowd and dense views, normal overview, and views 107
+page residency and 109 error vs tau at tau 1 and 0.25); diff the per-shot stats
+JSON (`vg.selected_triangles`, tier counts, `gpu_ms`) and the images between builds:
+
+```powershell
+$env:VG_STRESS_SHOTS = 'vg_stress_shots/vg_runtime.json'; $env:VG_STRESS_CAPTURE = 'outfter'
+$env:HELIO_VG_PROFILE = '1'; cargo vg-stress
+```
+
 Tier 3 is opt-in for this demo: set `VG_STRESS_TIER3=1` to run its ray-traced
 dense-tile backend when hardware and proxy residency allow it. The “Ray Trace vs
 Raster” debug view only shows which path produced each pixel; it does not enable

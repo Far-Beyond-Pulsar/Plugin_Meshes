@@ -148,6 +148,9 @@ pub struct VgTargets {
     pub dense_args: wgpu::Buffer,
     /// Persistent per-tile latch age of the dense classification.
     pub dense_age: wgpu::Buffer,
+    /// Bound as the estimate when no cull estimate is given (a buffer the
+    /// classifier layout needs, distinct from `dense_age`, which it also writes).
+    pub(crate) no_estimate: wgpu::Buffer,
     pub(crate) tile_bin_counts: wgpu::Buffer,
     pub(crate) tile_bin_entries: wgpu::Buffer,
     pub(crate) params: [wgpu::Buffer; 2],
@@ -249,6 +252,7 @@ impl VgTargets {
             dense_list: buf("VG Dense List", tiles * 4, st),
             dense_args: buf("VG Dense Args", 16, st | wgpu::BufferUsages::INDIRECT),
             dense_age: buf("VG Dense Age", tiles * 4, st),
+            no_estimate: buf("VG No Estimate", 16, st),
             tile_bin_counts: buf(
                 "VG Tile Bin Counts",
                 if fallback { tiles * 4 } else { 16 },
@@ -922,7 +926,7 @@ impl VgRaster {
         };
         queue.write_buffer(&t.classify_params, 0, bytemuck::bytes_of(&params));
         // Bound even without an estimate (the layout needs a buffer there).
-        let est_buffer = estimate.map_or(&t.dense_age, |e| e.buffer);
+        let est_buffer = estimate.map_or(&t.no_estimate, |e| e.buffer);
         let write = t.parity;
         let read = t.parity ^ 1;
         let gc = device.create_bind_group(&wgpu::BindGroupDescriptor {
