@@ -383,11 +383,11 @@ pub mod presets {
     }
 
     pub fn hlfs(ctx: PassBuildContext<'_>) -> RenderGraph {
-        preset(Preset::Hlfs).build(ctx)
+        preset(Preset::Model(helio_light_host::HLFS)).build(ctx)
     }
 
     pub fn hlfs_fxaa(ctx: PassBuildContext<'_>) -> RenderGraph {
-        preset(Preset::HlfsFxaa).build(ctx)
+        preset(Preset::Model(helio_light_host::HLFS_FXAA)).build(ctx)
     }
 
     pub fn forward(ctx: PassBuildContext<'_>) -> RenderGraph {
