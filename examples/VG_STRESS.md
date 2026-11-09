@@ -258,20 +258,23 @@ The title also carries the cull's stats line (selected triangles, emitted/tested
 clusters, HW/SW/dense split, frustum/occlusion/backface/error culls and overflow
 counters), read from the same asynchronous readback, so it adds no GPU stall.
 
-Selection uses a screen-wide feedback controller (on by default) around the existing error-based hierarchy
-cut. It compares the previous completed frame's selected triangles per viewport
-pixel with `selection_triangles_per_pixel` (default 2) and adjusts the next
-frame's `tau_px`. A denser cut raises tau so parent clusters replace complete
-finer cuts; a lighter cut lowers tau to recover detail. It never rejects an
-otherwise visible cluster to satisfy a count. Set
-`HELIO_VG_SELECTION_TRIANGLES_PER_PIXEL` (0.25–32) for the target and
-`HELIO_VG_SELECTION_SENSITIVITY` (0 disables the controller, default 1);
-both can also be changed through `VgRuntimeSettings`. Set sensitivity to 0 to
-disable adaptation. The controller (`helio_vg_format::density`: dead band, fast attack, slow release, demand normalised for the stats delay) steers to 0.7x the target. When enabled, effective tau stays between 1x and 8x the
-authored setting; the count target cannot override quality indefinitely. If even the resident root cut exceeds the target, the
-selected count stays above target rather than dropping geometry. The target is
-a project tuning value; Epic's Nanite docs describe triangle count scaling with
-pixel count but do not prescribe a fixed triangles-per-pixel ratio.
+Selection is per cluster: a group is refined when its projected error exceeds
+`tau_px` (default 1 px), a stable setting with no per-frame screen-wide
+multiplier, so triangle density follows geometry (UE5 Nanite does the same).
+Three bounded mechanisms sit around that one rule, all in `VirtualGeometrySettings`
+(see `feature/vg-cull` crate docs, "The cut"):
+
+- hysteresis on the error test and on the SW/HW edge test (a still camera never
+  flips a cut),
+- `prefetch_factor` (default 2): child pages are requested while the error is
+  above `tau / prefetch_factor`, urgent requests first,
+- `tile_density_limit` (default 16 triangles per covered pixel, 0 = off): an
+  overdraw safety valve that coarsens only the 16x16 tiles above the limit, at
+  most 4x, with a dead band; a tile resolved as dense is exempt.
+
+The stored error is used as is. The builder bakes a density relaxation into it
+(`DENSITY_TOLERANCE_GAIN`), so the cut can be coarser than `tau` implies until
+the builder stores true deviation separately.
 
 ## Validation
 
@@ -431,18 +434,19 @@ falls back to the non-RT dense path. Alpha-masked materials are not represented
 by RT proxies yet; replacement mode currently resolves the proxy's geometric
 surface without its alpha texture.
 
-Calibration overrides (read when the raster is created): `HELIO_VG_DENSE_TRI`
-(base triangles per tile, default 64), `HELIO_VG_DENSE_HIT` (base depth-passing
-hits per tile, default 64), and `HELIO_VG_DENSE_SENSITIVITY` (default 1, clamped
-to 0.125–8). Higher sensitivity divides both dense thresholds, so tiles qualify
-sooner; for example, `2` uses thresholds 32 triangles and 32 hits. The raw
-threshold overrides are scaled by sensitivity too. `HELIO_VG_DENSE_LATCH` sets
-how many frames a tile stays dense (default 8), and
-`HELIO_VG_DENSE_MAX_TILES` caps qualifying tiles per frame (default 512).
+Dense-tile sensitivity is the `dense_sensitivity` setting (default 1, 0.125 to 8):
+it divides both dense thresholds, so tiles qualify sooner; `2` uses 32 triangles
+and 32 hits. The classifier also reads the cull's per-tile triangle estimate,
+which includes hardware-class clusters, so a tile can go dense without the
+software raster having counted it. Calibration overrides (read when the raster is
+created): `HELIO_VG_DENSE_TRI` (base triangles per tile, default 64),
+`HELIO_VG_DENSE_HIT` (base depth-passing hits per tile, default 64),
+`HELIO_VG_DENSE_LATCH` (frames a tile stays dense, default 8) and
+`HELIO_VG_DENSE_MAX_TILES` (qualifying tiles per frame, default 512; the
+thresholds are scaled by sensitivity too).
 `VG_STRESS_PAGE_MB` sets the page-pool budget.
 
 ```powershell
-$env:HELIO_VG_DENSE_SENSITIVITY = '4'
 $env:VG_STRESS_TIER3 = '1'
 cargo vg-stress
 ```
@@ -632,19 +636,13 @@ Validate with `cargo test --release -p helio-vg-build --test lod_validation --
 --nocapture --include-ignored` (set `VG_LOD_OUT` for images). Real caches:
 `VG_CACHE_DIR=<cache dir> VG_REBUILD=1 ... real_cached_assets_ladder_and_images`.
 
-### Computed screen-wide density (cook revision 11, format version 4)
+### Per-cluster cut and per-tile overdraw valve (replaces the screen-wide density solve)
 
-The feedback controller described above is gone. Every asset header now carries
-its bounding sphere and a 32-entry `LodTable` (selected triangles against
-object-space error tolerance, written by the builder). Before traversal the cull
-pass runs `cs_density` (one workgroup): each frustum-visible instance looks its
-asset's table up at the tolerance its centre distance implies, for 13 candidate
-multipliers (1x to 8x); the smallest multiplier that fits
-`0.75 * selection_triangles_per_pixel * pixels` is written to the state buffer
-and used by `load_inst` for every cut that frame, rate limited to x1.25 up and
-x0.96 down per frame. Only the occlusion share is learned (CPU, from the late
-stats: `VisibleFraction`), and it only scales the budget. CPU mirror and tests:
-`helio_vg_format::density`; benchmark: `forest_density_is_computed_screen_wide`
-(demo trees, ~2,100 instances: worst 1.92 triangles/pixel, mean 1.25, prediction
-within x1.29, per-frame multiplier change <= x1.16). Merged foliage cards now take
+The computed screen-wide density multiplier (`cs_density`, `VisibleFraction`,
+`helio_vg_format::density`, `selection_*` settings, the
+`HELIO_VG_SELECTION_*` variables) is removed: a view-wide tau moved every
+instance's LOD at once as the camera moved. The cull now runs `cs_tiles`, one
+thread per 16x16 tile, which turns last frame's per-tile triangle estimate into the
+valve scale. The asset header's `LodTable` is still written by the builder but no
+longer read at runtime. Merged foliage cards now take
 all four corners' attributes from one member so their texture stays coherent.
