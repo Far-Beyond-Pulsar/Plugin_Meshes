@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::mesh_cache;
 
-struct ModelImporter;
+pub struct ModelImporter;
 
 impl Importer for ModelImporter {
     fn id(&self) -> &'static str {
@@ -207,11 +207,4 @@ fn surfaces_of(scene: &helio_asset_compat::ConvertedScene, source: &Path) -> Vec
             surface
         })
         .collect()
-}
-
-inventory::submit! {
-    asset_import::importer::ImporterRegistration {
-        origin: pulsar_plugins::origin!(),
-        importer: &ModelImporter,
-    }
 }

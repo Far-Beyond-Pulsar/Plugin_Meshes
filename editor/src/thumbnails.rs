@@ -19,15 +19,13 @@ use meshes_component::components::{StaticMeshMaterialSlot, resolve_slot_material
 const SIZE: u32 = 128;
 const BACKGROUND: [u8; 4] = [0, 0, 0, 255];
 
-pulsar_reflection::inventory::submit! {
-    ui_common::asset_thumbnails::ThumbnailRendererRegistration {
-        extension: "mesh",
-        render: render_mesh_thumbnail,
-    }
-}
+/// The source model extensions drawn by [`render_model_thumbnail`].
+pub const MODEL_EXTENSIONS: [&str; 10] = [
+    "fbx", "gltf", "glb", "obj", "usd", "usda", "usdc", "usdz", "uasset", "umap",
+];
 
 /// A source model's thumbnail: the meshes' snapshot renderer.
-fn render_model_thumbnail(path: &Path) -> Option<image::RgbaImage> {
+pub fn render_model_thumbnail(path: &Path) -> Option<image::RgbaImage> {
     match helio_snapshot::render_preview(
         path,
         helio_snapshot::SnapshotConfig {
@@ -44,21 +42,6 @@ fn render_model_thumbnail(path: &Path) -> Option<image::RgbaImage> {
         }
     }
 }
-
-macro_rules! model_thumbnails {
-    ($($extension:literal),*) => {$(
-        pulsar_reflection::inventory::submit! {
-            ui_common::asset_thumbnails::ThumbnailRendererRegistration {
-                extension: $extension,
-                render: render_model_thumbnail,
-            }
-        }
-    )*};
-}
-
-model_thumbnails!(
-    "fbx", "gltf", "glb", "obj", "usd", "usda", "usdc", "usdz", "uasset", "umap"
-);
 
 fn edge(a: Vec2, b: Vec2, p: Vec2) -> f32 {
     (p.x - a.x) * (b.y - a.y) - (p.y - a.y) * (b.x - a.x)

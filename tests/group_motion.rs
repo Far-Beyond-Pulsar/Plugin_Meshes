@@ -2,6 +2,9 @@
 //! includes something authored fixed -- unless the group is a rigid frame,
 //! whose members stay fixed in its own space.
 
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
+
 use engine_backend::scene::frames::make_frame;
 use engine_backend::scene::{SceneWorldExt, SpawnObject, first_fixed_in_group};
 use helio_component::components::ObjectMovability;

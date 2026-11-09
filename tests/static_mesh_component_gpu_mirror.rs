@@ -14,6 +14,9 @@
 //! insert via `World::insert`, the same real entry point hydrate itself
 //! calls after loading.
 
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
+
 use helio_mesh_api::PackedVertex;
 use meshes_component::components::{MeshAssetPath, MeshGeometryKey, StaticMeshComponent};
 use pulsar_scenedb::World;

@@ -3,6 +3,9 @@
 //! companion here is a stub: the pipeline must not need to know what a
 //! companion makes.
 
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
+
 // The meshes' model importer registers itself with the import service.
 use meshes_component as _;
 
@@ -64,8 +67,7 @@ fn accepted_companions_run_record_outputs_and_fill_only_empty_slots() {
     let root = dir.path();
     let source = root.join("cube.fbx");
     std::fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../assets/meshes/primitives/SM_Cube.fbx"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../assets/meshes/primitives/SM_Cube.fbx"),
         &source,
     )
     .unwrap();

@@ -20,14 +20,8 @@
 //!   G-buffer, shadow-caster, forward and transparent phases) and virtual
 //!   geometry.
 //!
-//! Everything registers through `inventory` once the crate is linked:
-//! hosts link it without naming it (a game built for a project links the
-//! runtime modules of the plugins its `Pulsar.toml` enables, the editor
-//! every installed plugin through `installed_plugins`; `pulsar_plugins`).
-
-// The plugin's descriptor (`../pulsar-plugin.toml`): linking this crate
-// installs the plugin; a project enables it or not (`pulsar_plugins`).
-pulsar_plugins::installed!("../pulsar-plugin.toml");
+//! This crate registers nothing itself: the plugin's root crate
+//! (`meshes_plugin`) submits every registration above, in one place.
 
 pub mod authored_lod;
 pub mod components;
@@ -50,7 +44,7 @@ use pulsar_scenedb::gpu::BufferKey;
 use pulsar_scenedb::{Entity, World};
 
 /// The meshes' features.
-fn render_features() -> helio_feature_api::FeatureSet {
+pub fn render_features() -> helio_feature_api::FeatureSet {
     helio_feature_api::FeatureSet::new()
         .with(helio_pass_object_batch::ObjectBatchFeature)
         .with(helio_pass_occlusion_cull::MeshCulling)
@@ -64,16 +58,8 @@ fn render_features() -> helio_feature_api::FeatureSet {
 /// The meshes' features read no project settings through the renderer
 /// config: virtual geometry's come in with its runtime ([`host_part`]),
 /// shadows' with the lights' `ShadowSettings`.
-fn configure_renderer(config: helio::RendererConfig) -> helio::RendererConfig {
+pub fn configure_renderer(config: helio::RendererConfig) -> helio::RendererConfig {
     config
-}
-
-inventory::submit! {
-    engine_backend::subsystems::render::RenderFeatureRegistration {
-        origin: pulsar_plugins::origin!(),
-        features: render_features,
-        configure: configure_renderer,
-    }
 }
 
 // ── The scene join ──────────────────────────────────────────────────────────
@@ -103,7 +89,8 @@ pub fn scene_join_keys(context: &ObjectJoinContext) -> SceneJoinKeys {
     }
 }
 
-fn register_columns(
+/// Registers the SceneDB columns the scene join reads.
+pub fn register_columns(
     store: &mut pulsar_scenedb::gpu::SceneGpuStore,
     device: &std::sync::Arc<wgpu::Device>,
 ) {
@@ -126,29 +113,18 @@ fn register_columns(
     helio_mats::instance::register_columns(store, device);
 }
 
-fn scene_join(
+/// The meshes' scene join (`ObjectJoinRegistration`).
+pub fn scene_join(
     device: &wgpu::Device,
     context: &ObjectJoinContext,
 ) -> Box<dyn helio_scene_join::SceneDerivation> {
     Box::new(SceneJoin::new(device, scene_join_keys(context)))
 }
 
-inventory::submit! {
-    engine_backend::scene::ObjectJoinRegistration {
-        origin: pulsar_plugins::origin!(),
-        name: "meshes",
-        // First: the other joins and the row joins read the object rows.
-        order: 0,
-        owner_bounds: Some(BufferKey::of(MESH_BOUNDS_BUFFER)),
-        register_columns,
-        derivation: scene_join,
-    }
-}
-
 // ── Picking ─────────────────────────────────────────────────────────────────
 
 /// The box around `object`'s enabled meshes' local bounding spheres.
-fn mesh_local_bounds(world: &World, object: Entity) -> Option<(glam::Vec3, glam::Vec3)> {
+pub fn mesh_local_bounds(world: &World, object: Entity) -> Option<(glam::Vec3, glam::Vec3)> {
     let meshes = pulsar_scene_model::attachments::enabled_components_of::<StaticMeshComponent>(
         world, object,
     );
@@ -170,7 +146,7 @@ fn mesh_local_bounds(world: &World, object: Entity) -> Option<(glam::Vec3, glam:
 }
 
 /// A local ray against `object`'s enabled meshes' triangles.
-fn mesh_hit(
+pub fn mesh_hit(
     world: &World,
     object: Entity,
     origin: glam::Vec3,
@@ -206,7 +182,7 @@ fn mesh_hit(
 }
 
 /// Every enabled mesh triangle in `world`, in its owner's local space.
-fn mesh_triangles(world: &World, visit: &mut dyn FnMut(Entity, [glam::Vec3; 3]) -> bool) {
+pub fn mesh_triangles(world: &World, visit: &mut dyn FnMut(Entity, [glam::Vec3; 3]) -> bool) {
     for (_, owner, mesh) in
         pulsar_scene_model::attachments::enabled_components::<StaticMeshComponent>(world)
     {
@@ -230,20 +206,26 @@ fn mesh_triangles(world: &World, visit: &mut dyn FnMut(Entity, [glam::Vec3; 3]) 
     }
 }
 
-inventory::submit! {
-    engine_backend::subsystems::render::helio_renderer::ContentGeometryRegistration {
-        origin: pulsar_plugins::origin!(),
-        local_bounds: mesh_local_bounds,
-        hit: mesh_hit,
-        triangles: mesh_triangles,
+// ── What the root registers for the engine's hooks ──────────────────────────
+
+/// Whether a mesh drawn with a shader graph that reads the frame clock is in
+/// `world` (it animates). The answer changes when a mesh does or when an
+/// instance binds its material.
+/// What a headless run reports of the meshes: how many mesh components
+/// there are and how many bound their geometry.
+pub fn content_report(world: &World) -> serde_json::Value {
+    let mut components = 0;
+    let mut bound = 0;
+    for (_, mesh) in world.query::<&StaticMeshComponent>() {
+        components += 1;
+        if mesh.geometry_key != MeshGeometryKey::NONE {
+            bound += 1;
+        }
     }
+    serde_json::json!({ "components": components, "bound": bound })
 }
 
-// ── Runtime registrations ───────────────────────────────────────────────────
-
-// A mesh drawn with a shader graph that reads the frame clock animates. The
-// answer changes when a mesh does or when an instance binds its material.
-fn meshes_read_time(world: &World) -> bool {
+pub fn meshes_read_time(world: &World) -> bool {
     world
         .query::<&StaticMeshComponent>()
         .filter(|(instance, _)| pulsar_scene_model::attachments::is_enabled(world, *instance))
@@ -260,102 +242,8 @@ fn meshes_read_time(world: &World) -> bool {
         })
 }
 
-inventory::submit! {
-    engine_backend::subsystems::render::AnimatedContentRegistration {
-        origin: pulsar_plugins::origin!(),
-        watch: |world| world.open_change_cursor::<StaticMeshComponent>(),
-        animated: meshes_read_time,
-    }
-}
-
-inventory::submit! {
-    engine_backend::subsystems::render::AnimatedContentRegistration {
-        origin: pulsar_plugins::origin!(),
-        watch: |world| world.open_change_cursor::<helio_mats::instance::MaterialInstanceComponent>(),
-        animated: meshes_read_time,
-    }
-}
-
-// What an object's mesh instances author fixes the object.
-inventory::submit! {
-    helio_component::components::MovabilityRegistration {
-        origin: pulsar_plugins::origin!(),
-        of: |world, instance| world.get::<StaticMeshComponent>(instance).map(|mesh| mesh.movability),
-    }
-}
-
-// An animator (the animation plugin's) finds the skinned mesh it drives and
-// shows its pose there (`helio_component::skinning`).
-inventory::submit! {
-    helio_component::skinning::SkinnedMeshAccess {
-        origin: pulsar_plugins::origin!(),
-        instance: |world, owner, ordinal| {
-            pulsar_world_registry::instances::resolve_instance(
-                world,
-                owner,
-                components::SKELETAL_MESH_COMPONENT,
-                ordinal,
-            )
-        },
-        binding: |world, instance| {
-            world
-                .get::<SkeletalMeshComponent>(instance)
-                .map(|mesh| mesh.binding())
-        },
-        show_pose: |world, instance, bones, pose| {
-            world
-                .get_mut::<SkeletalMeshComponent>(instance)
-                .map(|mut mesh| mesh.show_pose(bones, pose))
-                .is_some()
-        },
-    }
-}
-
-// A headless run reports how many mesh components there are and how many
-// bound their geometry.
-inventory::submit! {
-    engine_backend::scene::game_hooks::ContentReportRegistration {
-        origin: pulsar_plugins::origin!(),
-        key: "meshes",
-        report: |world| {
-            let mut components = 0;
-            let mut bound = 0;
-            for (_, mesh) in world.query::<&StaticMeshComponent>() {
-                components += 1;
-                if mesh.geometry_key != MeshGeometryKey::NONE {
-                    bound += 1;
-                }
-            }
-            serde_json::json!({ "components": components, "bound": bound })
-        },
-    }
-}
-
-// The `project.virtual_geometry` settings.
-inventory::submit! {
-    pulsar_settings::project::ProjectSettingsRegistration {
-        origin: pulsar_plugins::origin!(),
-        register: vg_settings::register,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use engine_backend::subsystems::render::helio_renderer::render_features;
-
-    #[test]
-    fn registers_its_features() {
-        let ids = render_features::plugin_features().ids();
-        for id in [
-            "helio.mesh.batch",
-            "helio.mesh.cull",
-            "helio.mesh.gbuffer",
-            "helio.mesh.shadow",
-        ] {
-            assert!(ids.contains(&id), "{id} is missing: {ids:?}");
-        }
-    }
-
     /// The join reads these rows with fixed layouts; a drift here must fail
     /// a test, not draw garbage.
     #[test]

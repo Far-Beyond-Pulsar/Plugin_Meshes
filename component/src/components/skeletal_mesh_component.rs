@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use engine_class_derive::{engine_class, register_scene_props_applier, register_world_component};
+use engine_class_derive::{engine_class, register_scene_props_applier, world_component};
 use helio_mesh_api::PackedVertex;
 use pulsar_reflection::{
     AssetKind, AssetRef, ScenePropsProjector, SkeletalMeshAssetKind, SkeletonAssetKind,
@@ -124,7 +124,7 @@ impl ScenePropsProjector for SkeletalMeshComponent {
     }
 }
 
-#[register_world_component(
+#[world_component(
     decode = decode_skeletal_mesh_component,
     property_written = skeletal_mesh_property_written
 )]

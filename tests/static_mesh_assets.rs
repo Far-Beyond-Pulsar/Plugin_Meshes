@@ -12,6 +12,9 @@
 //! process global. Needs a GPU adapter for the upload checks (lavapipe
 //! works); skips them without one.
 
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +29,7 @@ use pulsar_scenedb::{AssetState, World};
 
 fn primitive(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../../assets/meshes/primitives")
+        .join("../../../assets/meshes/primitives")
         .join(name)
 }
 

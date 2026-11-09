@@ -2,6 +2,9 @@
 //! scene-join-shaped inputs: which static-mesh instances become VG-active,
 //! with which flags, and which objects the authored LOD must skip.
 
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
+
 use helio_core::{
     BufferHandle, BufferKey, SceneBufferProjection, SceneDerivation, SceneDerivationContext,
 };

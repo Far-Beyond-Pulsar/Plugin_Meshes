@@ -5,6 +5,9 @@
 //! Outputs go to `SKM_OUT_DIR` (default: a temp folder) for the plugin's
 //! `render_real_sample` test to draw.
 
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
+
 // The meshes' model importer registers itself with the import service.
 use meshes_component as _;
 

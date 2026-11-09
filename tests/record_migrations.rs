@@ -1,6 +1,9 @@
 //! The meshes' record migrations, as a level load runs them
 //! (`pulsar_class::records::migrate_component_records`).
 
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
+
 use meshes_component::records::{FOLDED, FROM_PROPS};
 use pulsar_class::records::migrate_component_records;
 use serde_json::json;

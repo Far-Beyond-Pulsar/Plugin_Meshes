@@ -1,6 +1,9 @@
 //! The engine's import service with the meshes' model importer: linking a
 //! source, re-importing it, converting in place, unlinking.
 
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
+
 // The model importer registers itself (`asset_import::ImporterRegistration`).
 use meshes_component as _;
 use std::path::{Path, PathBuf};
@@ -30,7 +33,7 @@ fn wait(id: TaskId) -> (TaskStatus, Option<String>) {
 }
 
 fn cube() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../assets/meshes/primitives/SM_Cube.fbx")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../assets/meshes/primitives/SM_Cube.fbx")
 }
 
 #[test]

@@ -14,7 +14,8 @@
 //! BM4 below measures that memoization's own speedup instead, which is the
 //! piece this codebase actually caches.
 
-#![cfg(feature = "gpu")]
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
 
 use helio_mesh_api::PackedVertex;
 use meshes_component::components::{MeshAssetPath, MeshGeometryKey, StaticMeshComponent};

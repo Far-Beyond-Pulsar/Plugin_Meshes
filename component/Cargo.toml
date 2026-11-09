@@ -2,10 +2,10 @@
 name = "meshes_component"
 version = "0.1.0"
 edition = "2024"
-description = "Meshes (pulsar.meshes): the SceneDB components (static and skeletal meshes, their draw rows, authored LOD, virtual-geometry overrides), mesh assets and their import, the scene join, LOD selection, the virtual-geometry host and picking, and the registrations of the plugin's Helio features."
+description = "Meshes (pulsar.meshes): the SceneDB components (static and skeletal meshes, their draw rows, authored LOD, virtual-geometry overrides), mesh assets and their import, the scene join, LOD selection, the virtual-geometry host and picking."
 
-# Hosts (the editor through the plugin crate, the game) link it; everything
-# registers through `inventory` once the crate is linked.
+# Registers nothing itself: the plugin's root crate (`meshes_plugin`) submits
+# its registrations. Its integration tests are the root's (`../tests`).
 [lib]
 name = "meshes_component"
 
@@ -17,15 +17,12 @@ default = ["gpu"]
 gpu = []
 
 [dependencies]
-# The plugin's descriptor and its registrations' origin.
-pulsar_plugins = { workspace = true }
 # The game's slim feature set (as pulsar_game): linking the plugin must not
 # pull the editor's features into a game build. A path dependency because
 # the workspace table cannot opt out of default features.
 engine_backend = { path = "../../../../crates/core/engine_backend", default-features = false, features = ["render"] }
 # The engine's shared pieces: the asset seams, images, movability.
 helio_component = { workspace = true }
-inventory = { workspace = true }
 helio = { workspace = true }
 helio-core = { workspace = true }
 helio-feature-api = { workspace = true }
@@ -83,25 +80,9 @@ twox-hash = { workspace = true }
 profiling = { workspace = true }
 
 [dev-dependencies]
+# The unit tests: headless devices and WGSL validation.
 pollster = "=0.4.0"
-# The moved engine tests: the import service, the tick loop, picking.
-editor_task_queue = { workspace = true }
-parking_lot = { workspace = true }
-pulsar_game = { path = "../../../../crates/core/pulsar_game" }
 naga = { version = "30.0.0", features = ["wgsl-in"] }
-tempfile = { workspace = true }
-
-[[test]]
-name = "static_mesh_component_gpu_mirror"
-required-features = ["gpu"]
-
-[[test]]
-name = "content_dedup"
-required-features = ["gpu"]
-
-[[test]]
-name = "content_dedup_benchmarks"
-required-features = ["gpu"]
 
 [lints]
 workspace = true

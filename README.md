@@ -22,8 +22,9 @@ draw phases and api crates.
 | `helio-android-demos` | `android-demos/` | Helio demos compiled for Android — one feature per demo |
 | `helio-mesh-api` | `api/` | The meshes' public contract: the rows their components author, the batch, draw and frame data their passes publish, the ray-instance rows their acceleration publishes, and their WGSL. The one crate another kind reads a mesh concept from. |
 | `helio-asset-compat` | `asset-compat/` | SolidRS integration layer for Helio renderer - asset loading and conversion |
-| `meshes_component` | `component/` | Meshes (pulsar.meshes): the SceneDB components (static and skeletal meshes, their draw rows, authored LOD, virtual-geometry overrides), mesh assets and their import, the scene join, LOD selection, the virtual-geometry host and picking, and the registrations of the plugin's Helio features. |
-| `meshes_plugin` | `editor/` | Meshes (pulsar.meshes): the editor plugin -- its metadata, over the plugin's component crate |
+| `meshes_plugin` | `./` (`src/`) | The plugin's root crate: the one place it registers everything it contributes (`src/runtime.rs`; `src/editor.rs` with the `editor` feature). Its integration tests are in `tests/`. |
+| `meshes_component` | `component/` | Meshes (pulsar.meshes): the SceneDB components (static and skeletal meshes, their draw rows, authored LOD, virtual-geometry overrides), mesh assets and their import, the scene join, LOD selection, the virtual-geometry host and picking. |
+| `meshes_editor` | `editor/` | Meshes (pulsar.meshes): the editor crate -- the level editor's mesh entries and icon and the asset browser's mesh thumbnails |
 | `meshes-examples` | `examples/` | The meshes plugin's standalone hosts on Helio: its demos and GPU tests |
 | `helio-pass-forward-lit` | `feature/forward/` | Helio pass: the forward-lit mesh drawer (presets without a G-buffer) |
 | `helio-pass-gbuffer` | `feature/gbuffer/` | Helio pass: the meshes' G-buffer drawer (opens the G-buffer phase) |
@@ -46,8 +47,11 @@ draw phases and api crates.
 | `helio-vg-stream` | `vg/stream/` | Virtual geometry page streaming: GPU page pool, residency table, request readback, upload scheduler |
 | `helio-web-demos` | `web-demos/` | The meshes plugin's scenes compiled to WASM, one feature per demo; `cargo run --bin web` builds every demo and serves them |
 
-- **Runtime module** (what a game built for a project links): `meshes_component`.
-- **Editor module** (what the editor links in addition): `meshes_plugin`.
+- **Root crate** `meshes_plugin`: the only crate that registers anything
+  (component classes, the Helio features, the scene join, settings, asset
+  seams, the importer; with `editor`, the level editor entries and
+  thumbnails). A game links it without `editor`; the editor links it with.
+  Other plugins never depend on it, only on `helio-mesh-api`.
 - **Requires**: nothing. A project enables or disables the plugin in its
   `Pulsar.toml` (`[plugins]`); disabled, the kind is absent and the frame
   draws without it.
@@ -65,8 +69,8 @@ only inside a Pulsar-Native checkout:
 ```bash
 git clone --recursive https://github.com/Far-Beyond-Pulsar/Pulsar-Native
 cd Pulsar-Native
-cargo check -p helio-android-demos -p helio-mesh-api -p helio-asset-compat -p meshes_component -p meshes_plugin -p meshes-examples -p helio-pass-forward-lit -p helio-pass-gbuffer -p helio-pass-indirect-dispatch -p helio-pass-object-batch -p helio-pass-occlusion-cull -p helio-pass-shadow -p helio-pass-shadow-dirty -p helio-pass-transparent -p helio-pass-vg -p helio-pass-vg-bvh -p helio-pass-vg-cull -p helio-pass-vg-dense -p helio-pass-vg-raster -p helio-pass-vg-shade -p helio-mesh-host -p helio-snapshot -p helio-vg-build -p helio-vg-format -p helio-vg-stream -p helio-web-demos --tests
-cargo test -p helio-mesh-api -p meshes_component -p helio-pass-forward-lit -p helio-pass-gbuffer -p helio-pass-indirect-dispatch -p helio-pass-object-batch -p helio-pass-occlusion-cull -p helio-pass-shadow -p helio-pass-shadow-dirty -p helio-pass-transparent -p helio-pass-vg -p helio-pass-vg-bvh -p helio-pass-vg-cull -p helio-pass-vg-dense -p helio-pass-vg-raster -p helio-pass-vg-shade
+cargo check -p helio-android-demos -p helio-mesh-api -p helio-asset-compat -p meshes_component -p meshes_editor -p meshes_plugin --features meshes_plugin/editor -p meshes-examples -p helio-pass-forward-lit -p helio-pass-gbuffer -p helio-pass-indirect-dispatch -p helio-pass-object-batch -p helio-pass-occlusion-cull -p helio-pass-shadow -p helio-pass-shadow-dirty -p helio-pass-transparent -p helio-pass-vg -p helio-pass-vg-bvh -p helio-pass-vg-cull -p helio-pass-vg-dense -p helio-pass-vg-raster -p helio-pass-vg-shade -p helio-mesh-host -p helio-snapshot -p helio-vg-build -p helio-vg-format -p helio-vg-stream -p helio-web-demos --tests
+cargo test -p helio-mesh-api -p meshes_component -p meshes_plugin -p helio-pass-forward-lit -p helio-pass-gbuffer -p helio-pass-indirect-dispatch -p helio-pass-object-batch -p helio-pass-occlusion-cull -p helio-pass-shadow -p helio-pass-shadow-dirty -p helio-pass-transparent -p helio-pass-vg -p helio-pass-vg-bvh -p helio-pass-vg-cull -p helio-pass-vg-dense -p helio-pass-vg-raster -p helio-pass-vg-shade
 ```
 
 Suites that render real frames need a GPU; CI leaves them out by name

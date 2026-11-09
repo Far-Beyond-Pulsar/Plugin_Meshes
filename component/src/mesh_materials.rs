@@ -247,11 +247,3 @@ impl pulsar_scenedb::Subsystem for MeshMaterialInstances {
         self
     }
 }
-
-pulsar_world_registry::inventory::submit! {
-    pulsar_world_registry::SceneSubsystemRegistration {
-        origin: pulsar_plugins::origin!(),
-        name: MeshMaterialInstances::NAME,
-        install: |scene| scene.register_subsystem(MeshMaterialInstances::default()),
-    }
-}
