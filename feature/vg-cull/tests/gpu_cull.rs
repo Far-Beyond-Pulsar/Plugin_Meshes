@@ -594,6 +594,8 @@ fn single_phase_matches_the_reference_over_taus_and_residencies() {
             VgCullConfig {
                 two_phase_occlusion: false,
                 initial_bin_capacity: 4096,
+                // The reference is the stateless cut: no overdraw valve.
+                tile_density_limit: 0.0,
                 ..Default::default()
             },
         );
