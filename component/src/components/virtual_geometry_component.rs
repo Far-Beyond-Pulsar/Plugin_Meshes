@@ -19,7 +19,7 @@
 //! virtual-geometry passes are wired into the default graph (task T10) its
 //! ledger row is `unverified` instead.
 
-use engine_class_derive::{engine_class, register_world_component};
+use engine_class_derive::{engine_class, world_component};
 use helio_vg_format::{
     INST_ENABLED, INST_FORCE_ROOT_ONLY, INST_SHADOW_CASTER, INST_TIER_SHIFT, TierLock,
 };
@@ -212,7 +212,7 @@ fn virtual_geometry_property_written(
     }
 }
 
-#[register_world_component(
+#[world_component(
     decode = decode_virtual_geometry_component,
     property_written = virtual_geometry_property_written
 )]

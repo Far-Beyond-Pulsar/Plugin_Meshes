@@ -1,7 +1,7 @@
 //! Authored mesh LOD selection for a scene object.
 
 use super::MeshAssetPath;
-use engine_class_derive::{engine_class, register_world_component};
+use engine_class_derive::{engine_class, world_component};
 use pulsar_reflection::{ReflectError, ReflectResult, pulsar_type};
 
 /// Selects among authored mesh assets according to camera distance.
@@ -221,5 +221,5 @@ fn refresh_gpu_levels(component: &mut LODComponent) {
         .collect();
 }
 
-#[register_world_component(decode = decode_lod_component, property_written = lod_property_written)]
+#[world_component(decode = decode_lod_component, property_written = lod_property_written)]
 impl LODComponent {}

@@ -1,6 +1,6 @@
 //! Static mesh component for mesh asset assignment.
 
-use engine_class_derive::{engine_class, register_scene_props_applier, register_world_component};
+use engine_class_derive::{engine_class, register_scene_props_applier, world_component};
 use helio_mesh_api::PackedVertex;
 use pulsar_reflection::{ReflectError, ScenePropsProjector};
 use serde::{Deserialize, Serialize};
@@ -9,20 +9,12 @@ use std::collections::HashMap;
 
 use crate::mesh_cache::{MeshAssetUpload, MeshMaterialSlot, MeshSection};
 use crate::mesh_files::load_mesh_asset_upload;
-use helio_component::asset_component::AssetComponentRegistration;
 use helio_component::subsystems::resolve_asset_path;
 use pulsar_scenedb::gpu::{BufferKey, GpuMirrorHandle, InternedGpuLease};
 use pulsar_scenedb::handle_ledger::HandleId;
 use pulsar_scenedb::{AssetId, AssetPayload, AssetView, Prefetch, Residency};
 use std::sync::{Mutex, OnceLock};
 
-pulsar_reflection::inventory::submit! {
-    AssetComponentRegistration {
-        asset_kind: plugin_editor_api::AssetKind::Mesh,
-        class_name: "StaticMeshComponent",
-        value_for: |path| Box::new(StaticMeshComponent::for_mesh_asset(path)),
-    }
-}
 // Mat4/Quat/Vec3 used to build the transform passed to sync_mesh_object.
 
 // ── MeshAssetPath ─────────────────────────────────────────────────────────────
@@ -355,15 +347,6 @@ pub fn mesh_source_for_file(abs: &std::path::Path) -> String {
         .unwrap_or_else(|_| abs.to_path_buf())
         .to_string_lossy()
         .into_owned()
-}
-
-// A changed mesh file reloads its mesh asset.
-inventory::submit! {
-    helio_component::asset_component::AssetReloadRegistration {
-        origin: pulsar_plugins::origin!(),
-        kind: plugin_editor_api::AssetKind::Mesh,
-        sources_for_file: |path| vec![mesh_source_for_file(path)],
-    }
 }
 
 /// The mesh kind's loader: runs on a SceneDB worker thread.
@@ -1308,7 +1291,7 @@ fn local_bounding_sphere_from_bounds(bounds: crate::mesh_cache::MeshLocalBounds)
 
 // Phase B4 (Pulsar-Native#555): the first component migrated onto
 // pulsar_world_registry's World bridge.
-#[register_world_component(
+#[world_component(
     decode = decode_static_mesh_component,
     property_written = static_mesh_property_written
 )]

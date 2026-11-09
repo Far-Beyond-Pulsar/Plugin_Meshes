@@ -1,0 +1,65 @@
+[package]
+name = "meshes_plugin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Meshes (`pulsar.meshes`): the plugin's root crate, the one place it registers everything it contributes (runtime registrations always, the editor's with `editor`)"
+# `examples/` is the plugin's examples crate, not this package's examples.
+autoexamples = false
+
+[features]
+# The editor's registrations (the hierarchy icon, the Create menu's meshes,
+# the asset browser's thumbnails) and the crates they need. A game links the
+# root without it, so it takes no editor dependency.
+editor = ["dep:meshes_editor", "dep:ui_level_editor", "dep:ui_common", "dep:ui", "dep:pulsar_scene_model"]
+
+[dependencies]
+# The plugin gate and the registrations' collection.
+pulsar_plugins = { workspace = true }
+inventory = { workspace = true }
+# The plugin's crates.
+meshes_component = { workspace = true }
+meshes_editor = { workspace = true, optional = true }
+# The engine seams the plugin registers into.
+engine_backend = { path = "../../../crates/core/engine_backend", default-features = false, features = ["render"] }
+helio_component = { workspace = true }
+helio-mats = { workspace = true, features = ["instances"] }
+plugin_editor_api = { workspace = true }
+pulsar_scenedb = { workspace = true }
+pulsar_world_registry = { workspace = true }
+pulsar_settings = { workspace = true }
+pulsar_class = { workspace = true }
+asset_import = { workspace = true }
+# The editor's extension points.
+ui_level_editor = { workspace = true, optional = true }
+ui_common = { workspace = true, optional = true }
+ui = { workspace = true, optional = true }
+pulsar_scene_model = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The plugin's integration tests (`tests/`): the plugin as a game links it.
+pollster = "=0.4.0"
+editor_task_queue = { workspace = true }
+parking_lot = { workspace = true }
+pulsar_game = { path = "../../../crates/core/pulsar_game" }
+naga = { version = "30.0.0", features = ["wgsl-in"] }
+tempfile = { workspace = true }
+glam = { workspace = true, features = ["serde"] }
+serde_json = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true, features = ["derive"] }
+image = { workspace = true }
+helio = { workspace = true }
+helio-core = { workspace = true }
+helio-mesh-api = { workspace = true }
+helio-vg-format = { workspace = true }
+helio-vg-build = { workspace = true }
+helio-pass-object-batch = { workspace = true }
+skeletal_assets = { workspace = true }
+engine_state = { workspace = true }
+engine_fs = { workspace = true }
+pulsar_scene_model = { workspace = true }
+pulsar_reflection = { workspace = true, features = ["prims-gpui"] }
+
+[lints]
+workspace = true

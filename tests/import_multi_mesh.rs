@@ -1,6 +1,9 @@
 //! A source with several meshes becomes one native mesh per source mesh, not
 //! one merged mesh.
 
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
+
 // The meshes' model importer registers itself with the import service.
 use meshes_component as _;
 

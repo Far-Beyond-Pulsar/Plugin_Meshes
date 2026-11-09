@@ -106,6 +106,12 @@ jobs:
           test -n "$packages"
           echo "PACKAGES=$packages" >> "$GITHUB_ENV"
           echo "$packages"
+          # The plugin's root crate registers its editor contributions behind
+          # its `editor` feature: check and test them too.
+          root=$(sed -n 's/^root = "\(.*\)"/\1/p' "$PLUGIN_DIR/pulsar-plugin.toml")
+          if [ -n "$root" ] && ! grep -q '^editor_only = true' "$PLUGIN_DIR/pulsar-plugin.toml"; then
+            echo "ROOT_FEATURES=--features $root/editor" >> "$GITHUB_ENV"
+          fi
 
       - name: rustfmt
         working-directory: pulsar
@@ -118,7 +124,7 @@ jobs:
         working-directory: pulsar
         run: |
           # shellcheck disable=SC2086 # one -p per word
-          cargo clippy $PACKAGES --all-targets -- \
+          cargo clippy $PACKAGES $ROOT_FEATURES --all-targets -- \
             -A warnings \
             -A dead_code \
             -A clippy::too_many_arguments \
@@ -142,4 +148,4 @@ jobs:
         timeout-minutes: 60
         run: |
           # shellcheck disable=SC2086 # one -p per word
-          cargo nextest run --profile ci $PACKAGES --no-fail-fast --no-tests=pass
+          cargo nextest run --profile ci $PACKAGES $ROOT_FEATURES --no-fail-fast --no-tests=pass

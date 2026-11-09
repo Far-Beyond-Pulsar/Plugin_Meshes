@@ -1,6 +1,9 @@
 //! A mesh's geometry as imported, cached and uploaded: UVs, normals,
 //! sections and the vertex pool's layout survive each step.
 
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
+
 fn gpu() -> (wgpu::Device, wgpu::Queue) {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter =
@@ -98,7 +101,7 @@ fn gpu_mesh_upload_preserves_uv0_uv1_normals_and_stride() {
 #[test]
 fn fbx_import_and_native_cache_preserve_uvs_normals_and_sections() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../../assets/meshes/primitives/SM_Cube.fbx");
+        .join("../../../assets/meshes/primitives/SM_Cube.fbx");
     let asset = meshes_component::mesh_files::load_mesh_asset_upload(&path).expect("bundled FBX");
     assert!(!asset.sections.is_empty());
     assert!(

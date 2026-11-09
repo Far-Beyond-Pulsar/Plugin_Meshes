@@ -5,6 +5,9 @@
 //! edit sets, the row a light gets) and a world populated before the mirror
 //! attached. Needs a GPU adapter (lavapipe works); skips without one.
 
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
+
 use std::sync::Arc;
 
 use engine_backend::scene::{SceneWorldExt, SpawnObject, Transform, Visibility, attachments};

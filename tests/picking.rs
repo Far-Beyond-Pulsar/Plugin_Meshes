@@ -2,6 +2,9 @@
 //! (`engine_backend`'s `ContentGeometryRegistration`) tests the ray against
 //! the mesh's triangles and frames its bounding sphere.
 
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
+
 use engine_backend::subsystems::render::helio_renderer::SceneInteraction;
 use glam::{DVec3, Vec3};
 use meshes_component::components::{MeshGeometryKey, StaticMeshComponent};

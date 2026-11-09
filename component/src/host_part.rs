@@ -1,4 +1,5 @@
-//! The meshes' per-renderer state (`RenderHostPartRegistration`): the
+//! The meshes' per-renderer state (a `RenderHostPartRegistration` the root
+//! submits): the
 //! virtual-geometry host (builds, caches and streams the cluster assets of
 //! meshes whose owner has a `VirtualGeometryComponent`; its runtime feeds
 //! the VG passes) and the authored LOD selection.
@@ -10,9 +11,7 @@
 use std::sync::Arc;
 
 use engine_backend::scene::SharedScene;
-use engine_backend::subsystems::render::helio_renderer::{
-    RenderHostPart, RenderHostPartRegistration,
-};
+use engine_backend::subsystems::render::helio_renderer::RenderHostPart;
 use helio_core::SceneDerivation;
 use pulsar_scenedb::gpu::{BufferKey, GpuMirrorHandle};
 
@@ -28,7 +27,7 @@ pub struct MeshesHostPart {
 }
 
 impl MeshesHostPart {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             virtual_geometry: VirtualGeometryHost::new(),
             settings_override: None,
@@ -170,13 +169,5 @@ impl RenderHostPart for MeshesHostPart {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
-    }
-}
-
-inventory::submit! {
-    RenderHostPartRegistration {
-        origin: pulsar_plugins::origin!(),
-        name: "meshes",
-        new: || Box::new(MeshesHostPart::new()),
     }
 }

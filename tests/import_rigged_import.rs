@@ -1,6 +1,9 @@
 //! Import of a rigged glTF into the linked skeletal assets. The model is built
 //! here, byte by byte, so no binary fixture is committed.
 
+// The plugin as a game links it: its root, with every registration.
+use meshes_plugin as _;
+
 // The meshes' model importer registers itself with the import service.
 use meshes_component as _;
 
@@ -494,8 +497,8 @@ fn a_static_model_still_imports_to_a_plain_mesh_with_no_extra_outputs() {
     let project = Project::new();
     let root = project.root().to_path_buf();
     let source = root.join("cube.fbx");
-    let cube = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../../assets/meshes/primitives/SM_Cube.fbx");
+    let cube =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../assets/meshes/primitives/SM_Cube.fbx");
     std::fs::copy(cube, &source).unwrap();
     let options = Arc::new(Mutex::new(OptionValues::new()));
 
