@@ -1,0 +1,470 @@
+{
+  "shots": [
+    {
+      "name": "hero-lucy",
+      "camera": {
+        "position": [
+          9.992046356201172,
+          1.4702569246292114,
+          29.043081283569336
+        ],
+        "look_at": [
+          13.1,
+          1.2,
+          25.8
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240
+    },
+    {
+      "name": "hero-lucy-triangles",
+      "camera": {
+        "position": [
+          9.992046356201172,
+          1.4702569246292114,
+          29.043081283569336
+        ],
+        "look_at": [
+          13.1,
+          1.2,
+          25.8
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240,
+      "debug_view": "triangle"
+    },
+    {
+      "name": "hero-thai",
+      "camera": {
+        "position": [
+          19.1,
+          2.4,
+          38.5
+        ],
+        "look_at": [
+          19.1,
+          2.4,
+          33.1
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240
+    },
+    {
+      "name": "hero-thai-triangles",
+      "camera": {
+        "position": [
+          19.1,
+          2.4,
+          38.5
+        ],
+        "look_at": [
+          19.1,
+          2.4,
+          33.1
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240,
+      "debug_view": "triangle"
+    },
+    {
+      "name": "hero-canopy",
+      "camera": {
+        "position": [
+          40,
+          9,
+          44
+        ],
+        "look_at": [
+          27,
+          11,
+          30
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240
+    },
+    {
+      "name": "hero-canopy-triangles",
+      "camera": {
+        "position": [
+          40,
+          9,
+          44
+        ],
+        "look_at": [
+          27,
+          11,
+          30
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240,
+      "debug_view": "triangle"
+    },
+    {
+      "name": "hero-courtyard",
+      "camera": {
+        "position": [
+          -2,
+          1.8,
+          40
+        ],
+        "look_at": [
+          13.1,
+          1.8,
+          25.8
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240
+    },
+    {
+      "name": "hero-courtyard-triangles",
+      "camera": {
+        "position": [
+          -2,
+          1.8,
+          40
+        ],
+        "look_at": [
+          13.1,
+          1.8,
+          25.8
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240,
+      "debug_view": "triangle"
+    },
+    {
+      "name": "crowd-forest",
+      "camera": {
+        "position": [
+          -22,
+          2,
+          30
+        ],
+        "look_at": [
+          -70,
+          8,
+          8
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240
+    },
+    {
+      "name": "crowd-forest-tier-hw",
+      "camera": {
+        "position": [
+          -22,
+          2,
+          30
+        ],
+        "look_at": [
+          -70,
+          8,
+          8
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240,
+      "debug_view": "tier",
+      "mode": "hw"
+    },
+    {
+      "name": "crowd-forest-dense-peel",
+      "camera": {
+        "position": [
+          -22,
+          2,
+          30
+        ],
+        "look_at": [
+          -70,
+          8,
+          8
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 300,
+      "mode": "nonrt"
+    },
+    {
+      "name": "crowd-forest-dense-mask",
+      "camera": {
+        "position": [
+          -22,
+          2,
+          30
+        ],
+        "look_at": [
+          -70,
+          8,
+          8
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 300,
+      "debug_view": "dense_mask",
+      "mode": "nonrt"
+    },
+    {
+      "name": "normal-overview",
+      "camera": {
+        "position": [
+          -34,
+          11,
+          78
+        ],
+        "look_at": [
+          6,
+          3,
+          22
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240
+    },
+    {
+      "name": "residency-overview-tau1p0",
+      "camera": {
+        "position": [
+          -34,
+          11,
+          78
+        ],
+        "look_at": [
+          6,
+          3,
+          22
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240,
+      "debug_view": "residency",
+      "tau_px": 1.0
+    },
+    {
+      "name": "error-overview-tau1p0",
+      "camera": {
+        "position": [
+          -34,
+          11,
+          78
+        ],
+        "look_at": [
+          6,
+          3,
+          22
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240,
+      "debug_view": "error",
+      "tau_px": 1.0
+    },
+    {
+      "name": "residency-forest-tau1p0",
+      "camera": {
+        "position": [
+          -22,
+          2,
+          30
+        ],
+        "look_at": [
+          -70,
+          8,
+          8
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240,
+      "debug_view": "residency",
+      "tau_px": 1.0
+    },
+    {
+      "name": "error-forest-tau1p0",
+      "camera": {
+        "position": [
+          -22,
+          2,
+          30
+        ],
+        "look_at": [
+          -70,
+          8,
+          8
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240,
+      "debug_view": "error",
+      "tau_px": 1.0
+    },
+    {
+      "name": "residency-overview-tau0p25",
+      "camera": {
+        "position": [
+          -34,
+          11,
+          78
+        ],
+        "look_at": [
+          6,
+          3,
+          22
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240,
+      "debug_view": "residency",
+      "tau_px": 0.25
+    },
+    {
+      "name": "error-overview-tau0p25",
+      "camera": {
+        "position": [
+          -34,
+          11,
+          78
+        ],
+        "look_at": [
+          6,
+          3,
+          22
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240,
+      "debug_view": "error",
+      "tau_px": 0.25
+    },
+    {
+      "name": "residency-forest-tau0p25",
+      "camera": {
+        "position": [
+          -22,
+          2,
+          30
+        ],
+        "look_at": [
+          -70,
+          8,
+          8
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240,
+      "debug_view": "residency",
+      "tau_px": 0.25
+    },
+    {
+      "name": "error-forest-tau0p25",
+      "camera": {
+        "position": [
+          -22,
+          2,
+          30
+        ],
+        "look_at": [
+          -70,
+          8,
+          8
+        ],
+        "fov_deg": 50
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "settle_frames": 240,
+      "debug_view": "error",
+      "tau_px": 0.25
+    }
+  ]
+}

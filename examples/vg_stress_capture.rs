@@ -752,9 +752,15 @@ pub fn default_shots() -> Vec<Shot> {
     shots
 }
 
-/// `assets/vg_stress/shots.json` if it exists and parses, else the default.
+/// The file named by `VG_STRESS_SHOTS` (relative to the examples directory), else
+/// `assets/vg_stress/shots.json`, if it exists and parses, else the default.
+/// `vg_stress_shots/vg_runtime.json` is the fixed before/after list of the VG
+/// runtime work (hero close-ups, crowd, dense, views 107 and 109 at tau 1 and 0.25).
 pub fn load_shots(root: &Path) -> Vec<Shot> {
-    let path = root.join("assets/vg_stress/shots.json");
+    let path = match std::env::var("VG_STRESS_SHOTS") {
+        Ok(file) if !file.trim().is_empty() => root.join(file.trim()),
+        _ => root.join("assets/vg_stress/shots.json"),
+    };
     match std::fs::read_to_string(&path) {
         Ok(text) => match parse_shots(&text) {
             Ok(shots) => {

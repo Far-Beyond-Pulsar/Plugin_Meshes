@@ -48,7 +48,7 @@ fn shader_struct_sizes_match_the_uploads() {
             .unwrap_or_else(|| panic!("missing {name}"));
         layouter[h].size
     };
-    assert_eq!(size("CullParams"), 80);
+    assert_eq!(size("CullParams"), 96);
     assert_eq!(size("VgBvhNode"), 32);
     assert_eq!(size("VgBvhHeader"), 128);
     assert_eq!(size("RoundParams"), 16);
