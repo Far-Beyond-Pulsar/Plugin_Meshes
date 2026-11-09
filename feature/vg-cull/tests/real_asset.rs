@@ -350,8 +350,7 @@ fn cut_is_exact_on_a_real_asset_fully_resident_and_under_streaming_churn() {
             want.insert((lcg(&mut rng) % pages as u64) as u32);
             core.ingest(&Feedback {
                 requests: want.into_iter().map(|p| reg.page_base + p).collect(),
-                used: vec![],
-                overflowed: false,
+                ..Feedback::default()
             });
         }
         evictions_seen |= core.scheduler_stats().evictions > 0;

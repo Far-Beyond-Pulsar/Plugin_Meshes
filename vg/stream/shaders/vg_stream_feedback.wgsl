@@ -28,6 +28,24 @@ fn vg_touch_page(global_page: u32) {
     atomicOr(&vg_feedback[VG_FB_HEADER_WORDS + cap + words + (global_page >> 5u)], bit);
 }
 
+/// Record that `global_page` is wanted by the cut: resident pages are touched,
+/// non-resident ones requested. `urgent` = the cut needs it now (it would
+/// refine into it); otherwise it is a prefetch, scheduled after every urgent
+/// request.
+fn vg_demand_page(global_page: u32, urgent: bool) {
+    if (vg_residency[global_page] != VG_PAGE_NOT_RESIDENT) {
+        vg_touch_page(global_page);
+        return;
+    }
+    if (urgent) {
+        let cap = atomicLoad(&vg_feedback[VG_FB_CAPACITY]);
+        let words = atomicLoad(&vg_feedback[VG_FB_BITS_WORDS]);
+        let bit = 1u << (global_page & 31u);
+        atomicOr(&vg_feedback[VG_FB_HEADER_WORDS + cap + 2u * words + (global_page >> 5u)], bit);
+    }
+    vg_request_page(global_page);
+}
+
 /// Resolve a page for drawing: returns its slot and touches it, or requests
 /// it and returns VG_PAGE_NOT_RESIDENT (draw the resident parent instead).
 fn vg_use_or_request_page(global_page: u32) -> u32 {

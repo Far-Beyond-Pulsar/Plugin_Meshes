@@ -1,6 +1,7 @@
 //! Pipelines, targets and the per-frame encode of the virtual-geometry raster.
 
 use crate::abi::{self, ClassifyParams, VgRasterParams, TILE_SIZE};
+use helio_pass_vg_cull::VgTileEstimate;
 use crate::shaders;
 use helio_core::CommandRecorder;
 use wgpu::util::DeviceExt;
@@ -35,6 +36,9 @@ pub struct VgRasterConfig {
     /// A tile with at least this many depth-test-passing pixel hits is dense
     /// (256 pixels per tile, so `256 * K` = average depth complexity K).
     pub dense_hit_threshold: u32,
+    /// Divides both thresholds: higher lowers the overlap a tile needs to be
+    /// classified dense. Set per frame from `VirtualGeometrySettings`.
+    pub dense_sensitivity: f32,
     /// A previously dense tile stays dense above this fraction of the thresholds.
     pub dense_hysteresis: f32,
     /// Frames a tile stays dense after its counters last qualified (latch with
@@ -51,38 +55,14 @@ fn env_u32(name: &str) -> Option<u32> {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
 }
 
-/// Higher sensitivity lowers the overlap required before a tile is classified
-/// as dense. Kept as a startup setting because the classifier pipelines are
-/// built with the raster pass.
-fn dense_sensitivity() -> f32 {
-    std::env::var("HELIO_VG_DENSE_SENSITIVITY")
-        .ok()
-        .and_then(|value| value.trim().parse::<f32>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(1.0)
-        .clamp(0.125, 8.0)
-}
-
-fn sensitivity_threshold(base: u32, sensitivity: f32) -> u32 {
-    (f64::from(base.max(1)) / f64::from(sensitivity))
-        .round()
-        .clamp(1.0, f64::from(u32::MAX)) as u32
-}
-
 impl Default for VgRasterConfig {
     fn default() -> Self {
-        let sensitivity = dense_sensitivity();
         Self {
             cull_back: true,
             tile_bin_cap: 1024,
-            dense_tri_threshold: sensitivity_threshold(
-                env_u32("HELIO_VG_DENSE_TRI").unwrap_or(64),
-                sensitivity,
-            ),
-            dense_hit_threshold: sensitivity_threshold(
-                env_u32("HELIO_VG_DENSE_HIT").unwrap_or(64),
-                sensitivity,
-            ),
+            dense_tri_threshold: env_u32("HELIO_VG_DENSE_TRI").unwrap_or(64).max(1),
+            dense_hit_threshold: env_u32("HELIO_VG_DENSE_HIT").unwrap_or(64).max(1),
+            dense_sensitivity: 1.0,
             dense_hysteresis: 0.5,
             dense_latch_frames: env_u32("HELIO_VG_DENSE_LATCH").unwrap_or(8),
             dense_max_tiles: env_u32("HELIO_VG_DENSE_MAX_TILES").unwrap_or(512),
@@ -122,22 +102,6 @@ pub struct VgRasterInputs<'a> {
     /// Alpha-masked clusters (bins 6 and 7 of the cull). `None` records nothing
     /// for them; the opaque tiers are identical either way.
     pub masked: Option<VgMaskedInputs<'a>>,
-    /// Dense-bin clusters (cull bin 5) of this phase: their overlap is estimated
-    /// into the classifier so a tile does not stop being dense just because its
-    /// clusters were diverted away from Tier 2. `None` = no estimate.
-    pub dense: Option<VgDenseInputs<'a>>,
-}
-
-/// The cull's dense bin for one phase (see [`VgRasterInputs::dense`]).
-#[derive(Clone, Copy)]
-pub struct VgDenseInputs<'a> {
-    /// Buffer holding the dense bin `{first, count}` (the cull `state`).
-    pub meta: &'a wgpu::Buffer,
-    /// Word offset of the dense bin's `{first, count}` in `meta`.
-    pub meta_offset_words: u32,
-    /// `DispatchIndirect` args of the dense bin `{min(n, 32768), ceil(n / 32768), 1}`.
-    pub dispatch: &'a wgpu::Buffer,
-    pub dispatch_offset: u64,
 }
 
 /// Inputs of the alpha-masked tiers (see `helio_mats::vg_alpha`).
@@ -182,15 +146,12 @@ pub struct VgTargets {
     pub dense_list: wgpu::Buffer,
     /// `[x, y, z, count]`: DispatchIndirect args for one workgroup per dense tile + count.
     pub dense_args: wgpu::Buffer,
-    /// Per-tile triangle estimate of this frame's dense-bin clusters (`u32`).
-    pub dense_est: wgpu::Buffer,
     /// Persistent per-tile latch age of the dense classification.
     pub dense_age: wgpu::Buffer,
     pub(crate) tile_bin_counts: wgpu::Buffer,
     pub(crate) tile_bin_entries: wgpu::Buffer,
     pub(crate) params: [wgpu::Buffer; 2],
     pub(crate) params_masked: [wgpu::Buffer; 2],
-    pub(crate) params_dense: [wgpu::Buffer; 2],
     pub(crate) classify_params: wgpu::Buffer,
     parity: usize,
 }
@@ -255,7 +216,6 @@ impl VgTargets {
         };
         let params = [make_params(), make_params()];
         let params_masked = [make_params(), make_params()];
-        let params_dense = [make_params(), make_params()];
         let classify_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("VG Classify Params"),
             contents: bytemuck::bytes_of(&ClassifyParams {
@@ -265,9 +225,10 @@ impl VgTargets {
                 hysteresis: raster.config.dense_hysteresis,
                 max_dense: raster.config.dense_max_tiles,
                 latch: raster.config.dense_latch_frames,
-                pad: [0; 2],
+                est_base: ClassifyParams::NO_ESTIMATE,
+                sensitivity: raster.config.dense_sensitivity,
             }),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         Self {
             width,
@@ -287,7 +248,6 @@ impl VgTargets {
             ],
             dense_list: buf("VG Dense List", tiles * 4, st),
             dense_args: buf("VG Dense Args", 16, st | wgpu::BufferUsages::INDIRECT),
-            dense_est: buf("VG Dense Estimate", tiles * 4, st),
             dense_age: buf("VG Dense Age", tiles * 4, st),
             tile_bin_counts: buf(
                 "VG Tile Bin Counts",
@@ -301,7 +261,6 @@ impl VgTargets {
             ),
             params,
             params_masked,
-            params_dense,
             classify_params,
             parity: 0,
         }
@@ -421,8 +380,6 @@ pub struct VgRaster {
     classify: wgpu::ComputePipeline,
     classify_args: wgpu::ComputePipeline,
     classify_bgl: wgpu::BindGroupLayout,
-    dense_count: wgpu::ComputePipeline,
-    dense_count_bgl1: wgpu::BindGroupLayout,
     binding: helio_mats::MaterialBindingConfig,
     /// Built on first use: devices and scenes without alpha-tested materials
     /// never compile (or pay for) the masked pipelines.
@@ -568,19 +525,6 @@ impl VgRaster {
         let cpl = pipeline_layout(device, "VG Classify PL", &[&classify_bgl]);
         let classify = compute(device, "VG Tile Classify", &cpl, &cm, "classify_main");
         let classify_args = compute(device, "VG Dense Args", &cpl, &cm, "dense_args_main");
-        let dcm = module(device, "VG Dense Count", shaders::dense_count_source());
-        let dense_count_bgl1 = bgl(
-            device,
-            "VG Dense Count G1",
-            &[storage_entry(0, c, false), storage_entry(1, c, true)],
-        );
-        let dcpl = pipeline_layout(
-            device,
-            "VG Dense Count PL",
-            &[&bgl0_compute, &dense_count_bgl1],
-        );
-        let dense_count = compute(device, "VG Dense Count", &dcpl, &dcm, "dense_count_main");
-
         Self {
             config,
             hw,
@@ -591,8 +535,6 @@ impl VgRaster {
             classify,
             classify_args,
             classify_bgl,
-            dense_count,
-            dense_count_bgl1,
             binding: helio_mats::MaterialBindingConfig::for_device(device),
             masked: std::sync::OnceLock::new(),
         }
@@ -712,7 +654,7 @@ impl VgRaster {
     ) {
         let mut rec = CommandRecorder::from_encoder(encoder);
         self.encode_phase(device, queue, &mut rec, t, i, 0);
-        self.encode_classify(device, &mut rec, t);
+        self.encode_classify(device, queue, &mut rec, t, None);
     }
 
     /// Record one phase of a two-phase frame: Tier 1 draws then Tier 2.
@@ -764,7 +706,6 @@ impl VgRaster {
                 &t.tile_counters,
                 &t.stats,
                 &t.dense_args,
-                &t.dense_est,
             ] {
                 rec.clear_buffer(b, 0, None);
             }
@@ -915,25 +856,6 @@ impl VgRaster {
                 }
             }
         }
-        if let Some(d) = &i.dense {
-            // Estimate the overlap of clusters diverted to Tier 3, so the tiles
-            // they sit in keep counting as dense (see `vg_dense_count.wgsl`).
-            let params_dense = VgRasterParams {
-                sw_meta_word: d.meta_offset_words,
-                ..params
-            };
-            queue.write_buffer(&t.params_dense[slot], 0, bytemuck::bytes_of(&params_dense));
-            let g0d = g0(&self.bgl0_compute, &t.params_dense[slot]);
-            let g1d = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("VG Dense Count G1"),
-                layout: &self.dense_count_bgl1,
-                entries: &[bind(0, &t.dense_est), bind(1, d.meta)],
-            });
-            cpass.set_pipeline(&self.dense_count);
-            cpass.set_bind_group(0, &g0d, &[]);
-            cpass.set_bind_group(1, &g1d, &[]);
-            cpass.dispatch_workgroups_indirect(d.dispatch, d.dispatch_offset);
-        }
         if let Some(tf) = &self.tile {
             let g1b = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("VG SW Bin G1"),
@@ -974,12 +896,33 @@ impl VgRaster {
     /// Record tile classification over the counters of every phase recorded so
     /// far, and flip the double-buffered dense mask. Afterwards
     /// [`VgTargets::dense_mask_last_frame`] is the mask just classified.
+    ///
+    /// `estimate` is the cull's per-tile triangle estimate (hardware-class
+    /// clusters included); `None` classifies from the software counters alone.
     pub fn encode_classify(
         &self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         rec: &mut CommandRecorder<'_>,
         t: &mut VgTargets,
+        estimate: Option<VgTileEstimate<'_>>,
     ) {
+        // The cull's tile grid is the raster's when both were sized for the same
+        // screen; a mismatch (one resize behind) falls back to the counters.
+        let estimate = estimate.filter(|e| e.tiles == [t.tiles_x, t.tiles_y]);
+        let params = ClassifyParams {
+            tile_count: t.tiles_x * t.tiles_y,
+            tri_thresh: self.config.dense_tri_threshold,
+            hit_thresh: self.config.dense_hit_threshold,
+            hysteresis: self.config.dense_hysteresis,
+            max_dense: self.config.dense_max_tiles,
+            latch: self.config.dense_latch_frames,
+            est_base: estimate.map_or(ClassifyParams::NO_ESTIMATE, |e| e.base_words),
+            sensitivity: self.config.dense_sensitivity.max(1.0e-3),
+        };
+        queue.write_buffer(&t.classify_params, 0, bytemuck::bytes_of(&params));
+        // Bound even without an estimate (the layout needs a buffer there).
+        let est_buffer = estimate.map_or(&t.dense_age, |e| e.buffer);
         let write = t.parity;
         let read = t.parity ^ 1;
         let gc = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -992,7 +935,7 @@ impl VgRaster {
                 bind(3, &t.dense_masks[write]),
                 bind(4, &t.dense_list),
                 bind(5, &t.dense_args),
-                bind(6, &t.dense_est),
+                bind(6, est_buffer),
                 bind(7, &t.dense_age),
             ],
         });

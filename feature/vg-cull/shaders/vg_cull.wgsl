@@ -5,15 +5,19 @@
 // Composed in Rust (see `shader_source()`): helio prelude, generated `VGC_*`
 // constants, vg_format.wgsl, helio-vg-stream bindings + helpers (binding 4..11),
 // helio-pass-vg-bvh `NODES_WGSL`, then this
-// file. Entry points: cs_density, cs_seed, cs_round_prepare, cs_traverse, cs_finalize.
+// file. Entry points: cs_tiles, cs_seed, cs_round_prepare, cs_traverse, cs_finalize.
 //
 // Job = vec2<u32>(x, y), tag = y >> 30:
 //   0  GCBVH node          x = 0xffffffff, y = node index
 //   1  asset hierarchy item x = instance,   y = TAG | (parent_node << 2 | slot)
 //   2  cluster item         x = instance,   y = TAG | cluster_slot (pool_slot << 11 | local)
 //   3  instance             x = instance,   y = TAG
-// Every job tests only its own bound. The selected cut remains coverage complete;
-// the screen-wide density solve (`cs_density`) raises tau instead of rejecting geometry.
+// Every job tests only its own bound. The cut is per cluster group: a group is
+// refined when its projected error exceeds tau (a stable setting; no screen-wide
+// multiplier), with hysteresis (`group_refines`). The only thing that raises
+// the threshold is the per-tile overdraw valve (`tile_scale`), which acts on a
+// tile that exceeds `tile_limit` triangles per covered pixel and nowhere else.
+// The cut stays coverage complete: a coarser parent replaces geometry, never drops it.
 
 struct CullParams {
     screen_width: u32,
@@ -32,12 +36,20 @@ struct CullParams {
     dense_tiles_x: u32,
     dense_tiles_y: u32,
     max_groups: u32,
-    // Triangles the density solve may predict (0 disables it) and the largest
-    // tolerance multiplier it may choose.
-    density_budget: f32,
-    density_scale_max: f32,
+    // Overdraw valve: triangles per covered pixel one tile may hold before its
+    // clusters are coarsened (0 = valve off).
+    tile_limit: f32,
+    // Prefetch band: child pages are requested/touched while the projected
+    // error exceeds tau / prefetch_k (>= 1).
+    prefetch_k: f32,
+    // Tile grid of the screen (16x16 px tiles) and the word offset of its
+    // per-tile block in `history` (3 words per tile: triangles, area, scale).
+    tiles_x: u32,
+    tiles_y: u32,
+    tile_base: u32,
     pad0: u32,
     pad1: u32,
+    pad2: u32,
 }
 
 struct RoundParams {
@@ -140,6 +152,24 @@ fn history_mark(key: u32) {
     atomicOr(&history[params.hist_write_base + (bit >> 5u)], 1u << (bit & 31u));
 }
 
+// Hysteresis memory: the same hash set, salted per decision kind and not gated
+// by the two-phase flag. A bit says "this decision was taken last frame"; both
+// the test and the mark are idempotent, so every job that reaches the same
+// decision (the two sides of one group) agrees.
+const SALT_REFINE: u32 = 0x1b873593u;
+const SALT_SW: u32 = 0x51ed270bu;
+
+fn hyst_test(key: u32) -> bool {
+    let bit = key & params.history_bits_mask;
+    let w = atomicLoad(&history[params.hist_read_base + (bit >> 5u)]);
+    return ((w >> (bit & 31u)) & 1u) != 0u;
+}
+
+fn hyst_mark(key: u32) {
+    let bit = key & params.history_bits_mask;
+    atomicOr(&history[params.hist_write_base + (bit >> 5u)], 1u << (bit & 31u));
+}
+
 fn vp_row(r: u32) -> vec4<f32> {
     let m = cameras[0].view_proj;
     return vec4<f32>(m[0][r], m[1][r], m[2][r], m[3][r]);
@@ -216,9 +246,7 @@ fn load_inst(id: u32) -> InstCtx {
     c.err_scale = max(inst.lod_error_scale, 1.0e-4);
     c.flags = inst.flags;
     c.asset = inst.asset_slot;
-    // The screen-wide multiplier solved by `cs_density` this frame (0 bits = unset).
-    let density = max(bitcast<f32>(atomicLoad(&state[VGC_ST_DENSITY])), 1.0);
-    c.tau = select(params.tau_px * density, ROOT_ONLY_TAU, (inst.flags & VG_INST_FORCE_ROOT_ONLY) != 0u);
+    c.tau = select(params.tau_px, ROOT_ONLY_TAU, (inst.flags & VG_INST_FORCE_ROOT_ONLY) != 0u);
     return c;
 }
 
@@ -322,6 +350,114 @@ fn defer_job(job: vec2<u32>) {
     }
 }
 
+// ── Per-tile density: the overdraw valve and the dense-tile estimate ───────
+//
+// `history` carries, after its two visibility halves, three words per 16x16
+// tile: the triangles and the covered area the clusters emitted last frame
+// estimate into the tile (fixed point), and the valve's coarsening scale
+// `g >= 1` (f32 bits; 0 reads as 1). `cs_tiles` turns the estimate into the
+// scale and clears it; `emit_cluster` adds to it; the dense-tile classifier
+// reads the triangle word (so hardware-class clusters count towards "this tile
+// is dense" without the software raster having run).
+
+const TILE_EST_MAX_R: f32 = 32.0;
+
+struct Footprint {
+    ok: bool,
+    px: vec2<f32>,
+    r: f32,
+    lo: vec2<i32>,
+    hi: vec2<i32>,
+}
+
+// The 16x16 tiles a projected sphere covers. `ok` is false for spheres behind
+// the camera, off screen, or wider than `TILE_EST_MAX_R` px (a cluster that
+// large cannot make a tile dense: at most 128 triangles over 4+ tiles).
+fn tile_footprint(cw: vec3<f32>, rw: f32) -> Footprint {
+    var f: Footprint;
+    f.ok = false;
+    if params.tiles_x == 0u || params.tiles_y == 0u { return f; }
+    let clip = cameras[0].view_proj * vec4<f32>(cw, 1.0);
+    if clip.w <= 0.0 { return f; }
+    let d = max(view_depth_of(cw), cameras[0].position_near.w);
+    let r = rw * cameras[0].proj[1][1] * 0.5 * f32(params.screen_height) / d;
+    if r > TILE_EST_MAX_R { return f; }
+    let uv = helio_ndc_to_uv(clip.xy / clip.w);
+    let px = uv * vec2<f32>(f32(params.screen_width), f32(params.screen_height));
+    let re = max(r, 0.5);
+    if px.x + re <= 0.0 || px.y + re <= 0.0
+        || px.x - re >= f32(params.screen_width) || px.y - re >= f32(params.screen_height) { return f; }
+    let tmax = vec2<i32>(i32(params.tiles_x) - 1, i32(params.tiles_y) - 1);
+    f.px = px;
+    f.r = re;
+    f.lo = clamp(vec2<i32>(floor((px - vec2<f32>(re)) / f32(VGC_TILE))), vec2<i32>(0), tmax);
+    f.hi = clamp(vec2<i32>(floor((px + vec2<f32>(re)) / f32(VGC_TILE))), vec2<i32>(0), tmax);
+    f.ok = true;
+    return f;
+}
+
+fn tile_word(t: u32, w: u32) -> u32 { return params.tile_base + t * VGC_TILE_WORDS + w; }
+
+// The valve's coarsening scale for a sphere: the largest scale of the tiles it
+// covers (1 when none is over the limit, or the valve is off).
+fn tile_scale(cw: vec3<f32>, rw: f32) -> f32 {
+    if params.tile_limit <= 0.0 { return 1.0; }
+    let f = tile_footprint(cw, rw);
+    if !f.ok { return 1.0; }
+    var g = 1.0;
+    for (var y = f.lo.y; y <= f.hi.y; y++) {
+        for (var x = f.lo.x; x <= f.hi.x; x++) {
+            let t = u32(y) * params.tiles_x + u32(x);
+            g = max(g, bitcast<f32>(atomicLoad(&history[tile_word(t, 2u)])));
+        }
+    }
+    return g;
+}
+
+// Adds an emitted cluster's triangles to the tiles it covers, weighted by the
+// overlap of each tile with the sphere's bounding square, and the disc area.
+fn tile_accumulate(cw: vec3<f32>, rw: f32, tris: u32) {
+    let f = tile_footprint(cw, rw);
+    if !f.ok { return; }
+    let sq = 4.0 * f.r * f.r;
+    let disc = 3.14159265 * f.r * f.r;
+    let tile = f32(VGC_TILE);
+    for (var y = f.lo.y; y <= f.hi.y; y++) {
+        let ty = f32(y) * tile;
+        let oy = max(min(f.px.y + f.r, ty + tile) - max(f.px.y - f.r, ty), 0.0);
+        for (var x = f.lo.x; x <= f.hi.x; x++) {
+            let tx = f32(x) * tile;
+            let ox = max(min(f.px.x + f.r, tx + tile) - max(f.px.x - f.r, tx), 0.0);
+            let share = ox * oy / sq;
+            let t = u32(y) * params.tiles_x + u32(x);
+            atomicAdd(&history[tile_word(t, 0u)], u32(f32(tris) * share * VGC_TILE_FIXED + 0.5));
+            atomicAdd(&history[tile_word(t, 1u)], u32(disc * share * VGC_TILE_FIXED + 0.5));
+        }
+    }
+}
+
+// ── Group refinement (the cut's one decision) ──────────────────────────────
+
+// Whether the group with object-space sphere `sph` and error `err` (projected
+// `px`) is refined, i.e. its children replace its clusters. Both sides of the
+// decision (the group's own clusters, and the finer clusters it was made from)
+// evaluate this with identical inputs, so the cut has neither holes nor
+// overlaps. Hysteresis: a group refined last frame stays refined until `px`
+// drops below `tau * VGC_TAU_HOLD`, so `px <= tau` still holds for every drawn
+// group and only the finer side is ever held.
+fn group_refines(inst: u32, sph: vec4<f32>, err: f32, px: f32, tau: f32) -> bool {
+    if err >= INF_ERR { return true; }
+    if !(err > 0.0) { return false; }
+    var h = vg_hash(inst, bitcast<u32>(err));
+    h = vg_hash(h, bitcast<u32>(sph.x));
+    h = vg_hash(h, bitcast<u32>(sph.y));
+    h = vg_hash(h, bitcast<u32>(sph.z));
+    let key = h ^ SALT_REFINE;
+    let refine = px > select(tau, tau * VGC_TAU_HOLD, hyst_test(key));
+    if refine { hyst_mark(key); }
+    return refine;
+}
+
 // ── Binning ────────────────────────────────────────────────────────────────
 
 fn tri_class(tris: u32) -> u32 {
@@ -371,7 +507,7 @@ fn dense_fully_covered(cw: vec3<f32>, r_px: f32) -> bool {
     return true;
 }
 
-fn choose_bin(tris: u32, ic: InstCtx, cw: vec3<f32>, rw: f32) -> u32 {
+fn choose_bin(tris: u32, ic: InstCtx, cw: vec3<f32>, rw: f32, key: u32) -> u32 {
     let hw_bin = tri_class(tris);
     if params.mode == VGC_MODE_FORCE_HW { return hw_bin; }
     let d = max(view_depth_of(cw), cameras[0].position_near.w);
@@ -387,8 +523,14 @@ fn choose_bin(tris: u32, ic: InstCtx, cw: vec3<f32>, rw: f32) -> u32 {
     if lock == 1u { return hw_bin; }
     if lock == 2u { return VGC_BIN_SW; }
     if lock == 3u { return VGC_BIN_DENSE; }
+    // Hysteresis on the SW/HW edge test: a cluster that was software last frame
+    // stays so until its edge exceeds the threshold by `VGC_EDGE_HYST`, and a
+    // hardware one only turns software below it by the same margin.
     let edge = VGC_EDGE_FACTOR * r_px / sqrt(f32(max(tris, 1u)));
-    if edge <= params.sw_edge_px {
+    let sw_key = vg_hash(key, SALT_SW);
+    let was_sw = hyst_test(sw_key);
+    if edge <= params.sw_edge_px * select(1.0 - VGC_EDGE_HYST, 1.0 + VGC_EDGE_HYST, was_sw) {
+        hyst_mark(sw_key);
         if (params.flags & VGC_FLAG_DENSE_MASK) != 0u && dense_overlap(cw, r_px) {
             return VGC_BIN_DENSE;
         }
@@ -418,16 +560,16 @@ fn masked_bin(bin: u32) -> u32 {
     return VGC_BIN_HW_MASKED;
 }
 
-fn emit_cluster(inst: u32, slot: u32, bin: u32, triangles: u32) {
+fn emit_cluster(inst: u32, slot: u32, bin: u32, triangles: u32, cw: vec3<f32>, rw: f32) {
     let k = atomicAdd(&state[VGC_ST_BINS + bin], 1u);
     if k >= params.bin_capacity {
         stat_add(VGC_STAT_VISIBLE_OVERFLOW);
         return;
     }
     visible[bin * params.bin_capacity + k] = vec2<u32>(inst, slot);
-    // Keep the selected-cut density sample accurate even when the other
-    // diagnostic counters are disabled; the host uses it for next-frame LOD.
+    // The selected triangle count is kept even when the other counters are off.
     atomicAdd(&state[VGC_ST_STATS + VGC_STAT_TRIANGLES], triangles);
+    tile_accumulate(cw, rw, triangles);
     stat_add(VGC_STAT_EMITTED);
 }
 
@@ -441,22 +583,32 @@ fn try_cluster(inst: u32, cs: u32, ic: InstCtx) {
     let pw = (ic.m * vec4<f32>(c.parent_sphere.xyz, 1.0)).xyz;
     let prw = c.parent_sphere.w * ic.scale;
     let k = ic.err_scale * ic.scale;
-    let s_err = proj_err(c.self_error * k, cw, rw);
-    let p_err = proj_err(c.parent_error * k, pw, prw);
+    let s_px = proj_err(c.self_error * k, cw, rw);
+    let p_px = proj_err(c.parent_error * k, pw, prw);
 
-    // Residency: if the clusters this one was simplified from (the members of
-    // its producer group) are not resident, this cluster stands in for them
-    // (it is the resident parent). `group_id` is asset-local.
+    // The cut: this cluster is drawn when its parent group is refined (the
+    // parent is too coarse) and its own group is not (it is fine enough), or
+    // when the clusters it was simplified from (the members of its producer
+    // group) are not resident, so it stands in for them. `group_id` is
+    // asset-local.
     var kids_resident = true;
+    var self_refined = false;
     if (c.flags & VGC_CLUSTER_FLAG_LEAF) == 0u && c.group_id != VG_NODE_INVALID {
         let gref = vg_group_refs[vg_group_ref_base(ic.asset) + c.group_id];
         let child_page = vg_global_page(ic.asset, gref);
         kids_resident = vg_page_resident(child_page);
-        if !kids_resident && s_err > ic.tau {
-            vg_request_page(child_page);
+        let tau_s = ic.tau * tile_scale(cw, rw);
+        self_refined = group_refines(inst, c.sphere, c.self_error, s_px, tau_s);
+        // Streaming demand: urgent while the children are wanted now, a
+        // prefetch while the error is within `prefetch_k` of the threshold
+        // (resident pages in the band are touched, so they are not evicted
+        // before the cut needs them).
+        if s_px * params.prefetch_k > tau_s {
+            vg_demand_page(child_page, self_refined);
         }
     }
-    let draw = p_err > ic.tau && (s_err <= ic.tau || !kids_resident);
+    let parent_refined = group_refines(inst, c.parent_sphere, c.parent_error, p_px, ic.tau * tile_scale(pw, prw));
+    let draw = parent_refined && (!self_refined || !kids_resident);
     if !draw { return; }
 
     if (ic.flags & VG_INST_CONE_CULL) != 0u {
@@ -487,12 +639,12 @@ fn try_cluster(inst: u32, cs: u32, ic: InstCtx) {
     if pol == POLICY_DROP { stat_add(VGC_STAT_CULLED_OCCLUSION); return; }
     history_mark(job_key(job));
     let triangles = c.counts_material & 0xffu;
-    var bin = choose_bin(triangles, ic, cw, rw);
+    var bin = choose_bin(triangles, ic, cw, rw, job_key(job));
     if (params.flags & VGC_FLAG_MASKED) != 0u {
         let mflags = section_material_flags(inst, c.counts_material >> 16u);
         if (mflags & MATERIAL_FLAG_ALPHA_TEST) != 0u { bin = masked_bin(bin); }
     }
-    emit_cluster(inst, cs, bin, triangles);
+    emit_cluster(inst, cs, bin, triangles, cw, rw);
 }
 
 // `gidx` is an asset-local group-ref index.
@@ -558,7 +710,7 @@ fn root_leaf_ok(inst_ctx: InstCtx, leaf1: u32) -> bool {
     for (var i = 0u; i < count; i++) {
         let c = vg_load_cluster(slot, first + i);
         let cw = (inst_ctx.m * vec4<f32>(c.sphere.xyz, 1.0)).xyz;
-        if proj_err(c.self_error * k, cw, c.sphere.w * inst_ctx.scale) > inst_ctx.tau { return false; }
+        if proj_err(c.self_error * k, cw, c.sphere.w * inst_ctx.scale) > inst_ctx.tau * VGC_TAU_HOLD { return false; }
     }
     return true;
 }
@@ -609,9 +761,10 @@ fn job_asset_item(job: vec2<u32>) {
     let sph = vg_nodes[parent].spheres[slot];
     let cw = (ic.m * vec4<f32>(sph.xyz, 1.0)).xyz;
     let rw = sph.w * ic.scale;
-    // Enter only while something below may still need drawing.
+    // Enter only while something below may still need drawing, against the
+    // smallest threshold a group below may be held at (hysteresis).
     let mpe = vg_nodes[parent].max_parent_error[slot];
-    if proj_err(mpe * ic.err_scale * ic.scale, cw, rw) <= ic.tau {
+    if proj_err(mpe * ic.err_scale * ic.scale, cw, rw) <= ic.tau * VGC_TAU_HOLD {
         stat_add(VGC_STAT_CULLED_SSE);
         return;
     }
@@ -652,81 +805,38 @@ fn process_job(job: vec2<u32>) {
 
 // ── Entry points ───────────────────────────────────────────────────────────
 
-// ── Screen-wide density solve ───────────────────────────────────────────────
-// One workgroup, before traversal: each instance's selected triangles at the
-// candidate tolerance multipliers 2^(k/4) come from its asset's LOD table
-// (`vg_lod_tris`), summed over the frustum-visible instances; the smallest
-// multiplier that fits `params.density_budget` is written to the state buffer
-// and read back by `load_inst`. Mirrors `helio_vg_format::density::solve`.
-const DENS_STEPS: u32 = 13u;
-const DENS_THREADS: u32 = 128u;
-var<workgroup> dens_part: array<f32, 1664>;
-var<workgroup> dens_tot: array<f32, 13>;
-
-@compute @workgroup_size(128)
-fn cs_density(@builtin(local_invocation_index) lid: u32) {
-    if lid < 5u { wg_planes[lid] = frustum_plane(lid); }
-    var mine: array<f32, 13>;
-    for (var k = 0u; k < DENS_STEPS; k++) { mine[k] = 0.0; }
-    workgroupBarrier();
-    if params.density_budget > 0.0 && params.mode != VGC_MODE_OFF {
-        let px_scale = cameras[0].proj[1][1] * 0.5 * f32(params.screen_height);
-        for (var i = lid; i < params.instance_count; i += DENS_THREADS) {
-            let inst = vg_instances[i];
-            if (inst.flags & VG_INST_ENABLED) == 0u { continue; }
-            if (inst.flags & VG_INST_FORCE_ROOT_ONLY) != 0u { continue; }
-            if inst.asset_slot >= arrayLength(&vg_asset_headers) { continue; }
-            if !vg_asset_ready(inst.asset_slot) { continue; }
-            let hdr = vg_asset_headers[inst.asset_slot];
-            if !(hdr.lod_error_max > 0.0) { continue; }
-            let ic = load_inst(i);
-            let cw = (ic.m * vec4<f32>(hdr.bounds.xyz, 1.0)).xyz;
-            let rw = hdr.bounds.w * ic.scale;
-            if !sphere_in_frustum(cw, rw) { continue; }
-            // Object-space tolerance this instance's distance implies at the base tau,
-            // at its centre: the cut mixes finer near parts with coarser far ones, and
-            // the nearest point (a huge tolerance swing for a tree around the camera)
-            // over-predicted by up to 12x.
-            let d = max(view_depth_of(cw), max(0.7 * rw, cameras[0].position_near.w));
-            let base_e = params.tau_px * d / (px_scale * ic.err_scale * ic.scale);
-            for (var k = 0u; k < DENS_STEPS; k++) {
-                mine[k] += vg_lod_tris(hdr, base_e * exp2(f32(k) * 0.25));
-            }
+// ── Tile pass ───────────────────────────────────────────────────────────────
+// One thread per 16x16 tile, before traversal: turns last frame's emitted-triangle
+// estimate into the overdraw valve's scale for this frame and clears the estimate.
+//
+// The valve is a slow integrator with a dead band, so it cannot oscillate: a
+// tile over `tile_limit * (1 + VGC_TILE_BAND)` triangles per covered pixel
+// coarsens by `VGC_TILE_STEP_UP` per frame (up to `VGC_TILE_SCALE_MAX`), a tile
+// under `tile_limit / (1 + VGC_TILE_BAND)` relaxes by `VGC_TILE_STEP_DOWN`, and
+// in between it holds. A tile the dense-tile mask marks dense is exempt: its
+// scale only relaxes (dense is an outcome of the cut, not a failure of it).
+@compute @workgroup_size(64)
+fn cs_tiles(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if t >= params.tiles_x * params.tiles_y { return; }
+    let tris = f32(atomicExchange(&history[tile_word(t, 0u)], 0u)) / VGC_TILE_FIXED;
+    let area = f32(atomicExchange(&history[tile_word(t, 1u)], 0u)) / VGC_TILE_FIXED;
+    var g = max(bitcast<f32>(atomicLoad(&history[tile_word(t, 2u)])), 1.0);
+    if params.tile_limit > 0.0 {
+        let d = tris / max(min(area, f32(VGC_TILE * VGC_TILE)), 1.0);
+        var dense = false;
+        if (params.flags & VGC_FLAG_DENSE_MASK) != 0u && t < arrayLength(&dense_mask) {
+            dense = dense_mask[t] != 0u;
         }
-    }
-    for (var k = 0u; k < DENS_STEPS; k++) { dens_part[lid * DENS_STEPS + k] = mine[k]; }
-    workgroupBarrier();
-    if lid < DENS_STEPS {
-        var s = 0.0;
-        for (var t = 0u; t < DENS_THREADS; t++) { s += dens_part[t * DENS_STEPS + lid]; }
-        dens_tot[lid] = s;
-    }
-    workgroupBarrier();
-    if lid == 0u {
-        let budget = params.density_budget;
-        var g = 1.0;
-        var predicted = dens_tot[0];
-        if budget > 0.0 && dens_tot[0] > budget {
-            g = params.density_scale_max;
-            predicted = dens_tot[DENS_STEPS - 1u];
-            for (var k = 1u; k < DENS_STEPS; k++) {
-                if dens_tot[k] <= budget {
-                    let hi = log(max(dens_tot[k - 1u], 1.0));
-                    let lo = log(max(dens_tot[k], 1.0));
-                    var t = 1.0;
-                    if hi > lo { t = clamp((hi - log(max(budget, 1.0))) / (hi - lo), 0.0, 1.0); }
-                    g = exp2((f32(k - 1u) + t) * 0.25);
-                    predicted = min(budget, dens_tot[k - 1u]);
-                    break;
-                }
-            }
+        if dense || d < params.tile_limit / (1.0 + VGC_TILE_BAND) {
+            g = max(g * VGC_TILE_STEP_DOWN, 1.0);
+        } else if d > params.tile_limit * (1.0 + VGC_TILE_BAND) {
+            g = min(g * VGC_TILE_STEP_UP, VGC_TILE_SCALE_MAX);
         }
-        // Rate-limit against last frame's multiplier (the word survives the state clear).
-        let prev = bitcast<f32>(atomicLoad(&state[VGC_ST_DENSITY]));
-        if prev >= 1.0 { g = clamp(g, prev * 0.96, prev * 1.25); }
-        atomicStore(&state[VGC_ST_DENSITY], bitcast<u32>(clamp(g, 1.0, params.density_scale_max)));
-        atomicStore(&state[VGC_ST_PREDICTED], u32(min(predicted, 4.0e9)));
+    } else {
+        g = 1.0;
     }
+    atomicStore(&history[tile_word(t, 2u)], bitcast<u32>(g));
 }
 
 // One thread, frame start: seed the traversal with the GCBVH root.

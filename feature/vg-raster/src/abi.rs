@@ -94,7 +94,15 @@ pub struct ClassifyParams {
     pub max_dense: u32,
     /// Frames a tile stays dense after its counters last qualified.
     pub latch: u32,
-    pub pad: [u32; 2],
+    /// Word offset of the cull's tile block in the estimate buffer
+    /// ([`ClassifyParams::NO_ESTIMATE`] = none).
+    pub est_base: u32,
+    /// Scales both thresholds (`threshold / sensitivity`).
+    pub sensitivity: f32,
+}
+
+impl ClassifyParams {
+    pub const NO_ESTIMATE: u32 = u32::MAX;
 }
 
 /// Slots of the `stats` buffer (`u32` counters, cleared every frame).

@@ -12,8 +12,6 @@ pub const SW_RASTER: &str = include_str!("../shaders/vg_sw_raster.wgsl");
 pub const SW_BIN: &str = include_str!("../shaders/vg_sw_bin.wgsl");
 /// Reusable tiled shared-memory raster kernel (Tier 2 fallback, Tier 3 base).
 pub const TILE_RASTER: &str = include_str!("../shaders/vg_tile_raster.wgsl");
-/// Dense-bin overlap estimate (`dense_count_main`).
-pub const DENSE_COUNT: &str = include_str!("../shaders/vg_dense_count.wgsl");
 pub const TILE_CLASSIFY: &str = include_str!("../shaders/vg_tile_classify.wgsl");
 /// Alpha-masked Tier 1 (`vs_masked`, `fs_masked`).
 pub const HW_RASTER_MASKED: &str = include_str!("../shaders/vg_hw_raster_masked.wgsl");
@@ -94,13 +92,10 @@ pub fn sw_masked_source(binding: helio_mats::MaterialBindingConfig) -> String {
         ])
     )
 }
-/// Dense-bin overlap estimate kernel.
-pub fn dense_count_source() -> String {
-    scene(&[DENSE_COUNT])
-}
-/// `classify_main` and `dense_args_main` (standalone, no scene bindings).
+/// `classify_main` and `dense_args_main` (standalone, no scene bindings; the
+/// cull's tile-block constants are prepended).
 pub fn tile_classify_source() -> String {
-    TILE_CLASSIFY.to_string()
+    format!("{}{}", helio_pass_vg_cull::tile_block_wgsl(), TILE_CLASSIFY)
 }
 
 /// Every module with a label, for validation.
@@ -122,7 +117,6 @@ pub fn all_sources() -> Vec<(&'static str, String)> {
         ("vg_sw_raster", sw_raster_source()),
         ("vg_sw_bin", sw_bin_source()),
         ("vg_tile_raster", tile_raster_source()),
-        ("vg_dense_count", dense_count_source()),
         ("vg_tile_classify", tile_classify_source()),
     ]
 }

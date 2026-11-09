@@ -90,6 +90,9 @@ pub fn virtual_geometry_runtime_settings(
         max_visible_clusters: settings.max_visible_clusters,
         two_phase_occlusion: settings.two_phase_occlusion,
         tier3: settings.tier3,
+        prefetch_factor: settings.prefetch_factor,
+        tile_density_limit: settings.tile_density_limit,
+        dense_sensitivity: settings.dense_sensitivity,
         ..helio_vg_stream::VgRuntimeSettings::default()
     }
 }

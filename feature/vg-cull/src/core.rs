@@ -25,17 +25,13 @@ pub struct VgCullConfig {
     pub tau_px: f32,
     /// Projected average triangle edge at or below which a cluster is SW.
     pub sw_edge_px: f32,
-    /// Target selected cluster triangles per viewport pixel. Selection responds
-    /// by changing its error threshold, so complete parent clusters replace
-    /// finer cuts instead of visible geometry being dropped.
-    pub selection_triangles_per_pixel: f32,
-    /// Log-space response strength for the asynchronous selection feedback.
-    /// 1 by default (0 disables the screen-wide density control); the multiplier
-    /// stays within 1x to 8x of the base tau (`helio_vg_format::density`).
-    pub selection_sensitivity: f32,
-    /// Triangles the density solve may predict this frame (set by the pass each
-    /// frame from the target and the observed visible fraction; 0 disables it).
-    pub density_budget_tris: f32,
+    /// Overdraw valve: triangles per covered pixel one 16x16 tile may hold before
+    /// the groups covering it are coarsened (0 turns the valve off). Per tile, never
+    /// screen-wide; see the crate docs.
+    pub tile_density_limit: f32,
+    /// Prefetch band: child pages are requested while the projected error exceeds
+    /// `tau / prefetch_factor` (1 = request only when the cut needs the page).
+    pub prefetch_factor: f32,
     pub mode: VgMode,
     /// Last-frame-visible-first occlusion with a Hi-Z hook between phases.
     pub two_phase_occlusion: bool,
@@ -76,24 +72,11 @@ pub struct VgCullConfig {
 
 impl Default for VgCullConfig {
     fn default() -> Self {
-        let selection_triangles_per_pixel = std::env::var("HELIO_VG_SELECTION_TRIANGLES_PER_PIXEL")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| v.is_finite())
-            .unwrap_or(2.0)
-            .clamp(0.25, 32.0);
-        let selection_sensitivity = std::env::var("HELIO_VG_SELECTION_SENSITIVITY")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| v.is_finite())
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
         Self {
             tau_px: 1.0,
             sw_edge_px: 2.0,
-            selection_triangles_per_pixel,
-            selection_sensitivity,
-            density_budget_tris: 0.0,
+            tile_density_limit: 16.0,
+            prefetch_factor: 2.0,
             mode: VgMode::Auto,
             two_phase_occlusion: true,
             rounds: 4,
@@ -151,11 +134,22 @@ pub struct VgCullBuffers {
     pub visible: wgpu::Buffer,
     pub state: wgpu::Buffer,
     pub queues: wgpu::Buffer,
+    /// Two visibility halves (`history_words` each), then the tile block:
+    /// [`crate::TILE_WORDS`] words per tile (see the crate docs).
     pub history: wgpu::Buffer,
     pub bin_capacity: u32,
     pub queue_capacity: u32,
     /// `u32` words per history half.
     pub history_words: u32,
+    /// The 16x16 tile grid of the screen the tile block is sized for.
+    pub tiles: [u32; 2],
+}
+
+impl VgCullBuffers {
+    /// Word offset of the tile block in `history`.
+    pub fn tile_base(&self) -> u32 {
+        2 * self.history_words
+    }
 }
 
 impl VgCullBuffers {
@@ -164,6 +158,7 @@ impl VgCullBuffers {
         bin_capacity: u32,
         queue_capacity: u32,
         history_words: u32,
+        tiles: [u32; 2],
     ) -> Self {
         let storage = wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_SRC
@@ -188,10 +183,39 @@ impl VgCullBuffers {
                 storage | wgpu::BufferUsages::INDIRECT,
             ),
             queues: mk("VgCull Queues", QUEUES * queue_capacity as u64 * 8, storage),
-            history: mk("VgCull History", 2 * history_words as u64 * 4, storage),
+            history: Self::history_buffer(device, history_words, tiles),
             bin_capacity,
             queue_capacity,
             history_words,
+            tiles,
+        }
+    }
+
+    fn history_buffer(device: &wgpu::Device, history_words: u32, tiles: [u32; 2]) -> wgpu::Buffer {
+        let words = 2 * u64::from(history_words)
+            + u64::from(crate::TILE_WORDS) * u64::from(tiles[0]) * u64::from(tiles[1]);
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("VgCull History"),
+            size: (words * 4).max(16),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// These buffers with the tile block resized for a new screen grid: only the
+    /// history buffer is replaced (a window resize must not reallocate the bins).
+    fn with_tiles(&self, device: &wgpu::Device, tiles: [u32; 2]) -> Self {
+        Self {
+            visible: self.visible.clone(),
+            state: self.state.clone(),
+            queues: self.queues.clone(),
+            history: Self::history_buffer(device, self.history_words, tiles),
+            bin_capacity: self.bin_capacity,
+            queue_capacity: self.queue_capacity,
+            history_words: self.history_words,
+            tiles,
         }
     }
 }
@@ -215,9 +239,12 @@ struct GpuParams {
     dense_tiles_x: u32,
     dense_tiles_y: u32,
     max_groups: u32,
-    density_budget: f32,
-    density_scale_max: f32,
-    _pad: [u32; 2],
+    tile_limit: f32,
+    prefetch_k: f32,
+    tiles_x: u32,
+    tiles_y: u32,
+    tile_base: u32,
+    _pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -238,7 +265,7 @@ struct Readback {
 }
 
 struct Pipelines {
-    density: wgpu::ComputePipeline,
+    tiles: wgpu::ComputePipeline,
     seed: wgpu::ComputePipeline,
     prepare: wgpu::ComputePipeline,
     traverse: wgpu::ComputePipeline,
@@ -383,7 +410,7 @@ impl VgCullCore {
             )
         };
         let pipelines = Pipelines {
-            density: pipeline("VgCull Density", &pl2, "cs_density"),
+            tiles: pipeline("VgCull Tiles", &pl2, "cs_tiles"),
             seed: pipeline("VgCull Seed", &pl2, "cs_seed"),
             prepare: pipeline("VgCull RoundPrepare", &pl3, "cs_round_prepare"),
             traverse: pipeline("VgCull Traverse", &pl2, "cs_traverse"),
@@ -465,6 +492,7 @@ impl VgCullCore {
             config.initial_bin_capacity.min(MAX_BIN_CAPACITY).max(16),
             config.initial_queue_capacity.max(256),
             history_words,
+            [1, 1],
         ));
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("VgCull Stats Readback"),
@@ -579,7 +607,16 @@ impl VgCullCore {
                 bin_cap,
                 queue_cap,
                 b.history_words,
+                b.tiles,
             ));
+            self.bind_cache = [None, None];
+        }
+        let tiles = [
+            frame.width.max(1).div_ceil(crate::DENSE_TILE),
+            frame.height.max(1).div_ceil(crate::DENSE_TILE),
+        ];
+        if tiles != self.buffers.tiles {
+            self.buffers = Arc::new(self.buffers.with_tiles(device, tiles));
             self.bind_cache = [None, None];
         }
         let b = &self.buffers;
@@ -622,9 +659,12 @@ impl VgCullCore {
             dense_tiles_x: inputs.dense_tiles[0].max(1),
             dense_tiles_y: inputs.dense_tiles[1].max(1),
             max_groups: self.config.max_groups.max(1),
-            density_budget: self.config.density_budget_tris.max(0.0),
-            density_scale_max: helio_vg_format::density::MAX_SCALE,
-            _pad: [0; 2],
+            tile_limit: self.config.tile_density_limit.max(0.0),
+            prefetch_k: self.config.prefetch_factor.max(1.0),
+            tiles_x: b.tiles[0],
+            tiles_y: b.tiles[1],
+            tile_base: b.tile_base(),
+            _pad: [0; 3],
         };
         helio_core::upload::write_buffer(queue, &self.params_buf, 0, bytemuck::bytes_of(&params));
         self.prepared = true;
@@ -678,9 +718,7 @@ impl VgCullCore {
         let b = self.buffers.clone();
         let rounds = self.config.rounds.max(1);
         if phase == 0 {
-            // Everything but the density multiplier, which the next solve slews from.
-            rec.clear_buffer(&b.state, 0, Some(state::DENSITY as u64 * 4));
-            rec.clear_buffer(&b.state, (state::DENSITY as u64 + 1) * 4, None);
+            rec.clear_buffer(&b.state, 0, None);
             let parity = (self.frame & 1) as u64;
             rec.clear_buffer(
                 &b.history,
@@ -747,8 +785,8 @@ impl VgCullCore {
         pass.set_bind_group(0, &bg0, &[]);
         if phase == 0 {
             pass.set_bind_group(1, &self.bg1, &[0]);
-            pass.set_pipeline(&self.pipelines.density);
-            pass.dispatch_workgroups(1, 1, 1);
+            pass.set_pipeline(&self.pipelines.tiles);
+            pass.dispatch_workgroups((b.tiles[0] * b.tiles[1]).div_ceil(64), 1, 1);
             pass.set_pipeline(&self.pipelines.seed);
             pass.dispatch_workgroups(1, 1, 1);
         }

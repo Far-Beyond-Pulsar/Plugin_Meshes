@@ -1,5 +1,6 @@
 //! GPU -> CPU page feedback: one storage buffer holding a deduplicated
-//! request list, a request bitset (dedup) and a "used" bitset (LRU recency).
+//! request list, a request bitset (dedup), a "used" bitset (LRU recency) and an
+//! "urgent" bitset (which requests the cut needs now; the rest are prefetches).
 //!
 //! Layout in u32 words (mirrored by `shaders/vg_stream.wgsl`):
 //!
@@ -11,6 +12,7 @@
 //! [4 .. 4+cap]                 request list (global page ids)
 //! [4+cap .. 4+cap+bits]        request bitset (dedup)
 //! [4+cap+bits .. 4+cap+2*bits] used bitset (resident pages needed)
+//! [4+cap+2*bits .. 4+cap+3*bits] urgent bitset (requested pages the cut needs now)
 //! ```
 
 pub const HEADER_WORDS: u32 = 4;
@@ -29,7 +31,7 @@ impl FeedbackLayout {
         }
     }
     pub fn total_words(&self) -> u32 {
-        HEADER_WORDS + self.list_capacity + 2 * self.bits_words
+        HEADER_WORDS + self.list_capacity + 3 * self.bits_words
     }
     pub fn total_bytes(&self) -> u64 {
         u64::from(self.total_words()) * 4
@@ -39,6 +41,9 @@ impl FeedbackLayout {
     }
     pub fn used_bits_offset_words(&self) -> u32 {
         self.request_bits_offset_words() + self.bits_words
+    }
+    pub fn urgent_bits_offset_words(&self) -> u32 {
+        self.used_bits_offset_words() + self.bits_words
     }
     /// Initial contents: counter 0, constants filled in, everything else 0.
     pub fn initial_words(&self) -> Vec<u32> {
@@ -54,6 +59,9 @@ impl FeedbackLayout {
 pub struct Feedback {
     /// Distinct non-resident pages the GPU wanted (ascending page id).
     pub requests: Vec<u32>,
+    /// The requested pages the cut needs now (ascending page id); the other
+    /// requests are prefetches, pages the cut will want as the error grows.
+    pub urgent: Vec<u32>,
     /// Distinct resident pages the GPU used (ascending page id).
     pub used: Vec<u32>,
     /// The request list filled up; some requests were lost this round.
@@ -76,21 +84,26 @@ pub fn decode(words: &[u32], layout: FeedbackLayout, page_count: u32) -> Feedbac
     fb.requests.sort_unstable();
     fb.requests.dedup();
 
-    let ub = layout.used_bits_offset_words() as usize;
-    for (wi, &w) in words[ub..ub + layout.bits_words as usize]
-        .iter()
-        .enumerate()
-    {
-        let mut bits = w;
-        while bits != 0 {
-            let b = bits.trailing_zeros();
-            bits &= bits - 1;
-            let page = wi as u32 * 32 + b;
-            if page < page_count {
-                fb.used.push(page);
+    let bitset = |offset: usize| {
+        let mut pages = Vec::new();
+        for (wi, &w) in words[offset..offset + layout.bits_words as usize]
+            .iter()
+            .enumerate()
+        {
+            let mut bits = w;
+            while bits != 0 {
+                let b = bits.trailing_zeros();
+                bits &= bits - 1;
+                let page = wi as u32 * 32 + b;
+                if page < page_count {
+                    pages.push(page);
+                }
             }
         }
-    }
+        pages
+    };
+    fb.used = bitset(layout.used_bits_offset_words() as usize);
+    fb.urgent = bitset(layout.urgent_bits_offset_words() as usize);
     fb
 }
 
@@ -107,8 +120,11 @@ mod tests {
         let ub = layout.used_bits_offset_words() as usize;
         w[ub] = 0b1010_0001; // pages 0, 5, 7
         w[ub + 3] = 1 << 5; // page 101: beyond page_count 100
+        let urg = layout.urgent_bits_offset_words() as usize;
+        w[urg] = 1 << 9; // page 9 is urgent, page 3 a prefetch
         let fb = decode(&w, layout, 100);
         assert_eq!(fb.requests, vec![3, 9]);
+        assert_eq!(fb.urgent, vec![9]);
         assert_eq!(fb.used, vec![0, 5, 7]);
         assert!(fb.overflowed);
         assert_eq!(layout.bits_words, 4);

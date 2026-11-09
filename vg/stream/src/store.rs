@@ -342,7 +342,7 @@ impl VgAssetStore {
         encoder.clear_buffer(
             &self.feedback.buffer,
             u64::from(l.request_bits_offset_words()) * 4,
-            Some(u64::from(l.bits_words) * 8),
+            Some(u64::from(l.bits_words) * 12),
         );
         let (tx, rx) = mpsc::channel();
         self.pending = Some(Pending {
@@ -704,7 +704,7 @@ impl VgAssetStore {
                 (0, 4),
                 (
                     u64::from(l.request_bits_offset_words()) * 4,
-                    u64::from(l.bits_words) * 8,
+                    u64::from(l.bits_words) * 12,
                 ),
             ],
         };

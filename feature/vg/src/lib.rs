@@ -189,6 +189,7 @@ impl RenderPass for VgInputsPass {
         };
         self.raster
             .ensure_targets(ctx.device, ctx.width, ctx.height);
+        self.raster.set_dense_sensitivity(settings.dense_sensitivity);
         let (dense_mask, dense_tiles) = match self.raster.dense_mask_last_frame() {
             Some((mask, tiles))
                 if self.dense_enabled && settings.tier3 && self.runtime.tier3_stats().engaged =>
@@ -296,8 +297,8 @@ fn cull_settings(runtime: &VgRuntime) -> VgCullDynamic {
     let s = runtime.settings();
     VgCullDynamic {
         tau_px: s.tau_px,
-        selection_triangles_per_pixel: s.selection_triangles_per_pixel,
-        selection_sensitivity: s.selection_sensitivity,
+        prefetch_factor: s.prefetch_factor,
+        tile_density_limit: s.tile_density_limit,
         mode: s.mode,
         two_phase_occlusion: s.two_phase_occlusion,
         max_visible_clusters: s.max_visible_clusters,

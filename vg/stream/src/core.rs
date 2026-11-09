@@ -15,6 +15,10 @@ use std::sync::Arc;
 /// Residency-table value for a page that is not in the pool.
 pub const PAGE_NOT_RESIDENT: u32 = 0xffff_ffff;
 
+/// Request weight of a page the cut needs now (a prefetch counts 1): urgent
+/// pages are scheduled before any prefetch.
+pub const URGENT_REQUEST_WEIGHT: u32 = 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VgStreamError {
     /// The source returned an error or inconsistent data.
@@ -436,7 +440,14 @@ impl StoreCore {
         }
         for &p in &fb.requests {
             if self.locate(p).is_some() {
-                self.sched.request(p, 1, frame);
+                // The cut needs an urgent page now; a prefetch only ranks by how
+                // often the GPU wants it, below every urgent page.
+                let weight = if fb.urgent.binary_search(&p).is_ok() {
+                    URGENT_REQUEST_WEIGHT
+                } else {
+                    1
+                };
+                self.sched.request(p, weight, frame);
             }
         }
     }
@@ -601,8 +612,7 @@ mod tests {
             let want = r.page_base + 1 + (round % 8);
             c.ingest(&Feedback {
                 requests: vec![want],
-                used: vec![],
-                overflowed: false,
+                ..Feedback::default()
             });
             let ops = c.update();
             for _ in 0..6 {
@@ -630,7 +640,7 @@ mod tests {
         c.ingest(&Feedback {
             requests: vec![900, r.page_base + 2],
             used: vec![901],
-            overflowed: false,
+            ..Feedback::default()
         });
         let ops = c.update();
         assert!(ops.uploads.is_empty());

@@ -131,6 +131,11 @@ pub fn instance_project(v: &RefView, inst: &RefInstance, err: f32, sphere: [f32;
 /// its neighbours:
 /// `project(parent) > tau && (project(self) <= tau || !children_resident)`.
 /// With everything resident this is `render iff self <= tau && parent > tau`.
+///
+/// This is the stateless cut (no hysteresis, no overdraw valve): what the GPU
+/// selects on the first frame of a view and whenever no group is held. With the
+/// hysteresis memory the GPU keeps a group refined that this refines, down to
+/// `tau / (1 + TAU_HYST)`; use [`cut_draws_held`] for that.
 pub fn cut_draws(
     v: &RefView,
     tau: f32,
@@ -138,10 +143,35 @@ pub fn cut_draws(
     c: &GpuCluster,
     children_resident: bool,
 ) -> bool {
+    cut_draws_held(v, tau, inst, c, children_resident, &|_, _| false)
+}
+
+/// [`cut_draws`] with the hysteresis memory: `held(sphere, error)` says whether
+/// that group was refined last frame, and a held group stays refined until its
+/// projected error is at most `tau / (1 + TAU_HYST)`.
+pub fn cut_draws_held(
+    v: &RefView,
+    tau: f32,
+    inst: &RefInstance,
+    c: &GpuCluster,
+    children_resident: bool,
+    held: &dyn Fn([f32; 4], f32) -> bool,
+) -> bool {
     let tau = inst.tau(tau);
-    let s = instance_project(v, inst, c.self_error, c.sphere);
-    let p = instance_project(v, inst, c.parent_error, c.parent_sphere);
-    p > tau && (s <= tau || !children_resident)
+    let hold = 1.0 / (1.0 + crate::TAU_HYST);
+    let refined = |sphere: [f32; 4], err: f32| -> bool {
+        if err >= INF_ERROR {
+            return true;
+        }
+        if err <= 0.0 {
+            return false;
+        }
+        let px = instance_project(v, inst, err, sphere);
+        px > if held(sphere, err) { tau * hold } else { tau }
+    };
+    let self_refined = refined(c.sphere, c.self_error);
+    let parent_refined = refined(c.parent_sphere, c.parent_error);
+    parent_refined && (!self_refined || !children_resident)
 }
 
 /// Tier bin of a drawn cluster (no dense mask: `dense_overlap` supplied by
@@ -251,12 +281,15 @@ impl RefAsset<'_> {
 pub struct RefSelection {
     /// Drawn `cluster_slot`s, ascending.
     pub drawn: Vec<u32>,
-    /// Asset-local page ids requested.
+    /// Asset-local page ids requested (urgent and prefetch).
     pub requested_pages: BTreeSet<u32>,
+    /// The requested pages the cut needs now; the rest are prefetches.
+    pub urgent_pages: BTreeSet<u32>,
 }
 
 /// Traversal by the same rules as the GPU (entry test, residency, cut), for
-/// one instance with no frustum/occlusion/cone culling.
+/// one instance with no frustum/occlusion/cone culling. Pages are requested
+/// only when the cut needs them (`prefetch_k = 1`).
 pub fn select_clusters(
     asset: &RefAsset<'_>,
     v: &RefView,
@@ -274,6 +307,21 @@ pub fn select_clusters_ex(
     tau: f32,
     inst: &RefInstance,
     apply_cone: bool,
+) -> RefSelection {
+    select_clusters_prefetch(asset, v, tau, inst, apply_cone, 1.0)
+}
+
+/// As [`select_clusters_ex`] with the prefetch band: the pages of the clusters a
+/// drawn cluster was simplified from are requested while its projected error
+/// times `prefetch_k` exceeds tau (and they are not resident);
+/// `RefSelection::urgent_pages` are those the cut needs now (error above tau).
+pub fn select_clusters_prefetch(
+    asset: &RefAsset<'_>,
+    v: &RefView,
+    tau: f32,
+    inst: &RefInstance,
+    apply_cone: bool,
+    prefetch_k: f32,
 ) -> RefSelection {
     let mut out = RefSelection::default();
     let tau_i = inst.tau(tau);
@@ -303,9 +351,12 @@ pub fn select_clusters_ex(
                 let kids = asset.children_resident(&c);
                 if !kids {
                     let s = instance_project(v, inst, c.self_error, c.sphere);
-                    if s > tau_i {
-                        out.requested_pages
-                            .insert(asset.group_refs[c.group_id as usize].page_id);
+                    if s * prefetch_k > tau_i {
+                        let page = asset.group_refs[c.group_id as usize].page_id;
+                        out.requested_pages.insert(page);
+                        if s > tau_i {
+                            out.urgent_pages.insert(page);
+                        }
                     }
                 }
                 if cut_draws(v, tau, inst, &c, kids)

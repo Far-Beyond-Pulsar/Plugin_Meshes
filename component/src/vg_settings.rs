@@ -109,6 +109,17 @@ pub struct VirtualGeometrySettings {
     pub mode: VirtualGeometryMode,
     /// Screen-space error threshold in pixels.
     pub tau_pixels: f32,
+    /// Prefetch band: child pages are requested while the projected error exceeds
+    /// `tau_pixels / prefetch_factor`, so fine pages are resident before the cut
+    /// needs them. 1 requests only when the cut needs the page.
+    pub prefetch_factor: f32,
+    /// Overdraw valve: triangles per covered pixel one 16x16 screen tile may hold
+    /// before the clusters over it are coarsened (0 = off). Only engages on
+    /// pathological overdraw; a tile resolved as dense is exempt.
+    pub tile_density_limit: f32,
+    /// Dense-tile classifier sensitivity: higher classifies a tile dense with
+    /// less overlap (thresholds are divided by it). Only matters with `tier3`.
+    pub dense_sensitivity: f32,
     /// Budget for resident cluster pages, in MB.
     pub page_budget_mb: u32,
     /// Ceiling on visible clusters per frame (a ceiling, not an allocation).
@@ -129,6 +140,9 @@ impl Default for VirtualGeometrySettings {
         Self {
             mode: VirtualGeometryMode::Auto,
             tau_pixels: 1.0,
+            prefetch_factor: 2.0,
+            tile_density_limit: 16.0,
+            dense_sensitivity: 1.0,
             page_budget_mb: 512,
             max_visible_clusters: 4_194_304,
             two_phase_occlusion: true,
@@ -140,6 +154,9 @@ impl Default for VirtualGeometrySettings {
 
 impl VirtualGeometrySettings {
     pub const TAU_RANGE: (f32, f32) = (0.1, 16.0);
+    pub const PREFETCH_FACTOR_RANGE: (f32, f32) = (1.0, 8.0);
+    pub const TILE_DENSITY_LIMIT_RANGE: (f32, f32) = (0.0, 256.0);
+    pub const DENSE_SENSITIVITY_RANGE: (f32, f32) = (0.125, 8.0);
     pub const PAGE_BUDGET_RANGE_MB: (u32, u32) = (64, 65_536);
 
     /// Read the namespace from `cfg`. Any key that is missing, of the wrong
@@ -162,6 +179,15 @@ impl VirtualGeometrySettings {
             tau_pixels: get("tau_pixels")
                 .and_then(|value| value.as_float().ok())
                 .map_or(defaults.tau_pixels, |value| value as f32),
+            prefetch_factor: get("prefetch_factor")
+                .and_then(|value| value.as_float().ok())
+                .map_or(defaults.prefetch_factor, |value| value as f32),
+            tile_density_limit: get("tile_density_limit")
+                .and_then(|value| value.as_float().ok())
+                .map_or(defaults.tile_density_limit, |value| value as f32),
+            dense_sensitivity: get("dense_sensitivity")
+                .and_then(|value| value.as_float().ok())
+                .map_or(defaults.dense_sensitivity, |value| value as f32),
             page_budget_mb: int("page_budget_mb")
                 .and_then(|value| u32::try_from(value).ok())
                 .unwrap_or(defaults.page_budget_mb),
@@ -190,6 +216,29 @@ impl VirtualGeometrySettings {
         } else {
             Self::default().tau_pixels
         };
+        let finite_in = |value: f32, (lo, hi): (f32, f32), default: f32| {
+            if value.is_finite() {
+                value.clamp(lo, hi)
+            } else {
+                default
+            }
+        };
+        let defaults = Self::default();
+        self.prefetch_factor = finite_in(
+            self.prefetch_factor,
+            Self::PREFETCH_FACTOR_RANGE,
+            defaults.prefetch_factor,
+        );
+        self.tile_density_limit = finite_in(
+            self.tile_density_limit,
+            Self::TILE_DENSITY_LIMIT_RANGE,
+            defaults.tile_density_limit,
+        );
+        self.dense_sensitivity = finite_in(
+            self.dense_sensitivity,
+            Self::DENSE_SENSITIVITY_RANGE,
+            defaults.dense_sensitivity,
+        );
         let (budget_min, budget_max) = Self::PAGE_BUDGET_RANGE_MB;
         self.page_budget_mb = self.page_budget_mb.clamp(budget_min, budget_max);
         self.max_visible_clusters = self
@@ -210,6 +259,9 @@ fn choices(values: impl IntoIterator<Item = (&'static str, &'static str)>) -> Ve
 pub fn schema() -> NamespaceSchema {
     let defaults = VirtualGeometrySettings::default();
     let (tau_min, tau_max) = VirtualGeometrySettings::TAU_RANGE;
+    let (prefetch_min, prefetch_max) = VirtualGeometrySettings::PREFETCH_FACTOR_RANGE;
+    let (density_min, density_max) = VirtualGeometrySettings::TILE_DENSITY_LIMIT_RANGE;
+    let (sens_min, sens_max) = VirtualGeometrySettings::DENSE_SENSITIVITY_RANGE;
     let (budget_min, budget_max) = VirtualGeometrySettings::PAGE_BUDGET_RANGE_MB;
     NamespaceSchema::new(
         "Virtual Geometry",
@@ -246,6 +298,60 @@ pub fn schema() -> NamespaceSchema {
             step: 0.1,
         })
         .validator(Validator::float_range(f64::from(tau_min), f64::from(tau_max))),
+    )
+    .setting(
+        "prefetch_factor",
+        SchemaEntry::new(
+            "Child pages are requested while a cluster's error is above the pixel error divided by this, so fine pages arrive before they are needed (1 = only when needed)",
+            f64::from(defaults.prefetch_factor),
+        )
+        .label("Prefetch Factor")
+        .page("Rendering / Virtual Geometry")
+        .field_type(FieldType::Slider {
+            min: f64::from(prefetch_min),
+            max: f64::from(prefetch_max),
+            step: 0.25,
+        })
+        .validator(Validator::float_range(
+            f64::from(prefetch_min),
+            f64::from(prefetch_max),
+        )),
+    )
+    .setting(
+        "tile_density_limit",
+        SchemaEntry::new(
+            "Triangles per covered pixel one 16x16 screen tile may hold before the clusters over it are coarsened; a safety valve against pathological overdraw (0 = off)",
+            f64::from(defaults.tile_density_limit),
+        )
+        .label("Tile Density Limit")
+        .page("Rendering / Virtual Geometry")
+        .field_type(FieldType::NumberInput {
+            min: Some(f64::from(density_min)),
+            max: Some(f64::from(density_max)),
+            step: Some(1.0),
+        })
+        .validator(Validator::float_range(
+            f64::from(density_min),
+            f64::from(density_max),
+        )),
+    )
+    .setting(
+        "dense_sensitivity",
+        SchemaEntry::new(
+            "How little overlap makes a tile dense for Tier 3 (higher is sooner); only matters with Tier 3 on",
+            f64::from(defaults.dense_sensitivity),
+        )
+        .label("Dense-Tile Sensitivity")
+        .page("Rendering / Virtual Geometry")
+        .field_type(FieldType::Slider {
+            min: f64::from(sens_min),
+            max: f64::from(sens_max),
+            step: 0.125,
+        })
+        .validator(Validator::float_range(
+            f64::from(sens_min),
+            f64::from(sens_max),
+        )),
     )
     .setting(
         "page_budget_mb",

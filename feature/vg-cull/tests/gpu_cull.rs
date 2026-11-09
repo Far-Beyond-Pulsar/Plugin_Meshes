@@ -437,6 +437,18 @@ fn begin(g: &Gpu, core: &mut VgCullCore, r: &Resources) {
     );
 }
 
+/// Run one frame with the camera far away from everything, so the hysteresis
+/// memory (last frame's refined groups, SW/HW classes) is empty for the next one:
+/// the tests that compare against the stateless reference start from it.
+fn flush_history(g: &Gpu, core: &mut VgCullCore, r: &Resources) {
+    set_camera(g, r, [1.0e7, 0.0, 300.0]);
+    begin(g, core, r);
+    run_phase(g, core, r, 0);
+    if core.config.two_phase_occlusion {
+        run_phase(g, core, r, 1);
+    }
+}
+
 fn check_args(out: &PhaseOut, phase: usize, bin_capacity: u32) {
     let a = state::ARGS as usize + phase * state::ARGS_PHASE_WORDS as usize;
     for b in 0..4usize {
@@ -503,6 +515,7 @@ fn distance_reduces_gpu_triangles_and_history_does_not_pin_fine_lod() {
             );
             let mut counts = Vec::new();
             for distance in [300.0, 1000.0, 3000.0, 10000.0, 100000.0, 300.0] {
+                flush_history(&g, &mut core, &r);
                 let v = set_camera(&g, &r, [0.0, 0.0, distance * scale]);
                 begin(&g, &mut core, &r);
                 run_phase(&g, &mut core, &r, 0);
@@ -588,6 +601,8 @@ fn single_phase_matches_the_reference_over_taus_and_residencies() {
             let v = set_camera(&g, &r, [31.0, 0.0, dist]);
             for tau in [0.01f32, 0.5, 2.0, 6.0, 20.0, 100.0, 1.0e5] {
                 core.config.tau_px = tau;
+                flush_history(&g, &mut core, &r);
+                set_camera(&g, &r, [31.0, 0.0, dist]);
                 r.reset_feedback(&g);
                 begin(&g, &mut core, &r);
                 run_phase(&g, &mut core, &r, 0);
@@ -1219,4 +1234,324 @@ fn root_shortcut_gives_the_same_cut_as_the_full_walk() {
         fired_total > 0,
         "the early-out never fired: the test would prove nothing"
     );
+}
+
+// ── Stability: hysteresis, prefetch, the overdraw valve ────────────────────
+
+/// One frame (single phase, no occlusion) at `eye`, from the current history.
+fn frame_at(g: &Gpu, core: &mut VgCullCore, r: &Resources, eye: [f32; 3]) -> (PhaseOut, Vec<u32>) {
+    set_camera(g, r, eye);
+    r.reset_feedback(g);
+    begin(g, core, r);
+    run_phase(g, core, r, 0);
+    collect(g, core, r, 0)
+}
+
+fn one_instance_scene(resident_root_only: bool) -> Scene {
+    let mut s = scene(resident_root_only);
+    s.instances.truncate(1);
+    s
+}
+
+fn stateless_triangles(g: &Gpu, s: &Scene, r: &Resources, d: f32) -> u32 {
+    let v = set_camera(g, r, [-87.0, 0.0, d]);
+    triangle_count(s, &expected(s, &v, 1.0, VgMode::Auto).0)
+}
+
+/// A distance `d` where the cut (stateless) is finer than at `d * 1.004`: the
+/// threshold of some group sits between them.
+fn find_transition(g: &Gpu, s: &Scene, r: &Resources) -> (f32, f32) {
+    let mut d = 200.0f32;
+    let mut last = stateless_triangles(g, s, r, d);
+    while d < 1.0e5 {
+        let next = d * 1.004;
+        let t = stateless_triangles(g, s, r, next);
+        if t < last {
+            return (d, next);
+        }
+        last = t;
+        d = next;
+    }
+    panic!("the cut never changes over the scanned distances");
+}
+
+fn stability_config() -> VgCullConfig {
+    VgCullConfig {
+        two_phase_occlusion: false,
+        initial_bin_capacity: 4096,
+        tile_density_limit: 0.0,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn hysteresis_keeps_the_cut_still_under_jitter_and_releases_it_outside_the_band() {
+    let Some(g) = gpu() else {
+        return;
+    };
+    let s = one_instance_scene(false);
+    let r = upload(&g, &s);
+    let (d_fine, d_coarse) = find_transition(&g, &s, &r);
+    let mut core = VgCullCore::new(&g.device, stability_config());
+    let fine = {
+        let v = set_camera(&g, &r, [-87.0, 0.0, d_fine]);
+        expected(&s, &v, 1.0, VgMode::Auto).0
+    };
+    let coarse = {
+        let v = set_camera(&g, &r, [-87.0, 0.0, d_coarse]);
+        expected(&s, &v, 1.0, VgMode::Auto).0
+    };
+    assert!(
+        triangle_count(&s, &fine) > triangle_count(&s, &coarse),
+        "the test needs a threshold between {d_fine} and {d_coarse}"
+    );
+
+    // Jitter across the threshold every frame: a stateless cut flaps between
+    // `fine` and `coarse`; the held cut stays on the finer one, which is never
+    // coarser than tau requires.
+    flush_history(&g, &mut core, &r);
+    for frame in 0..16 {
+        let d = if frame % 2 == 0 { d_fine } else { d_coarse };
+        let (out, _) = frame_at(&g, &mut core, &r, [-87.0, 0.0, d]);
+        assert_eq!(out.items, fine, "frame {frame} at {d}: the cut flapped");
+    }
+    // A still camera on the coarse side after the finer cut was chosen: held.
+    for frame in 0..4 {
+        let (out, _) = frame_at(&g, &mut core, &r, [-87.0, 0.0, d_coarse]);
+        assert_eq!(out.items, fine, "still frame {frame} lost the held detail");
+    }
+    // Far outside the band (error well below tau / (1 + TAU_HYST)) it releases.
+    let d_far = d_coarse * (1.0 + helio_pass_vg_cull::TAU_HYST) * 1.3;
+    let far_want = {
+        let v = set_camera(&g, &r, [-87.0, 0.0, d_far]);
+        expected(&s, &v, 1.0, VgMode::Auto).0
+    };
+    let mut released = BTreeSet::new();
+    for _ in 0..3 {
+        released = frame_at(&g, &mut core, &r, [-87.0, 0.0, d_far]).0.items;
+    }
+    assert_eq!(released, far_want, "the hold never releases");
+    assert!(triangle_count(&s, &far_want) < triangle_count(&s, &coarse));
+}
+
+#[test]
+fn the_sw_hw_edge_test_has_hysteresis() {
+    let Some(g) = gpu() else {
+        return;
+    };
+    let s = one_instance_scene(false);
+    let r = upload(&g, &s);
+    let mut core = VgCullCore::new(&g.device, stability_config());
+    // Software-class population of the stateless cut over distance; find the
+    // distance where it first changes.
+    let sw_count = |g: &Gpu, core: &mut VgCullCore, d: f32| {
+        flush_history(g, core, &r);
+        let (out, _) = frame_at(g, core, &r, [-87.0, 0.0, d]);
+        out.items
+            .iter()
+            .filter(|i| i.2 == helio_pass_vg_cull::BIN_SW)
+            .count()
+    };
+    let mut d = 100.0f32;
+    let mut last = sw_count(&g, &mut core, d);
+    let mut found = None;
+    while d < 1.0e5 {
+        let next = d * 1.004;
+        let n = sw_count(&g, &mut core, next);
+        if n != last {
+            found = Some((d, next, last, n));
+            break;
+        }
+        last = n;
+        d = next;
+    }
+    let (d_a, d_b, n_a, n_b) =
+        found.expect("the SW class never changes over the scanned distances");
+    // Jitter across that threshold: after the first frame the classes stay put.
+    flush_history(&g, &mut core, &r);
+    let mut seen = Vec::new();
+    for frame in 0..12 {
+        let d = if frame % 2 == 0 { d_a } else { d_b };
+        let (out, _) = frame_at(&g, &mut core, &r, [-87.0, 0.0, d]);
+        seen.push(
+            out.items
+                .iter()
+                .filter(|i| i.2 == helio_pass_vg_cull::BIN_SW)
+                .count(),
+        );
+    }
+    assert!(
+        seen.windows(2).all(|w| w[0] == w[1]),
+        "SW/HW classes flapped (stateless: {n_a} vs {n_b}): {seen:?}"
+    );
+}
+
+/// Page requests and the urgent subset of one frame at distance `d`.
+fn requests_at(
+    g: &Gpu,
+    core: &mut VgCullCore,
+    r: &Resources,
+    d: f32,
+) -> (BTreeSet<u32>, BTreeSet<u32>) {
+    flush_history(g, core, r);
+    set_camera(g, r, [-87.0, 0.0, d]);
+    r.reset_feedback(g);
+    begin(g, core, r);
+    run_phase(g, core, r, 0);
+    let fb = feedback::decode(
+        &read_words(g, &r.feedback, r.layout.total_words() as u64),
+        r.layout,
+        r.page_count,
+    );
+    (
+        fb.requests.into_iter().collect(),
+        fb.urgent.into_iter().collect(),
+    )
+}
+
+#[test]
+fn prefetch_requests_children_while_the_error_is_within_the_band() {
+    use helio_pass_vg_cull::reference::select_clusters_prefetch;
+    let Some(g) = gpu() else {
+        return;
+    };
+    // Only the roots are resident: every child page is a request candidate.
+    let s = one_instance_scene(true);
+    let r = upload(&g, &s);
+    let slots = s.dag.slots(&s.resident);
+    let lookup = s.dag.lookup();
+    let asset = s.dag.asset(&slots, &lookup);
+    let reference = |d: f32, k: f32| {
+        let v = set_camera(&g, &r, [-87.0, 0.0, d]);
+        let sel = select_clusters_prefetch(&asset, &v, 1.0, &s.instances[0], false, k);
+        (sel.requested_pages, sel.urgent_pages)
+    };
+    // A distance where the cut does not need the next level yet, but is within
+    // 4x of needing it.
+    let mut d = 100.0f32;
+    let band = loop {
+        let (need, _) = reference(d, 1.0);
+        let (early, _) = reference(d, 4.0);
+        if need.is_empty() && !early.is_empty() {
+            break d;
+        }
+        d *= 1.01;
+        assert!(d < 1.0e6, "no prefetch-only distance found");
+    };
+    let core = |k: f32| {
+        VgCullCore::new(
+            &g.device,
+            VgCullConfig {
+                prefetch_factor: k,
+                ..stability_config()
+            },
+        )
+    };
+    let mut demand_only = core(1.0);
+    let (requests, _) = requests_at(&g, &mut demand_only, &r, band);
+    assert!(requests.is_empty(), "k=1 requested early: {requests:?}");
+    drop(demand_only);
+    let mut prefetching = core(4.0);
+    let (requests, urgent) = requests_at(&g, &mut prefetching, &r, band);
+    let (want, want_urgent) = reference(band, 4.0);
+    assert_eq!(requests, want, "prefetch band requests at {band}");
+    assert!(urgent.is_empty() && want_urgent.is_empty(), "nothing is urgent yet");
+    // Close enough that the cut needs the pages: those are urgent, and the band
+    // still holds the prefetches below them.
+    let (requests, urgent) = requests_at(&g, &mut prefetching, &r, band / 3.0);
+    let (want, want_urgent) = reference(band / 3.0, 4.0);
+    assert_eq!(requests, want);
+    assert_eq!(urgent, want_urgent);
+    assert!(!urgent.is_empty() && urgent.is_subset(&requests));
+}
+
+fn tile_block(g: &Gpu, core: &VgCullCore) -> Vec<[u32; 3]> {
+    let b = core.buffers();
+    let words = u64::from(b.tile_base()) + u64::from(b.tiles[0] * b.tiles[1]) * 3;
+    let all = read_words(g, &b.history, words);
+    all[b.tile_base() as usize..]
+        .chunks_exact(3)
+        .map(|c| [c[0], c[1], c[2]])
+        .collect()
+}
+
+#[test]
+fn overdraw_valve_coarsens_only_the_hot_tiles_stably() {
+    use helio_pass_vg_cull::{TILE_FIXED, TILE_SCALE_MAX};
+    let Some(g) = gpu() else {
+        return;
+    };
+    // 48 copies of the asset stacked at one place (a hot patch), and one lone
+    // copy far to the side on screen (its tiles are below the limit).
+    const STACK: usize = 48;
+    let mut s = scene(false);
+    let make = |x: f32, row: u32| {
+        RefInstance::translated_scaled(
+            [x, 0.0, 0.0],
+            1.0,
+            GpuVgInstance {
+                asset_slot: 0,
+                flags: INST_ENABLED,
+                lod_error_scale: 1.0,
+                object_row: row,
+            },
+        )
+    };
+    s.instances = (0..STACK).map(|i| make(-150.0, i as u32)).collect();
+    s.instances.push(make(700.0, STACK as u32));
+    let r = upload(&g, &s);
+    let eye = [-87.0, 0.0, 1500.0];
+    let lone = STACK as u32;
+    let run = |limit: f32, frames: usize| -> (Vec<BTreeSet<Item>>, Vec<f32>, Vec<[u32; 3]>) {
+        let mut core = VgCullCore::new(
+            &g.device,
+            VgCullConfig {
+                initial_bin_capacity: 1 << 16,
+                tile_density_limit: limit,
+                ..stability_config()
+            },
+        );
+        let mut sets = Vec::new();
+        for _ in 0..frames {
+            let (out, _) = frame_at(&g, &mut core, &r, eye);
+            sets.push(out.items);
+        }
+        let tiles = tile_block(&g, &core);
+        let scales = tiles
+            .iter()
+            .map(|t| f32::from_bits(t[2]).max(1.0))
+            .collect();
+        (sets, scales, tiles)
+    };
+    let (open, _, tiles) = run(0.0, 2);
+    let density = |t: &[u32; 3]| t[0] as f32 / (t[1] as f32).clamp(1.0, 256.0 * TILE_FIXED);
+    let hot = tiles.iter().map(density).fold(0.0f32, f32::max);
+    assert!(hot > 25.0, "the stacked patch is not hot enough for the test: {hot}");
+    let triangles = |items: &BTreeSet<Item>, lone_only: bool| -> u32 {
+        triangle_count(
+            &s,
+            &items
+                .iter()
+                .copied()
+                .filter(|i| (i.0 == lone) == lone_only)
+                .collect(),
+        )
+    };
+    let (valved, scales, _) = run(16.0, 40);
+    let last = valved.last().unwrap();
+    assert!(
+        triangles(last, false) * 10 < triangles(&open[1], false) * 9,
+        "the hot stack was not coarsened: {} vs {}",
+        triangles(last, false),
+        triangles(&open[1], false)
+    );
+    // The lone copy is not over the limit: its cut is exactly the unvalved one.
+    let lone_open: BTreeSet<_> = open[1].iter().copied().filter(|i| i.0 == lone).collect();
+    let lone_valved: BTreeSet<_> = last.iter().copied().filter(|i| i.0 == lone).collect();
+    assert_eq!(lone_valved, lone_open, "the valve moved an unrelated instance");
+    // Stable: the last frames are identical (no oscillation), within the ceiling.
+    let tail = &valved[valved.len() - 8..];
+    assert!(tail.windows(2).all(|w| w[0] == w[1]), "the valve oscillates");
+    assert!(scales.iter().all(|&g| g <= TILE_SCALE_MAX + 1e-3));
+    assert!(scales.iter().any(|&g| g > 1.5), "no tile coarsened");
 }

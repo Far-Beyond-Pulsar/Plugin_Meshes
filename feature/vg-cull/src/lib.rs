@@ -12,13 +12,45 @@
 //!    dispatch and no per-instance cluster list: a job is `{instance, node}`.
 //! 2. Every job tests its own bound: frustum, screen-space error entry test
 //!    (`project(max_parent_error) > tau`), two-phase Hi-Z occlusion.
-//! 3. A cluster is drawn iff `project(self) <= tau && project(parent) > tau`
-//!    (scaled by `lod_error_scale * instance_scale`), after the cone cull
-//!    (`INST_CONE_CULL`) and its own frustum/occlusion test. If the pages of
-//!    the clusters it was simplified from are not resident it is drawn
-//!    *instead* (`project(parent) > tau` alone) and those pages are requested.
+//! 3. A cluster is drawn iff its parent group is refined and its own is not
+//!    (see "The cut" below), after the cone cull (`INST_CONE_CULL`) and its own
+//!    frustum/occlusion test. If the pages of the clusters it was simplified
+//!    from are not resident it is drawn *instead* (its parent group refined
+//!    alone) and those pages are requested.
 //! 4. Survivors are written, with atomics, into bins (below), together with
 //!    indirect draw/dispatch args for the raster tiers.
+//!
+//! # The cut
+//!
+//! Per-cluster screen-space error is the only LOD driver: a group is *refined*
+//! (its finer clusters replace its own) when `project(error * lod_error_scale *
+//! instance_scale) > tau`, tau being the stable `tau_px` setting. There is no
+//! screen-wide density multiplier, so density follows geometry. The stored error
+//! is used as is; until the builder stores true deviation separately
+//! (`vg/build` `DENSITY_TOLERANCE_GAIN`), the relaxed error it bakes makes the
+//! cut coarser than `tau` implies.
+//!
+//! * **Hysteresis** ([`TAU_HYST`], [`EDGE_HYST`]). A group refined last frame
+//!   stays refined until its error drops under `tau / (1 + TAU_HYST)`, so the
+//!   `error <= tau` bound always holds and only the finer side is held; the
+//!   SW/HW edge test has the same band around `sw_edge_px`. The memory is the
+//!   visibility hash set, salted per decision, keyed by the group's (identical on
+//!   both sides) sphere and error, so the two sides of a decision always agree.
+//! * **Prefetch** ([`VgCullDynamic::prefetch_factor`]). Child pages are
+//!   requested (and resident ones touched) while `error * k > tau`, so fine pages
+//!   are resident before the cut needs them; a page the cut needs now is
+//!   *urgent* and is scheduled before every prefetch.
+//! * **Overdraw valve** ([`VgCullDynamic::tile_density_limit`]). Every emitted
+//!   cluster adds its triangles and covered area to the 16x16 tiles it covers
+//!   (`tile estimate`); next frame `cs_tiles` turns that into triangles per
+//!   covered pixel per tile. Only a tile over the limit coarsens, slowly and with
+//!   a dead band ([`TILE_BAND`]), by at most [`TILE_SCALE_MAX`]x, and only the
+//!   groups whose footprint covers it feel it. A tile in the dense-tile mask is
+//!   exempt (its scale relaxes): dense is an outcome of the cut, not a failure.
+//! * **Dense estimate.** The same per-tile triangle estimate (hardware-class
+//!   clusters included) is published to the dense-tile classifier
+//!   ([`VgCullFrameData::tile_estimate`]), so a tile can go dense without the
+//!   software raster having counted it.
 //!
 //! # Two phases and the Hi-Z hook
 //!
@@ -52,7 +84,7 @@
 //! Bins ([`BIN_HW_32`] ..): `0..=3` hardware raster by triangle-count class
 //! (`<=32`, `<=64`, `<=96`, `<=128` -> 96/192/288/384 vertices per cluster),
 //! `4` = software micro-raster (projected average triangle edge
-//! `<= sw_edge_px`), `5` = dense candidates (SW-class clusters overlapping a
+//! `<= sw_edge_px`, with hysteresis), `5` = dense candidates (SW-class clusters overlapping a
 //! tile marked dense in last frame's `dense_tile_mask`, plus
 //! `TierLock::Dense`). Hardware-class clusters are never moved to dense:
 //! the dense tier re-processes tiles, it does not claim whole clusters.
@@ -124,6 +156,7 @@ mod pass;
 pub use crate::core::{VgCullBuffers, VgCullConfig, VgCullCore, VgCullFrame, VgCullInputs};
 pub use crate::pass::{
     VgCullDynamic, VgCullEarlyPass, VgCullFrameData, VgCullLatePass, VgCullSettingsSource,
+    VgTileEstimate,
 };
 
 use helio_vg_format::{GpuCluster, VgMode};
@@ -194,6 +227,34 @@ pub const DENSE_TILE: u32 = 16;
 /// average triangle edge of a cluster modelled as a disc of its bounding
 /// sphere's projected radius (equilateral triangles, area `sqrt(3)/4 e^2`).
 pub const EDGE_FACTOR: f32 = 2.7;
+/// Hysteresis of the cut: a group refined last frame stays refined down to
+/// `tau / (1 + TAU_HYST)`. 25 % is wider than the frame-to-frame error jitter of
+/// a still camera and of one pixel of camera motion, and costs at most that much
+/// extra detail (never less than `tau` requires).
+pub const TAU_HYST: f32 = 0.25;
+/// Hysteresis of the software/hardware edge test, as a fraction of `sw_edge_px`.
+pub const EDGE_HYST: f32 = 0.15;
+/// Overdraw valve: a tile coarsens above `limit * (1 + TILE_BAND)` triangles per
+/// covered pixel, relaxes below `limit / (1 + TILE_BAND)`, holds in between.
+pub const TILE_BAND: f32 = 0.25;
+/// Per-frame multipliers of a tile's coarsening scale (up when over the limit,
+/// down when under it or dense) and its ceiling.
+pub const TILE_STEP_UP: f32 = 1.2;
+pub const TILE_STEP_DOWN: f32 = 0.95;
+pub const TILE_SCALE_MAX: f32 = 4.0;
+/// Words per tile in the cull's tile block: estimated triangles and estimated
+/// covered area (both times [`TILE_FIXED`]) and the valve scale (f32 bits).
+pub const TILE_WORDS: u32 = 3;
+/// Fixed-point scale of the tile estimate words.
+pub const TILE_FIXED: f32 = 16.0;
+
+/// The WGSL constants of the tile block, for every shader that reads it (the
+/// cull itself and the dense-tile classifier).
+pub fn tile_block_wgsl() -> String {
+    format!(
+        "const VGC_TILE_WORDS: u32 = {TILE_WORDS}u;\nconst VGC_TILE_FIXED: f32 = {TILE_FIXED:?};\n"
+    )
+}
 /// Error value at or above which a cluster/node is treated as infinitely
 /// coarse (root parents).
 pub const INF_ERROR: f32 = 1.0e30;
@@ -216,11 +277,7 @@ pub mod state {
     pub const RANGES: u32 = helio_vg_format::CULL_STATE_RANGES;
     pub const ARGS: u32 = 72;
     pub const ARGS_PHASE_WORDS: u32 = 32;
-    /// Tolerance multiplier chosen by the density solve (f32 bits) and the
-    /// triangles it predicted (read back with the stats).
-    pub const DENSITY: u32 = 136;
-    pub const PREDICTED: u32 = 137;
-    pub const WORDS: u32 = 140;
+    pub const WORDS: u32 = 136;
 }
 
 pub const RANGES_BYTE_OFFSET: u64 = state::RANGES as u64 * 4;
@@ -300,10 +357,6 @@ pub struct VgCullStats {
     pub visible_overflow: u32,
     pub root_shortcuts: u32,
     pub peak_queue: u32,
-    /// Screen-wide tolerance multiplier the density solve chose this frame, and the
-    /// triangles it predicted at it (before occlusion).
-    pub density_scale: f32,
-    pub predicted_triangles: u32,
     pub tier_clusters: [u32; BIN_COUNT as usize],
 }
 
@@ -331,10 +384,6 @@ impl VgCullStats {
             visible_overflow: st(stats::VISIBLE_OVERFLOW),
             peak_queue: st(stats::PEAK_QUEUE),
             root_shortcuts: st(stats::ROOT_SHORTCUT),
-            density_scale: words
-                .get(state::DENSITY as usize)
-                .map_or(1.0, |w| f32::from_bits(*w).max(1.0)),
-            predicted_triangles: words.get(state::PREDICTED as usize).copied().unwrap_or(0),
             tier_clusters,
         })
     }
@@ -354,10 +403,8 @@ impl VgCullStats {
     pub fn summary(&self) -> String {
         let (hw, sw, dense) = self.tier_split();
         format!(
-            "tris {} (solve: x{:.2} tolerance, predicted {}) clusters {}/{} (HW {} SW {} dense {}) culled F{} O{} B{} E{} overflow {}",
+            "tris {} clusters {}/{} (HW {} SW {} dense {}) culled F{} O{} B{} E{} overflow {}",
             self.triangles,
-            self.density_scale,
-            self.predicted_triangles,
             self.emitted,
             self.clusters_tested,
             hw,
@@ -420,8 +467,6 @@ pub fn wgsl_constants() -> String {
     u("VGC_ST_PHASE1", state::PHASE0_COUNTS);
     u("VGC_ST_RANGES", state::RANGES);
     u("VGC_ST_ARGS", state::ARGS);
-    u("VGC_ST_DENSITY", state::DENSITY);
-    u("VGC_ST_PREDICTED", state::PREDICTED);
     u("VGC_ARGS_PHASE_WORDS", state::ARGS_PHASE_WORDS);
     u("VGC_SW_GROUP_WIDTH", SW_GROUP_WIDTH);
     u("VGC_TILE", DENSE_TILE);
@@ -454,7 +499,18 @@ pub fn wgsl_constants() -> String {
     ] {
         u(&format!("VGC_STAT_{name}"), v);
     }
+    s.push_str(&tile_block_wgsl());
     let _ = writeln!(s, "const VGC_EDGE_FACTOR: f32 = {:?};", EDGE_FACTOR);
+    for (name, v) in [
+        ("TAU_HOLD", 1.0 / (1.0 + TAU_HYST)),
+        ("EDGE_HYST", EDGE_HYST),
+        ("TILE_BAND", TILE_BAND),
+        ("TILE_STEP_UP", TILE_STEP_UP),
+        ("TILE_STEP_DOWN", TILE_STEP_DOWN),
+        ("TILE_SCALE_MAX", TILE_SCALE_MAX),
+    ] {
+        let _ = writeln!(s, "const VGC_{name}: f32 = {v:?};");
+    }
     s
 }
 

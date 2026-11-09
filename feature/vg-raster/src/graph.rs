@@ -19,14 +19,13 @@ use helio_core::{
     BufferKey, PassContext, PrepareContext, RenderPass, ResourceKey, Result as HelioResult,
 };
 use helio_pass_vg_cull::{
-    dense_dispatch_args_offset, hw_masked_draw_args_offset, state, sw_dispatch_args_offset,
-    sw_masked_dispatch_args_offset, VgCullFrameData, VgCullInputs, ARGS_BYTE_OFFSET,
-    ARGS_PHASE_BYTES, BIN_COUNT, BIN_DENSE, BIN_SW, BIN_SW_MASKED, KEY_CULL, KEY_CULL_EARLY,
-    KEY_HIZ_LATE, KEY_INPUTS,
+    hw_masked_draw_args_offset, state, sw_dispatch_args_offset, sw_masked_dispatch_args_offset,
+    VgCullFrameData, VgCullInputs, ARGS_BYTE_OFFSET, ARGS_PHASE_BYTES, BIN_COUNT, BIN_SW,
+    BIN_SW_MASKED, KEY_CULL, KEY_CULL_EARLY, KEY_HIZ_LATE, KEY_INPUTS,
 };
 use wgpu::util::DeviceExt;
 
-use crate::{VgDenseInputs, VgMaskedInputs, VgRaster, VgRasterConfig, VgRasterInputs, VgTargets};
+use crate::{VgMaskedInputs, VgRaster, VgRasterConfig, VgRasterInputs, VgTargets};
 
 /// [`VgRasterFrameData`] after phase 0.
 pub const KEY_RASTER_EARLY: &str = "vg_raster_early";
@@ -73,6 +72,12 @@ impl VgRasterShared {
             raster: VgRaster::new(device, config),
             targets: None,
         })))
+    }
+
+    /// The dense-tile classifier's sensitivity (`VirtualGeometrySettings`): both
+    /// thresholds are divided by it.
+    pub fn set_dense_sensitivity(&self, sensitivity: f32) {
+        lock(&self.0).raster.config.dense_sensitivity = sensitivity;
     }
 
     /// (Re)create the targets for `width x height`.
@@ -229,12 +234,6 @@ fn record_phase(
         sw_dispatch: cull.state,
         sw_dispatch_offset: sw_dispatch_args_offset(phase),
         masked,
-        dense: Some(VgDenseInputs {
-            meta: cull.state,
-            meta_offset_words: state::RANGES + phase * BIN_COUNT * 2 + BIN_DENSE * 2,
-            dispatch: cull.state,
-            dispatch_offset: dense_dispatch_args_offset(phase),
-        }),
     };
     let mut rec = ctx.graphics_cmds();
     raster.encode_phase(
@@ -246,7 +245,13 @@ fn record_phase(
         phase,
     );
     if phase == 1 {
-        raster.encode_classify(ctx.device, &mut rec, targets);
+        raster.encode_classify(
+            ctx.device,
+            ctx.queue,
+            &mut rec,
+            targets,
+            Some(cull.tile_estimate),
+        );
     }
     Some(Published::of(targets))
 }

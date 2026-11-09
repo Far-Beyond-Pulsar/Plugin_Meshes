@@ -134,7 +134,6 @@ pub fn decode_bindings_wgsl(group: u32, pool_binding: u32, quant_binding: u32) -
 }
 
 pub mod debug_view;
-pub mod density;
 pub mod testing;
 
 /// `.vgeo` / page identification.
