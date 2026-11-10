@@ -929,16 +929,21 @@ fn cs_traverse(@builtin(local_invocation_index) lid: u32) {
         // the rest of the GPU idle. Share a bounded frontier with the next
         // dispatch, whose workgroup count reflects that expanded frontier.
         // The final round drains normally; yielding there would drop work.
-        if waves >= REDISTRIBUTE_WAVES && rp.dst != 3u {
-            if lid == 0u { wg_n = min(atomicLoad(&wg_sp), STACK_CAP); }
-            workgroupBarrier();
-            let pending = workgroupUniformLoad(&wg_n);
-            for (var i = lid; i < pending; i += WG) { spill_job(wg_stack[i]); }
-            workgroupBarrier();
-            if lid == 0u { atomicStore(&wg_sp, 0u); }
-            workgroupBarrier();
-            waves = 0u;
+        // The barriers below run every iteration and only the work is
+        // predicated: FXC (the only compiler on Windows on ARM, which has no
+        // DXC) rejects a barrier inside a branch it cannot prove uniform, and
+        // after the data-dependent `break` above it can prove nothing.
+        let redistribute = waves >= REDISTRIBUTE_WAVES && rp.dst != 3u;
+        if lid == 0u {
+            wg_n = select(0u, min(atomicLoad(&wg_sp), STACK_CAP), redistribute);
         }
+        workgroupBarrier();
+        let pending = workgroupUniformLoad(&wg_n);
+        for (var i = lid; i < pending; i += WG) { spill_job(wg_stack[i]); }
+        workgroupBarrier();
+        if lid == 0u && redistribute { atomicStore(&wg_sp, 0u); }
+        workgroupBarrier();
+        if redistribute { waves = 0u; }
     }
 }
 
