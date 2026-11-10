@@ -368,12 +368,12 @@ pub fn measure(
                     if let Some(got) = Shading::blend([&c0, &c1, &c2], w) {
                         let tilt = length(sub(want.normal, got.normal));
                         let mut len = 0.5 * tilt * mean_edge;
-                        for ch in 0..2 {
+                        for (ch, &per_uv) in uv_len.iter().enumerate() {
                             let du = [
                                 want.uv[ch][0] - got.uv[ch][0],
                                 want.uv[ch][1] - got.uv[ch][1],
                             ];
-                            len = len.max((du[0] * du[0] + du[1] * du[1]).sqrt() * uv_len[ch]);
+                            len = len.max((du[0] * du[0] + du[1] * du[1]).sqrt() * per_uv);
                         }
                         shading = shading.max(len);
                         e = e.max(len);
