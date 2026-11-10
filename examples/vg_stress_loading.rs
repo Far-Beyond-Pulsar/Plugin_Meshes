@@ -51,7 +51,14 @@ pub struct VgPart {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PartMeta {
+    /// Material slot of the part; for a sectioned part, its first section's.
     pub slot: String,
+    /// Material slot of each section of a sectioned VG part, in section order
+    /// (the `counts_material >> 16` the cull and shade read); empty for a
+    /// single-material part. One instance of the part takes one object row per
+    /// section, consecutive, as the scene join lays out a sectioned mesh.
+    #[serde(default)]
+    pub sections: Vec<String>,
     pub transform: [f32; 16],
     pub radius: f32,
     /// Content id of the part's `.vgeo`; `None` for classic parts.
@@ -199,10 +206,51 @@ struct LoadedScene {
     info: std::collections::HashMap<String, GltfMaterial>,
 }
 
+/// The importer (`solid-gltf`) refuses a glTF that *requires*
+/// `KHR_texture_transform`, which every Poly Haven tree does. The loader
+/// bakes the transform into the vertices itself (below), so the importer is
+/// handed a sibling copy of the glTF JSON with that one extension no longer
+/// required (the `.bin` and textures are referenced by their relative URIs,
+/// not copied). Any other glTF is imported as it is.
+fn importable_path(path: &Path) -> Result<std::path::PathBuf, String> {
+    const EXT: &str = "KHR_texture_transform";
+    if !path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("gltf"))
+    {
+        return Ok(path.to_path_buf());
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let Some(required) = doc
+        .get_mut("extensionsRequired")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return Ok(path.to_path_buf());
+    };
+    if !required.iter().any(|v| v.as_str() == Some(EXT)) {
+        return Ok(path.to_path_buf());
+    }
+    required.retain(|v| v.as_str() != Some(EXT));
+    if required.is_empty() {
+        doc.as_object_mut().map(|o| o.remove("extensionsRequired"));
+    }
+    let out = path.with_extension("vgimport.gltf");
+    let json = serde_json::to_vec(&doc).map_err(|e| e.to_string())?;
+    if std::fs::read(&out).ok().as_deref() != Some(json.as_slice()) {
+        let tmp = out.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&tmp, &json).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &out).map_err(|e| format!("{}: {e}", out.display()))?;
+    }
+    Ok(out)
+}
+
 /// glTF `KHR_texture_transform` UV scale/offset is baked into the vertices.
 fn load_scene(path: &Path) -> Result<LoadedScene, String> {
-    let mut scene =
-        load_scene_file_with_config(path, LoadConfig::default()).map_err(|e| e.to_string())?;
+    let import_path = importable_path(path)?;
+    let mut scene = load_scene_file_with_config(&import_path, LoadConfig::default())
+        .map_err(|e| e.to_string())?;
     let info = if path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("gltf"))
@@ -254,16 +302,87 @@ impl LoadedScene {
     }
 }
 
+/// Geometry of one part: the importer's mesh, or (a sectioned VG part) the
+/// variant's material parts concatenated, with the section of each triangle.
+struct PartGeometry<'a> {
+    vertices: std::borrow::Cow<'a, [PackedVertex]>,
+    indices: std::borrow::Cow<'a, [u32]>,
+    tri_material: Vec<u32>,
+}
+
+impl<'a> PartGeometry<'a> {
+    fn of(mesh: &'a ConvertedMesh) -> Self {
+        Self {
+            vertices: std::borrow::Cow::Borrowed(&mesh.vertices),
+            indices: std::borrow::Cow::Borrowed(&mesh.indices),
+            tri_material: Vec::new(),
+        }
+    }
+}
+
+/// A tree variant's material parts as one VG asset with one section per part
+/// (Nanite's model: one mesh, materials per cluster). One instance, one
+/// hierarchy walk and one set of roots per placed tree instead of one per
+/// material. Only when every part has the same node transform (the glTF
+/// primitives of one mesh do); otherwise `None` and the parts stay separate.
+fn merge_sections<'a>(
+    parts: Vec<(PartGeometry<'a>, PartMeta)>,
+) -> Result<Vec<(PartGeometry<'a>, PartMeta)>, Vec<(PartGeometry<'a>, PartMeta)>> {
+    if parts.len() < 2
+        || parts.iter().any(|(_, m)| m.content.is_none() || m.transform != parts[0].1.transform)
+    {
+        return Err(parts);
+    }
+    let vertex_total: usize = parts.iter().map(|(g, _)| g.vertices.len()).sum();
+    let index_total: usize = parts.iter().map(|(g, _)| g.indices.len()).sum();
+    let mut vertices = Vec::with_capacity(vertex_total);
+    let mut indices = Vec::with_capacity(index_total);
+    let mut tri_material = Vec::with_capacity(index_total / 3);
+    let mut sections = Vec::with_capacity(parts.len());
+    let (mut radius, mut triangles, mut masked) = (0.0f32, 0u64, false);
+    for (section, (geometry, meta)) in parts.iter().enumerate() {
+        let base = vertices.len() as u32;
+        vertices.extend_from_slice(&geometry.vertices);
+        let whole = geometry.indices.len() / 3 * 3;
+        indices.extend(geometry.indices[..whole].iter().map(|&i| i + base));
+        tri_material.extend(std::iter::repeat_n(section as u32, whole / 3));
+        sections.push(meta.slot.clone());
+        radius = radius.max(meta.radius);
+        triangles += meta.source_triangles;
+        masked |= meta.masked;
+    }
+    let content = cook::sectioned_content_id(&vertices, &indices, &tri_material);
+    let first = &parts[0].1;
+    let meta = PartMeta {
+        slot: first.slot.clone(),
+        sections,
+        transform: first.transform,
+        radius,
+        content: Some(content_words(content)),
+        source_triangles: triangles,
+        masked,
+        lods: Vec::new(),
+    };
+    let geometry = PartGeometry {
+        vertices: std::borrow::Cow::Owned(vertices),
+        indices: std::borrow::Cow::Owned(indices),
+        tri_material,
+    };
+    Ok(vec![(geometry, meta)])
+}
+
 /// The parts of one asset (kit piece, scan, tree variant) with their scene
-/// transform, material slot and, for VG parts, their content id. No geometry
-/// is copied: the mesh is the importer's.
+/// transform, material slot and, for VG parts, their content id. A tree
+/// variant's parts become one sectioned part ([`merge_sections`]); other
+/// geometry is the importer's, not copied.
 fn describe<'a>(
     scene: &'a LoadedScene,
     root: &Path,
     path: &Path,
     asset: &str,
     vg: bool,
-) -> Result<Vec<(&'a ConvertedMesh, PartMeta)>, String> {
+    merge: bool,
+) -> Result<Vec<(PartGeometry<'a>, PartMeta)>, String> {
     let (_, variant) = split_key(asset);
     let mut min = glam::Vec3::splat(f32::INFINITY);
     let mut max = glam::Vec3::splat(f32::NEG_INFINITY);
@@ -323,9 +442,10 @@ fn describe<'a>(
             node.w_axis = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
         }
         parts.push((
-            mesh,
+            PartGeometry::of(mesh),
             PartMeta {
                 slot: scene.slot(mesh),
+                sections: Vec::new(),
                 transform: (correction * node).to_cols_array(),
                 radius,
                 content,
@@ -338,6 +458,9 @@ fn describe<'a>(
     if parts.is_empty() {
         return Err("asset contains no triangles".into());
     }
+    if merge && vg && variant.is_some() {
+        return Ok(merge_sections(parts).unwrap_or_else(|separate| separate));
+    }
     Ok(parts)
 }
 
@@ -347,7 +470,7 @@ fn describe<'a>(
 // and content id of each part, plus the classic meshes the asset keeps (the
 // whole kit piece, or the masked stand-in LODs). VG parts store no geometry.
 
-const RECORD_MAGIC: &[u8; 8] = b"VGPART06";
+const RECORD_MAGIC: &[u8; 8] = b"VGPART07";
 
 fn record_path(
     cache: &Path,
@@ -375,7 +498,7 @@ fn record_path(
     let hash = key.bytes().fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
-    Ok(cache.join(format!("parts-v6-{hash:016x}.bin")))
+    Ok(cache.join(format!("parts-v7-{hash:016x}.bin")))
 }
 
 fn write_record(path: &Path, parts: &[PreparedPart]) -> Result<(), String> {
@@ -507,35 +630,18 @@ fn process_asset(
     vg: bool,
 ) -> Result<Processed, String> {
     let (_, variant) = split_key(asset);
-    let mut record = Vec::new();
-    let mut cooked: Vec<Arc<VgeoBytes>> = Vec::new();
-    for (mesh, mut meta) in describe(scene, root, path, asset, vg)? {
-        let mut lods = Vec::new();
-        if !vg {
-            lods.push(MeshUpload {
-                vertices: mesh.vertices.clone(),
-                indices: mesh.indices.clone(),
-            });
-        } else if let Some(words) = meta.content {
-            let content = content_id(words);
-            let build =
-                || cook::load_or_build_vgeo_cache(content, &mesh.vertices, &mesh.indices, cache);
-            let (vgeo, _) = match pool {
-                Some(pool) => pool.install(build),
-                None => build(),
-            }?;
-            cooked.push(vgeo);
+    // A sectioned asset is simplified per material, so its root is the union
+    // of every material's root; when that cannot fit the pinned root budget
+    // (`RootTooLarge`, e.g. a 7M-triangle pine) the parts are cooked apart.
+    let (record, cooked) = match cook_parts(cache, pool, scene, root, path, asset, vg, true) {
+        Err(error) if error.contains("RootTooLarge") => {
+            log::warn!(
+                "{asset}: sectioned cook does not fit the root budget ({error}); cooking its material parts separately"
+            );
+            cook_parts(cache, pool, scene, root, path, asset, vg, false)?
         }
-        meta.lods = lods
-            .iter()
-            .map(|m| (m.vertices.len(), m.indices.len()))
-            .collect();
-        record.push(PreparedPart {
-            asset: asset.to_string(),
-            meta,
-            lods,
-        });
-    }
+        result => result?,
+    };
     let record_file = record_path(cache, path, variant, vg)?;
     if let Err(error) = write_record(&record_file, &record) {
         log::warn!("Part record {}: {error}", record_file.display());
@@ -554,6 +660,58 @@ fn process_asset(
         }
     }
     Ok(out)
+}
+
+/// Describes and cooks the parts of one asset (`merge`: a tree variant as one
+/// sectioned asset). Returns the part record and the cooked VG parts, in order.
+#[allow(clippy::too_many_arguments)]
+fn cook_parts(
+    cache: &Path,
+    pool: Option<&rayon::ThreadPool>,
+    scene: &LoadedScene,
+    root: &Path,
+    path: &Path,
+    asset: &str,
+    vg: bool,
+    merge: bool,
+) -> Result<(Vec<PreparedPart>, Vec<Arc<VgeoBytes>>), String> {
+    let mut record = Vec::new();
+    let mut cooked: Vec<Arc<VgeoBytes>> = Vec::new();
+    for (mesh, mut meta) in describe(scene, root, path, asset, vg, merge)? {
+        let mut lods = Vec::new();
+        if !vg {
+            lods.push(MeshUpload {
+                vertices: mesh.vertices.to_vec(),
+                indices: mesh.indices.to_vec(),
+            });
+        } else if let Some(words) = meta.content {
+            let content = content_id(words);
+            let build = || {
+                cook::load_or_build_vgeo_cache(
+                    content,
+                    &mesh.vertices,
+                    &mesh.indices,
+                    &mesh.tri_material,
+                    cache,
+                )
+            };
+            let (vgeo, _) = match pool {
+                Some(pool) => pool.install(build),
+                None => build(),
+            }?;
+            cooked.push(vgeo);
+        }
+        meta.lods = lods
+            .iter()
+            .map(|m| (m.vertices.len(), m.indices.len()))
+            .collect();
+        record.push(PreparedPart {
+            asset: asset.to_string(),
+            meta,
+            lods,
+        });
+    }
+    Ok((record, cooked))
 }
 
 /// Architecture kit piece: its record, or import and record it.

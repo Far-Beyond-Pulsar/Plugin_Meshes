@@ -22,6 +22,7 @@ mod vg_stress_loading;
 mod vg_stress_prep;
 mod vg_stress_data {
     pub mod dims;
+    pub mod forest;
     pub mod layout;
     pub mod materials;
     pub mod textures;
@@ -89,7 +90,10 @@ fn is_scan_asset(path: &std::path::Path) -> bool {
 struct VgTarget {
     vertex_offset: u32,
     vertex_count: u32,
+    /// First object row of the instance; its sections occupy
+    /// `object_row .. object_row + sections`.
     object_row: u32,
+    sections: u32,
 }
 
 #[derive(Default)]
@@ -110,6 +114,29 @@ struct VgSceneTargets {
     structure: u64,
     /// Bytes of the derivation's GPU buffers (instances, count, ready, classic).
     gpu_bytes: u64,
+}
+
+/// The preset graph of a scene: Helio's deferred preset over the meshes',
+/// materials' and lights' features, and for the forest the sky's and GI's
+/// (Helio's presets list neither: both are plugins').
+fn scene_preset(scene: vg_stress_prep::catalog::Scene) -> helio_presets::PresetGraph {
+    let extra = match scene {
+        vg_stress_prep::catalog::Scene::Museum => helio_feature_api::FeatureSet::new(),
+        vg_stress_prep::catalog::Scene::Forest => helio_feature_api::FeatureSet::new()
+            .with(helio_pass_sky::SkyFeature)
+            .with(helio_pass_gi::GiFeature),
+    };
+    helio_mesh_host::presets::with(helio_presets::Preset::Deferred, &extra)
+}
+
+/// The forest's atmosphere: Earth's air.
+fn spawn_forest_sky(world: &mut pulsar_scenedb::World) -> Entity {
+    let sky = helio_pass_sky::host_rows::AtmosphereComponent::from(
+        helio_pass_sky::AtmosphereRow::earth(),
+    );
+    let entity = world.spawn();
+    world.insert(entity, sky);
+    entity
 }
 
 /// Which instances are drawn through virtual geometry this frame: exactly the
@@ -137,8 +164,10 @@ fn select_visible(
             lod_error_scale: 1.0,
             object_row: target.object_row,
         });
-        if let Some(row) = classic.get_mut(target.object_row as usize) {
-            *row = 1;
+        for row in target.object_row..target.object_row + target.sections.max(1) {
+            if let Some(row) = classic.get_mut(row as usize) {
+                *row = 1;
+            }
         }
     }
     instances
@@ -433,8 +462,16 @@ fn prepare_requested() -> bool {
 fn prepare() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let config = vg_stress_prep::catalog::Config::from_env_and_args();
-    let layout =
-        vg_stress_data::layout::museum_layout_with(&vg_stress_data::dims::Dims::load(), &config);
+    let layout = match config.scene {
+        vg_stress_prep::catalog::Scene::Museum => vg_stress_data::layout::museum_layout_with(
+            &vg_stress_data::dims::Dims::load(),
+            &config,
+        ),
+        vg_stress_prep::catalog::Scene::Forest => vg_stress_data::layout::MuseumLayout {
+            placements: vg_stress_data::forest::build(&config).placements,
+            ..Default::default()
+        },
+    };
     print_scene_report(&layout, &config, &root);
     let tau = parse_tau(std::env::var("VG_STRESS_TAU").ok().as_deref());
     let loader = vg_stress_loading::start(root, &layout.placements, true, config, tau, true);
@@ -527,6 +564,12 @@ struct AppState {
     classic_batches: HashSet<(u32, u32)>,
     placeholder_ordinal: u32,
     bench: Option<vg_stress_bench::BenchState>,
+    scene: vg_stress_prep::catalog::Scene,
+    /// Camera clip planes and free-camera speed (metres): the museum is a
+    /// building, the forest a few kilometres of mountains.
+    near_m: f32,
+    far_m: f32,
+    move_speed: f32,
 }
 
 impl App {
@@ -588,7 +631,11 @@ impl ApplicationHandler for App {
             graphics.surface_config.format
         };
 
-        let mut scene_db = new_scene_db_with_gpu_mirror(&device, &queue);
+        let mut scene_db = v3_demo_common::new_scene_db_with_gpu_mirror_and(&device, &queue, |store| {
+            helio_pass_sky::host_rows::AtmosphereComponent::register_gpu_columns_growable(
+                store, 4, &device,
+            );
+        });
         let runtime = VgRuntime::default();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let tau = parse_tau(std::env::var("VG_STRESS_TAU").ok().as_deref());
@@ -623,10 +670,19 @@ impl ApplicationHandler for App {
             "[Museum] VG error tolerance tau = {tau} px (VG_STRESS_TAU; - and = keys change it live)"
         );
         let museum_config = vg_stress_prep::catalog::Config::from_env_and_args();
-        let mut layout = vg_stress_data::layout::museum_layout_with(
-            &vg_stress_data::dims::Dims::load(),
-            &museum_config,
-        );
+        let scene = museum_config.scene;
+        let mut forest = (scene == vg_stress_prep::catalog::Scene::Forest)
+            .then(|| vg_stress_data::forest::build(&museum_config));
+        let mut layout = match &mut forest {
+            Some(forest) => vg_stress_data::layout::MuseumLayout {
+                placements: std::mem::take(&mut forest.placements),
+                ..Default::default()
+            },
+            None => vg_stress_data::layout::museum_layout_with(
+                &vg_stress_data::dims::Dims::load(),
+                &museum_config,
+            ),
+        };
         // Instance benchmark: ONE asset, N placements, nothing else (VG_STRESS_INSTANCES).
         let bench_cfg = vg_stress_bench::BenchConfig::from_env_and_args();
         if let Some(b) = &bench_cfg {
@@ -664,10 +720,25 @@ impl ApplicationHandler for App {
             let entity = spawn_material(&mut scene_db.world, row);
             materials.insert(material, entity);
         }
-        let sun_light = spawn_light(
-            &mut scene_db.world,
-            directional_light([0.35, -0.8, -0.3], [1.0, 0.94, 0.82], 3.0),
-        );
+        let sun_light = if forest.is_some() {
+            // The sky's sun is the scene's first directional light.
+            spawn_forest_sky(&mut scene_db.world);
+            let sun = vg_stress_capture::SunSpec {
+                azimuth_deg: 140.0,
+                elevation_deg: 34.0,
+                color: [1.0, 0.93, 0.80],
+                intensity: 3.0,
+            };
+            spawn_light(
+                &mut scene_db.world,
+                directional_light(sun.direction(), sun.color, sun.intensity),
+            )
+        } else {
+            spawn_light(
+                &mut scene_db.world,
+                directional_light([0.35, -0.8, -0.3], [1.0, 0.94, 0.82], 3.0),
+            )
+        };
         for light in &layout.lights {
             let direction = glam::Vec3::from_array(light.direction)
                 .normalize_or_zero()
@@ -711,7 +782,7 @@ impl ApplicationHandler for App {
         let derivation =
             SceneVgDerivation::new(&device, runtime.clone(), targets.clone(), vg_supported);
         let builder = RendererBuilder::new(config, scene_db_handle(&scene_db))
-            .with_pass_build_context(Box::new(helio_mesh_host::presets::deferred))
+            .with_pass_build_context(Box::new(move |ctx| scene_preset(scene).build(ctx)))
             .with_scene_derivation(Box::new(derivation));
         let mut renderer = if capture_options.is_none() {
             builder
@@ -789,9 +860,11 @@ impl ApplicationHandler for App {
             surface_format: format,
             renderer,
             last_frame: std::time::Instant::now(),
-            cam_pos: glam::Vec3::new(0.0, 3.0, 34.0),
-            cam_yaw: 0.0,
-            cam_pitch: 0.04,
+            cam_pos: forest.as_ref().map_or(glam::Vec3::new(0.0, 3.0, 34.0), |f| {
+                vg_stress_data::forest::vantage(&f.terrain)
+            }),
+            cam_yaw: if forest.is_some() { 0.6 } else { 0.0 },
+            cam_pitch: if forest.is_some() { -0.05 } else { 0.04 },
             keys: HashSet::new(),
             cursor_grabbed: false,
             mouse_delta: (0.0, 0.0),
@@ -834,6 +907,10 @@ impl ApplicationHandler for App {
             classic_batches: HashSet::new(),
             placeholder_ordinal: 0,
             bench: bench_cfg.map(vg_stress_bench::BenchState::new),
+            scene,
+            near_m: if forest.is_some() { 0.3 } else { 0.1 },
+            far_m: if forest.is_some() { 6000.0 } else { 250.0 },
+            move_speed: if forest.is_some() { 40.0 } else { 6.0 },
         });
         if let Some(state) = &mut self.state {
             if state.capture.is_none() {
@@ -841,6 +918,9 @@ impl ApplicationHandler for App {
             }
             if state.bench.is_some() {
                 state.bench_ground();
+            }
+            if let Some(forest) = &forest {
+                state.spawn_terrain(&forest.terrain);
             }
         }
     }
@@ -1132,7 +1212,12 @@ impl AppState {
             .map(|stats| stats.summary())
             .unwrap_or_default();
         self.window.set_title(&format!(
-            "Helio – VG Museum | post {} (P) | {} | tau {:.2}px (-/=) | Scene tris: {} | VG selected: {} | VG assets {}/{} | {} | {}{}",
+            "Helio – VG {} | post {} (P) | {} | tau {:.2}px (-/=) | Scene tris: {} | VG selected: {} | VG assets {}/{} | {} | {}{}",
+            if self.scene == vg_stress_prep::catalog::Scene::Forest {
+                "Forest"
+            } else {
+                "Museum"
+            },
             ["off", "standard", "cinematic"][self.post_level as usize],
             self.debug_views[self.debug_index].name,
             self.tau,
@@ -1190,6 +1275,41 @@ impl AppState {
         }
     }
 
+    /// The forest's terrain: tiles of two classic meshes each (forest floor
+    /// and rock), one object row per tile and surface.
+    fn spawn_terrain(&mut self, terrain: &vg_stress_data::forest::Terrain) {
+        let started = std::time::Instant::now();
+        let tiles = vg_stress_data::forest::tiles(terrain);
+        let (mut triangles, mut objects) = (0usize, 0usize);
+        for tile in tiles {
+            triangles += tile.mesh.indices.len() / 3;
+            let (mesh, _, _) = self.upload_mesh(tile.mesh);
+            let material = self.materials[&Mat::Terrain(tile.surface)];
+            spawn_object(
+                &mut self.scene_db.world,
+                mesh,
+                material,
+                glam::Mat4::from_translation(glam::Vec3::from_array(tile.origin)),
+                tile.radius,
+            )
+            .expect("terrain tile mesh ranges");
+            objects += 1;
+        }
+        self.classic_objects += objects;
+        self.loaded_objects += objects;
+        self.scene_triangles += triangles as u64;
+        if let Ok(mut t) = self.targets.lock() {
+            t.structure += 1;
+        }
+        println!(
+            "[Forest] terrain: {objects} tile meshes, {:.2}M triangles, {:.1} m to {:.1} m, built in {:.2}s",
+            triangles as f64 / 1e6,
+            terrain.min_height(),
+            terrain.max_height(),
+            started.elapsed().as_secs_f32()
+        );
+    }
+
     /// Upload one classic mesh; returns its entity and interned vertex range.
     fn upload_mesh(&mut self, upload: helio_mesh_api::MeshUpload) -> (Entity, u32, u32) {
         let mesh = spawn_mesh(&mut self.scene_db.world, upload);
@@ -1215,16 +1335,25 @@ impl AppState {
         let private_before = vg_stress_bench::private_bytes();
         let objects_before = self.loaded_objects;
         let mut targets = self.targets.lock().expect("VG scene targets");
+        let single = [meta.slot.clone()];
+        let section_slots: &[String] = if meta.sections.is_empty() {
+            &single
+        } else {
+            &meta.sections
+        };
         for placement in &self.placements[asset] {
             self.scene_triangles += meta.source_triangles;
-            let material = placement
-                .slots
-                .iter()
-                .find(|(slot, _)| {
-                    slot == &meta.slot || meta.slot.strip_suffix(".001") == Some(slot.as_str())
-                })
-                .map(|(_, material)| *material)
-                .unwrap_or_else(|| Mat::for_kit_slot(&meta.slot));
+            let material_of = |slot_name: &str| {
+                placement
+                    .slots
+                    .iter()
+                    .find(|(slot, _)| {
+                        slot == slot_name || slot_name.strip_suffix(".001") == Some(slot.as_str())
+                    })
+                    .map(|(_, material)| *material)
+                    .unwrap_or_else(|| Mat::for_kit_slot(slot_name))
+            };
+            let material = material_of(&section_slots[0]);
             let [pitch, yaw, roll] = placement.rotation.map(f32::to_radians);
             let transform = glam::Mat4::from_scale_rotation_translation(
                 glam::Vec3::from_array(placement.scale),
@@ -1245,7 +1374,27 @@ impl AppState {
                 meta.radius * scale,
             )
             .expect("museum object mesh ranges");
-            targets.object_rows = targets.object_rows.max(object.index() + 1);
+            // The other sections: consecutive rows after the first, as the
+            // scene join lays out a sectioned mesh (the cull and shade read
+            // `object_row + section`).
+            let mut last_row = object.index();
+            for (section, slot_name) in section_slots.iter().enumerate().skip(1) {
+                let row = spawn_object(
+                    &mut self.scene_db.world,
+                    mesh,
+                    self.materials[&material_of(slot_name)],
+                    transform,
+                    meta.radius * scale,
+                )
+                .expect("museum section object");
+                assert_eq!(
+                    row.index(),
+                    object.index() + section as u32,
+                    "section rows of one instance must be consecutive"
+                );
+                last_row = row.index();
+            }
+            targets.object_rows = targets.object_rows.max(last_row + 1);
             targets.structure += 1;
             if let Some(bench) = &mut self.bench {
                 bench.entities.push(object);
@@ -1255,6 +1404,7 @@ impl AppState {
                     vertex_offset: range.0,
                     vertex_count: range.1,
                     object_row: object.index(),
+                    sections: section_slots.len() as u32,
                 });
                 targets.generation += 1;
                 self.vg_objects += 1;
@@ -1460,7 +1610,7 @@ impl AppState {
         }
         self.poll_loader();
         let dt = dt.min(0.1);
-        const SPEED: f32 = 6.0;
+        let speed = self.move_speed;
         const SENS: f32 = 0.002;
 
         self.cam_yaw += self.mouse_delta.0 * SENS;
@@ -1473,22 +1623,22 @@ impl AppState {
         let right = glam::Vec3::new(cy, 0.0, sy);
 
         if self.keys.contains(&KeyCode::KeyW) {
-            self.cam_pos += forward * SPEED * dt;
+            self.cam_pos += forward * speed * dt;
         }
         if self.keys.contains(&KeyCode::KeyS) {
-            self.cam_pos -= forward * SPEED * dt;
+            self.cam_pos -= forward * speed * dt;
         }
         if self.keys.contains(&KeyCode::KeyA) {
-            self.cam_pos -= right * SPEED * dt;
+            self.cam_pos -= right * speed * dt;
         }
         if self.keys.contains(&KeyCode::KeyD) {
-            self.cam_pos += right * SPEED * dt;
+            self.cam_pos += right * speed * dt;
         }
         if self.keys.contains(&KeyCode::Space) {
-            self.cam_pos += glam::Vec3::Y * SPEED * dt;
+            self.cam_pos += glam::Vec3::Y * speed * dt;
         }
         if self.keys.contains(&KeyCode::ShiftLeft) {
-            self.cam_pos -= glam::Vec3::Y * SPEED * dt;
+            self.cam_pos -= glam::Vec3::Y * speed * dt;
         }
 
         let size = self.window.inner_size();
@@ -1499,8 +1649,8 @@ impl AppState {
             glam::Vec3::Y,
             std::f32::consts::FRAC_PI_4,
             aspect,
-            0.1,
-            250.0,
+            self.near_m,
+            self.far_m,
         );
 
         v3_demo_common::flush_scene_db(&self.scene_db, &self.queue);
@@ -1533,7 +1683,24 @@ mod gating_tests {
             vertex_offset: offset,
             vertex_count: 3,
             object_row: row,
+            sections: 1,
         }
+    }
+
+    #[test]
+    fn every_section_row_of_a_visible_instance_leaves_the_classic_path() {
+        let targets = [VgTarget {
+            vertex_offset: 100,
+            vertex_count: 3,
+            object_row: 2,
+            sections: 3,
+        }];
+        let mut classic = vec![0u32; 6];
+        let ready = [ready(100, 4, VG_ASSET_READY_FLAG_READY)];
+        let visible = select_visible(&targets, &ready, &mut classic);
+        assert_eq!(visible.len(), 1, "one instance for all its sections");
+        assert_eq!(visible[0].object_row, 2);
+        assert_eq!(classic, [0, 0, 1, 1, 1, 0]);
     }
 
     fn ready(offset: u32, slot: u32, flags: u32) -> VgAssetReadyRow {

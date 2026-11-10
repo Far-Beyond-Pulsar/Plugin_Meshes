@@ -12,6 +12,13 @@ There is no cargo alias for it. The
 builds never download or compile any of the provisioning dependencies
 (`ureq`, `sha2`). Close a running copy before rebuilding on Windows.
 
+## Forest scene
+
+`-- --scene forest` (or `VG_STRESS_SCENE=forest`) builds a second scene
+instead of the museum: a procedural mountain valley with 30,000 x density
+Poly Haven trees through VG, the sky and GI. See [VG_FOREST.md](VG_FOREST.md)
+for the scene, its assets, tests, shot list and performance log.
+
 ## First run: self-provisioning
 
 The six Stanford scans (about 570 MB of downloads, about 1.2 GB of prepared
@@ -136,7 +143,10 @@ glTFs mark these materials `alphaMode: BLEND`:
 | `fir_tree_01` | `fir_tree_01_twig` | 6.72M of 6.98M | bark, trunk, dead branches |
 | `island_tree_01/02/03` | `*_leaves` | 1.06M / 0.71M / 1.41M | trunk and branches |
 | `tree_small_02` | `tree_small_02_leaves` | 1.94M of 2.06M | trunk and branches |
-Each tree variant stays one glTF mesh per material slot (parts). The glTFs mark
+A tree variant's material parts are cooked as one VG asset with one section per
+slot (`merge_sections` in `vg_stress_loading.rs`; one instance per tree). A
+variant whose merged root cannot fit the pinned root budget (`RootTooLarge`:
+the pines, simplified per material) is cooked as separate parts. The glTFs mark
 the leaf/twig materials `alphaMode: BLEND` (never VG-eligible), so the museum
 authors them as `FLAG_ALPHA_TEST | FLAG_DOUBLE_SIDED` (cutoff 0.5 via the
 single-row fallback) and `MASKED_PARTS_USE_VG` is `true`: masked parts are
@@ -165,7 +175,7 @@ passes shows no scans or trees (one warning).
   revision in their header; a valid file is never cooked again. Writes are
   atomic (unique temp file, fsync, rename), so a killed run leaves at most a
   stale `*.tmp` (removed on the next start) and never a corrupt cache. A small
-  per-asset part record (`parts-v6-*.bin`: transform, slot, radius, content id,
+  per-asset part record (`parts-v7-*.bin`, with each part's material sections: transform, slot, radius, content id,
   records) makes a warm start skip source parsing entirely.
 * **Memory-bounded.** Source files are cooked as jobs (a file's variants share
   one import). Each job's peak is estimated from triangle counts (96 B/triangle
@@ -268,9 +278,14 @@ Three bounded mechanisms sit around that one rule, all in `VirtualGeometrySettin
   flips a cut),
 - `prefetch_factor` (default 2): child pages are requested while the error is
   above `tau / prefetch_factor`, urgent requests first,
-- `tile_density_limit` (default 16 triangles per covered pixel, 0 = off): an
+- `tile_density_limit` (default 8 triangles per covered pixel, 0 = off): an
   overdraw safety valve that coarsens only the 16x16 tiles above the limit, at
-  most 4x, with a dead band; a tile resolved as dense is exempt.
+  most 32x (`TILE_SCALE_MAX`), with a dead band; a tile resolved as dense is
+  exempt. It also gates the hierarchy walk: a node stops the descent under
+  `tau * tile_scale_min` (the smallest scale over its tiles), so a distant
+  instance on saturated tiles is not walked at all. The defaults were 16 and
+  4x until the forest scene (`VG_FOREST.md`) showed 4x cannot bring aggregate
+  foliage (about 77 triangles per pixel at tau 1) down to the limit.
 
 The stored error is used as is, and it is the true deviation (cook revision 12):
 the largest object-space distance, normal change or uv slide that swapping the
@@ -382,10 +397,15 @@ stale history until a matching depth frame exists. This single-phase fallback
 can increase draws during motion; a current-depth second phase is still needed
 for efficient occlusion during motion.
 
-VG traversal redistributes its frontier after bounded local work, then drains
-the last round. Exact-set GPU tests check 128 instances over 2/4/8 rounds and
-1/256 workgroups, with no dropped or duplicate clusters. This changes work
-scheduling, not the geometric error tolerance or selected triangles.
+VG traversal is one persistent dispatch per phase: each workgroup works
+depth-first from a local deque, takes work from the phase queue when its deque
+is empty, shares the bottom of its deque (the coarsest jobs) while the queue
+runs low, and exits when an outstanding-work counter reaches zero. It replaces
+fixed rounds whose last round drained whole subtrees on a few workgroups (the
+forest's cull went from 47 to 6 ms by raising the round count alone, see
+`VG_FOREST.md`). Exact-set GPU tests check no dropped or duplicate clusters.
+This changes work scheduling, not the geometric error tolerance or selected
+triangles.
 
 Set `HELIO_VG_PROFILE=1` to log interval frame percentiles, GPU pass timings and
 readback age. With `HELIO_VG_SMOKE_SECONDS`, profiling keeps a fixed debug view
@@ -438,16 +458,18 @@ stats JSON and the images.
 Reading view 109 (error vs tau): a pixel is heat-coloured while the drawn
 cluster's projected error is under tau and magenta above it. With the default
 settings some hot pixels are magenta on purpose: the per-tile valve
-(`tile_density_limit`, 16) raises the effective tau, up to 4x, in 16x16 tiles
-above 16 triangles per covered pixel. With the valve off (`tile_density_limit`
+(`tile_density_limit`, 8) raises the effective tau, up to 32x, in 16x16 tiles
+above 8 triangles per covered pixel. With the valve off (`tile_density_limit`
 0) the museum overview at tau 1.0 shows no magenta. Shots use a fixed 240
 settle frames, not a streaming-ready signal, so a shot that needs many pages
 (the cook revision 12 cut at tau 0.25) can still be filling the pool; compare
 `vg.pool.resident_pages` between runs.
 
-The forest shots need the Poly Haven trees; if their glTF fails to import
-(`KHR_texture_transform` is not supported by the importer) the forest views draw
-no VG triangles and only the museum shots carry information.
+The forest shots need the Poly Haven trees. Their glTFs require
+`KHR_texture_transform`, which the importer refuses, so the loader hands it a
+sibling `<name>.vgimport.gltf` copy with that extension no longer required
+(`importable_path` in `vg_stress_loading.rs`) and bakes the UV transform into
+the vertices itself.
 
 ## Tier 3 measurements (dense tiles)
 

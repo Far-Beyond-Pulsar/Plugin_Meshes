@@ -260,6 +260,24 @@ pub const MARBLES: &[MarbleDef] = &[
     },
 ];
 
+/// Ground and rock texture sets of the forest scene (Poly Haven, CC0). Same
+/// package shape as the marbles (diffuse, nor_gl, arm), stored beside them.
+/// 4k: the terrain tiles every [`GROUND_UV_PERIOD_M`] metres.
+pub const GROUNDS: &[MarbleDef] = &[
+    MarbleDef {
+        id: "forrest_ground_01",
+        label: "Forest Ground 01",
+        use_for: "forest floor of the terrain",
+        resolutions: &["4k", "2k"],
+    },
+    MarbleDef {
+        id: "aerial_rocks_02",
+        label: "Aerial Rocks 02",
+        use_for: "steep terrain and cliffs",
+        resolutions: &["4k", "2k"],
+    },
+];
+
 pub fn tree(id: &str) -> Option<&'static TreeDef> {
     TREES.iter().find(|t| t.id == id)
 }
@@ -277,6 +295,8 @@ pub enum TextureQuality {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Which scene the example builds.
+    pub scene: Scene,
     /// Trees to provision and scatter (default: all six).
     pub trees: Vec<&'static TreeDef>,
     /// Scene density multiplier (1 = moderate).
@@ -286,6 +306,27 @@ pub struct Config {
     pub fetch_displacement: bool,
 }
 
+/// The scene of `vg_stress`: the museum, or the mountain forest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Scene {
+    #[default]
+    Museum,
+    Forest,
+}
+
+impl Scene {
+    pub fn parse(text: &str) -> Option<Scene> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "museum" => Some(Scene::Museum),
+            "forest" => Some(Scene::Forest),
+            _ => None,
+        }
+    }
+}
+
+/// Metres of terrain one tile of a ground texture covers (the UV period).
+pub const GROUND_UV_PERIOD_M: f32 = 6.0;
+
 pub const DEFAULT_DENSITY: f32 = 1.0;
 /// Highest supported museum scene-density multiplier. The layout creates
 /// individual tree instances, so keep the input bounded while allowing scenes
@@ -294,7 +335,7 @@ pub const MAX_DENSITY: f32 = 128.0;
 
 impl Default for Config {
     fn default() -> Self {
-        Config::resolve(None, None, None, None)
+        Config::resolve(None, None, None, None, None)
     }
 }
 
@@ -334,6 +375,7 @@ impl Config {
         density: Option<&str>,
         quality: Option<&str>,
         displacement: Option<&str>,
+        scene: Option<&str>,
     ) -> Self {
         let trees = trees
             .and_then(|t| parse_trees(t).ok())
@@ -347,6 +389,7 @@ impl Config {
         let fetch_displacement =
             displacement.is_some_and(|d| !matches!(d.trim(), "" | "0" | "false"));
         Config {
+            scene: scene.and_then(Scene::parse).unwrap_or_default(),
             trees,
             density,
             quality,
@@ -389,6 +432,9 @@ impl Config {
                 .or_else(|| env("VG_STRESS_TEXTURES"))
                 .as_deref(),
             env("VG_STRESS_DISPLACEMENT").as_deref(),
+            flag("--scene")
+                .or_else(|| env("VG_STRESS_SCENE"))
+                .as_deref(),
         )
     }
 

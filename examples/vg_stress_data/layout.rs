@@ -1304,7 +1304,7 @@ mod tests {
     use super::*;
 
     fn layout(density: f32, trees: &str) -> MuseumLayout {
-        let config = Config::resolve(Some(trees), Some(&density.to_string()), None, None);
+        let config = Config::resolve(Some(trees), Some(&density.to_string()), None, None, None);
         museum_layout_with(&Dims::load(), &config)
     }
 

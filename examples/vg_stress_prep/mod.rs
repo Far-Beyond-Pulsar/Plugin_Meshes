@@ -104,8 +104,16 @@ pub fn is_provisioned(assets: &Path) -> bool {
     is_provisioned_with(assets, &Config::from_env_and_args())
 }
 
+/// The Stanford scans a scene needs: the museum's exhibits; the forest has none.
+fn models_needed(assets: &Path, config: &Config) -> Vec<&'static Model> {
+    match config.scene {
+        catalog::Scene::Museum => missing_models(assets),
+        catalog::Scene::Forest => Vec::new(),
+    }
+}
+
 pub fn is_provisioned_with(assets: &Path, config: &Config) -> bool {
-    missing_models(assets).is_empty() && missing_units(assets, config).is_empty()
+    models_needed(assets, config).is_empty() && missing_units(assets, config).is_empty()
 }
 
 fn record_units(assets: &Path, units: &[(String, String)]) {
@@ -209,7 +217,7 @@ pub fn provision_with(assets: &Path, config: &Config, progress: Progress) -> Res
     }
     let lock = Lock::acquire(assets.join("source").join(".provision.lock"), progress)?;
     // Another process may have finished while we waited.
-    let todo = missing_models(assets);
+    let todo = models_needed(assets, config);
     let todo_units = missing_units(assets, config);
     if todo.is_empty() && todo_units.is_empty() {
         return Ok(());

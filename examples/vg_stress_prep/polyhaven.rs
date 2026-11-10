@@ -430,9 +430,14 @@ impl Unit {
     }
 }
 
-/// Every unit a configuration needs: all marble sets and the selected trees.
+/// Every unit a configuration needs: the museum's marble sets (the museum
+/// scene) or the ground sets (the forest scene), and the selected trees.
 pub fn units(config: &catalog::Config) -> Vec<Unit> {
-    catalog::MARBLES
+    let surfaces = match config.scene {
+        catalog::Scene::Museum => catalog::MARBLES,
+        catalog::Scene::Forest => catalog::GROUNDS,
+    };
+    surfaces
         .iter()
         .map(Unit::from)
         .chain(config.trees.iter().map(|t| Unit::from(*t)))
@@ -544,7 +549,11 @@ pub fn tree_gltf(assets: &Path, id: &str) -> Option<PathBuf> {
 }
 
 fn marble_unit(id: &str) -> Option<Unit> {
-    catalog::MARBLES.iter().find(|m| m.id == id).map(Unit::from)
+    catalog::MARBLES
+        .iter()
+        .chain(catalog::GROUNDS)
+        .find(|m| m.id == id)
+        .map(Unit::from)
 }
 
 // ── provisioning ────────────────────────────────────────────────────────────

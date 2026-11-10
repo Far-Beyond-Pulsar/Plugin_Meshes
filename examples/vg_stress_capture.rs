@@ -15,7 +15,7 @@ use helio_vg_format::debug_view;
 use helio_vg_stream::VgRuntimeSettings;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
 };
 
@@ -942,6 +942,8 @@ pub struct Capture {
     /// Frames this shot spent in BVH skip / refit / rebuild.
     bvh_modes: [u32; 3],
     derive_baseline: (u64, u64),
+    /// Bound CPU lead without draining the GPU after every measured frame.
+    in_flight: VecDeque<wgpu::SubmissionIndex>,
 }
 
 impl Capture {
@@ -987,6 +989,7 @@ impl Capture {
             samples: Vec::new(),
             bvh_modes: [0; 3],
             derive_baseline: (0, 0),
+            in_flight: VecDeque::new(),
         }
     }
 
@@ -1259,8 +1262,8 @@ impl Capture {
             glam::Vec3::Y,
             pose.fov_deg.to_radians(),
             size.0 as f32 / size.1 as f32,
-            0.1,
-            500.0,
+            s.near_m,
+            s.far_m.max(500.0),
         );
         s.renderer.set_frame_delta_override(Some(DT));
         if self.moving {
@@ -1278,7 +1281,18 @@ impl Capture {
             s.render_errors += 1;
         }
         let cpu_ms = started.elapsed().as_secs_f32() * 1000.0;
-        s.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        if let Some(submission) = s.renderer.last_submission() {
+            self.in_flight.push_back(submission);
+        }
+        let poll = if self.in_flight.len() >= 3 {
+            wgpu::PollType::Wait {
+                submission_index: self.in_flight.pop_front(),
+                timeout: None,
+            }
+        } else {
+            wgpu::PollType::Poll
+        };
+        s.device.poll(poll).expect("capture frame completion");
         let wall_ms = started.elapsed().as_secs_f32() * 1000.0;
         s.frames += 1;
         if let Some(bench) = &s.bench {
@@ -1502,7 +1516,7 @@ impl Capture {
             "tile_density": tile_density,
             "bench": self.bench_json(s),
             "gpu_ms": gpu,
-            "gpu_ms_note": "mean of the last 30 settle frames (asynchronous timestamp readback)",
+            "gpu_ms_note": "mean of distinct asynchronous timestamp samples in the last 30 settle iterations; up to 3 frames in flight",
             "capture_seconds": seconds,
         })
     }
