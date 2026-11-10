@@ -52,10 +52,6 @@ struct VgAssetHeader {
     flags: u32,
     // Object-space bounding sphere (xyz centre, w radius).
     bounds: vec4<f32>,
-    // Tolerance of lod_table entry 0 and the table (see `LodTable`).
-    lod_error_max: f32,
-    lod_table: array<u32, 8>,
-    reserved: array<u32, 3>,
 }
 
 struct VgInstance {

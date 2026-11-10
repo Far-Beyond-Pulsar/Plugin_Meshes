@@ -503,7 +503,7 @@ pub fn write_vgeo(
         d.file_offset = (pages_offset + i * PAGE_BYTES as usize) as u32;
     }
 
-    let (lod_bounds, lod_error_max, lod_table) = lod_summary(dag);
+    let bounds = root_bounds(dag);
     let header = VgeoHeader {
         magic: VGEO_MAGIC,
         version: FORMAT_VERSION,
@@ -517,10 +517,7 @@ pub fn write_vgeo(
             root_page_count,
             triangle_count: dag.source_tris as u32,
             flags: crate::COOK_REVISION << 16,
-            bounds: lod_bounds,
-            lod_error_max: lod_error_max,
-            lod_table: lod_table,
-            _reserved: [0; 3],
+            bounds,
         },
         hierarchy_offset: hierarchy_offset as u32,
         group_refs_offset: group_refs_offset as u32,
@@ -549,40 +546,12 @@ pub fn write_vgeo(
     Ok(out)
 }
 
-/// Bounding sphere of the roots, the largest stored error and the
-/// [`LodTable`] of a DAG: triangles of the uniform cut at each tolerance
-/// (`self_error <= e < parent_error`, the rule the cull applies).
-fn lod_summary(dag: &Dag) -> ([f32; 4], f32, [u32; helio_vg_format::LOD_TABLE_WORDS]) {
-    let mut sphere: Option<[f32; 4]> = None;
-    let mut e_max = 0.0f32;
-    for c in &dag.clusters {
-        if c.parent_error.is_infinite() {
-            sphere = Some(match sphere {
-                Some(s) => crate::math::sphere_union(s, c.sphere),
-                None => c.sphere,
-            });
-        }
-        if c.self_error.is_finite() {
-            e_max = e_max.max(c.self_error);
-        }
-    }
-    let mut q = [0u8; helio_vg_format::LOD_TABLE_ENTRIES];
-    if e_max > 0.0 {
-        for (k, v) in q.iter_mut().enumerate() {
-            let e = e_max * (-(k as f32) * 0.5).exp2();
-            let tris: u64 = dag
-                .clusters
-                .iter()
-                .filter(|c| c.self_error <= e && c.parent_error > e)
-                .map(|c| c.tris.len() as u64)
-                .sum();
-            *v = helio_vg_format::LodTable::quantize(tris as f64);
-        }
-    }
-    let words = helio_vg_format::LodTable {
-        error_max: e_max,
-        q,
-    }
-    .words();
-    (sphere.unwrap_or([0.0; 4]), e_max, words)
+/// Bounding sphere of the roots (zero for an empty DAG).
+fn root_bounds(dag: &Dag) -> [f32; 4] {
+    dag.clusters
+        .iter()
+        .filter(|c| c.parent_error.is_infinite())
+        .map(|c| c.sphere)
+        .reduce(crate::math::sphere_union)
+        .unwrap_or([0.0; 4])
 }

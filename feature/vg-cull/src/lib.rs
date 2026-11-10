@@ -26,9 +26,9 @@
 //! (its finer clusters replace its own) when `project(error * lod_error_scale *
 //! instance_scale) > tau`, tau being the stable `tau_px` setting. There is no
 //! screen-wide density multiplier, so density follows geometry. The stored error
-//! is used as is; until the builder stores true deviation separately
-//! (`vg/build` `DENSITY_TOLERANCE_GAIN`), the relaxed error it bakes makes the
-//! cut coarser than `tau` implies.
+//! is used as is, and the builder stores the true deviation (position, normal and
+//! uv, monotone, never relaxed for density), so `error <= tau` pixels bounds what
+//! a swap can change.
 //!
 //! * **Hysteresis** ([`TAU_HYST`], [`EDGE_HYST`]). A group refined last frame
 //!   stays refined until its error drops under `tau / (1 + TAU_HYST)`, so the

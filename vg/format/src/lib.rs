@@ -45,6 +45,52 @@ pub const POS_BLOCK_HEADER_WORDS: usize = 5;
 /// Bytes per vertex of the attribute stream: normal snorm8x4, tangent
 /// snorm8x4 (w = bitangent sign), uv0 f16x2, uv1 f16x2.
 pub const ATTR_STRIDE: u32 = 16;
+
+/// One decoded [`ATTR_STRIDE`] attribute record: the CPU mirror of `vgd_attr`
+/// in `vg_decode_attr.wgsl`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VertexAttr {
+    pub normal: [f32; 3],
+    pub tangent: [f32; 3],
+    pub bitangent_sign: f32,
+    pub uv0: [f32; 2],
+    pub uv1: [f32; 2],
+}
+
+impl VertexAttr {
+    /// Decode a record (at least [`ATTR_STRIDE`] bytes, little endian);
+    /// `None` when `record` is shorter.
+    pub fn decode(record: &[u8]) -> Option<Self> {
+        if record.len() < ATTR_STRIDE as usize {
+            return None;
+        }
+        let snorm = |b: u8| (f32::from(b as i8) / 127.0).max(-1.0);
+        let half = |o: usize| f16_to_f32(u16::from_le_bytes([record[o], record[o + 1]]));
+        Some(Self {
+            normal: [snorm(record[0]), snorm(record[1]), snorm(record[2])],
+            tangent: [snorm(record[4]), snorm(record[5]), snorm(record[6])],
+            bitangent_sign: if (record[7] as i8) >= 0 { 1.0 } else { -1.0 },
+            uv0: [half(8), half(10)],
+            uv1: [half(12), half(14)],
+        })
+    }
+}
+
+/// IEEE half to single precision.
+pub fn f16_to_f32(h: u16) -> f32 {
+    let (h, e, m) = (u32::from(h), (u32::from(h) >> 10) & 31, u32::from(h) & 1023);
+    let v = match e {
+        0 => m as f32 * 2f32.powi(-24),
+        31 if m == 0 => f32::INFINITY,
+        31 => f32::NAN,
+        _ => f32::from_bits(((e + 112) << 23) | (m << 13)),
+    };
+    if h & 0x8000 != 0 {
+        -v
+    } else {
+        v
+    }
+}
 /// A visible-cluster `cluster_slot` is `pool_slot << PAGE_CLUSTER_SHIFT | local_cluster`.
 pub const PAGE_CLUSTER_SHIFT: u32 = 11;
 pub const PAGE_CLUSTER_MASK: u32 = (1 << PAGE_CLUSTER_SHIFT) - 1;
@@ -87,7 +133,7 @@ pub struct GpuAssetQuant {
     pub step: f32,
 }
 /// File offset of the builder's meta block (directly after [`VgeoHeader`]).
-pub const VGEO_META_OFFSET: usize = 136;
+pub const VGEO_META_OFFSET: usize = 88;
 
 /// One entry of the visible-cluster list written by the cull. 8 bytes.
 #[repr(C)]
@@ -142,7 +188,8 @@ pub const PAGE_MAGIC: [u8; 4] = *b"VGPG";
 /// Bump on any layout or builder-semantics change; part of the cache key.
 /// 2: measured (not estimated) cluster errors, 0.6 group reduction ratio.
 /// 3: groups of up to `GROUP_MAX_CLUSTERS_LARGE` clusters at coarse levels.
-pub const FORMAT_VERSION: u32 = 4;
+/// 5: the asset header lost the never-read `LodTable`.
+pub const FORMAT_VERSION: u32 = 5;
 
 // ── Cluster ─────────────────────────────────────────────────────────────────
 
@@ -347,11 +394,7 @@ impl GpuGroupRef {
     }
 }
 
-/// Per-asset summary row. 96 bytes.
-///
-/// After the counters comes what the screen-wide density solve needs without
-/// reading any page: the asset's bounding sphere and [`LodTable`] (selected
-/// triangles against object-space error tolerance).
+/// Per-asset summary row. 48 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct GpuAssetHeader {
@@ -366,69 +409,6 @@ pub struct GpuAssetHeader {
     pub flags: u32,
     /// Bounding sphere of the asset (object space): centre xyz, radius.
     pub bounds: [f32; 4],
-    /// Error tolerance of [`LodTable`] entry 0 (the largest root error).
-    pub lod_error_max: f32,
-    /// [`LodTable`] entries, 4 per word, entry `k` in byte `k % 4` of word `k / 4`.
-    pub lod_table: [u32; LOD_TABLE_WORDS],
-    pub _reserved: [u32; 3],
-}
-
-/// Entries of a [`LodTable`].
-pub const LOD_TABLE_ENTRIES: usize = 32;
-pub const LOD_TABLE_WORDS: usize = LOD_TABLE_ENTRIES / 4;
-
-/// Selected triangles of one asset at a uniform object-space error tolerance:
-/// entry `k` is the cut at `error_max * 2^(-k/2)`, stored as `log2(triangles) *
-/// 8` in one byte (about 9% steps). The cull's density solve interpolates it
-/// per instance, so the screen-wide tolerance is computed rather than fed back.
-/// `vg_lod_tris` in `vg_format.wgsl` mirrors [`LodTable::tris_at`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LodTable {
-    pub error_max: f32,
-    pub q: [u8; LOD_TABLE_ENTRIES],
-}
-
-impl LodTable {
-    pub fn quantize(tris: f64) -> u8 {
-        (tris.max(1.0).log2() * 8.0).round().clamp(0.0, 255.0) as u8
-    }
-
-    pub fn from_header(h: &GpuAssetHeader) -> Self {
-        let mut q = [0u8; LOD_TABLE_ENTRIES];
-        for (k, v) in q.iter_mut().enumerate() {
-            *v = (h.lod_table[k / 4] >> ((k % 4) * 8)) as u8;
-        }
-        Self {
-            error_max: h.lod_error_max,
-            q,
-        }
-    }
-
-    pub fn words(&self) -> [u32; LOD_TABLE_WORDS] {
-        let mut w = [0u32; LOD_TABLE_WORDS];
-        for (k, &v) in self.q.iter().enumerate() {
-            w[k / 4] |= u32::from(v) << ((k % 4) * 8);
-        }
-        w
-    }
-
-    /// Triangles selected at object-space tolerance `e` (a tolerance at or above
-    /// `error_max` selects the roots, one far below selects the full mesh).
-    pub fn tris_at(&self, e: f32) -> f32 {
-        if !(self.error_max > 0.0) || !e.is_finite() {
-            return 0.0;
-        }
-        let x = if e <= 0.0 {
-            31.0
-        } else {
-            (2.0 * (self.error_max / e).log2()).clamp(0.0, 31.0)
-        };
-        let k = x.floor() as usize;
-        let t = x - k as f32;
-        let a = f32::from(self.q[k]);
-        let b = f32::from(self.q[(k + 1).min(LOD_TABLE_ENTRIES - 1)]);
-        ((a + (b - a) * t) / 8.0).exp2()
-    }
 }
 
 // ── Instances (produced by the VG scene derivation, read by cull) ──────────
@@ -535,7 +515,7 @@ pub fn bary_unpack(w: u32) -> (f32, f32) {
 
 // ── Files ──────────────────────────────────────────────────────────────────
 
-/// `.vgeo` header. 72 bytes. Section byte offsets are from the start of the
+/// `.vgeo` header. 88 bytes. Section byte offsets are from the start of the
 /// file; the section contents are owned by `helio-vg-build` (T2) but must
 /// stay expressible through this header.
 #[repr(C)]
@@ -599,13 +579,30 @@ mod tests {
     }
 
     #[test]
+    fn vertex_attr_decodes_the_record_layout() {
+        // normal (0, 127, -127), tangent x 127 with a negative bitangent sign,
+        // uv0 (1.0, -2.0), uv1 (0.5, 0.0) as half floats.
+        let mut r = [0u8; 16];
+        r[..4].copy_from_slice(&[0, 127, 0x81, 0]);
+        r[4..8].copy_from_slice(&[127, 0, 0, 0x81]);
+        r[8..12].copy_from_slice(&[0x00, 0x3c, 0x00, 0xc0]);
+        r[12..16].copy_from_slice(&[0x00, 0x38, 0x00, 0x00]);
+        let a = VertexAttr::decode(&r).unwrap();
+        assert_eq!(a.normal, [0.0, 1.0, -1.0]);
+        assert_eq!(a.tangent, [1.0, 0.0, 0.0]);
+        assert_eq!(a.bitangent_sign, -1.0);
+        assert_eq!((a.uv0, a.uv1), ([1.0, -2.0], [0.5, 0.0]));
+        assert!(VertexAttr::decode(&r[..15]).is_none());
+    }
+
+    #[test]
     fn layouts_are_stable() {
         assert_eq!(size_of::<GpuCluster>(), 64);
         assert_eq!(size_of::<GpuHierarchyNode>(), 96);
         assert_eq!(size_of::<GpuGroupRef>(), 8);
-        assert_eq!(size_of::<GpuAssetHeader>(), 96);
+        assert_eq!(size_of::<GpuAssetHeader>(), 48);
         assert_eq!(size_of::<GpuVgInstance>(), 16);
-        assert_eq!(size_of::<VgeoHeader>(), 136);
+        assert_eq!(size_of::<VgeoHeader>(), 88);
         assert_eq!(size_of::<PageHeader>(), 32);
         assert_eq!(size_of::<GpuAssetQuant>(), 16);
         assert_eq!(size_of::<GpuVisibleCluster>(), 8);
