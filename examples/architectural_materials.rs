@@ -1,6 +1,6 @@
 //! Shared, embedded CC0 architectural materials for interactive and capture paths.
+use helio_core::texture_mips::{mip_chain, TexelKind};
 use helio_mats::host_rows::MaterialComponent;
-use helio_mats::texture_mips::{mip_chain, TexelKind};
 use pulsar_scenedb::{gpu::TextureStore, Entity, World};
 use std::sync::{Arc, RwLock};
 
@@ -193,7 +193,7 @@ fn apply_material(
 }
 
 /// Decodes `bytes` and uploads it with a full mip chain filtered as
-/// `texels` says (`helio_mats::texture_mips`: normal maps keep their spread
+/// `texels` says (`helio_core::texture_mips`: normal maps keep their spread
 /// for specular anti-aliasing).
 fn upload(
     device: &wgpu::Device,

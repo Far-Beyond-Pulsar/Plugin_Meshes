@@ -14,6 +14,8 @@ autoexamples = false
 editor = ["dep:meshes_editor", "dep:ui_level_editor", "dep:ui_common", "dep:ui", "dep:pulsar_scene_model"]
 
 [dependencies]
+# The meshes' api, re-exported for hosts and tests (`helio_mesh_api`).
+helio-mesh-api = { workspace = true }
 # The plugin gate and the registrations' collection.
 pulsar_plugins = { workspace = true }
 inventory = { workspace = true }
@@ -51,7 +53,6 @@ bytemuck = { workspace = true, features = ["derive"] }
 image = { workspace = true }
 helio = { workspace = true }
 helio-core = { workspace = true }
-helio-mesh-api = { workspace = true }
 helio-vg-format = { workspace = true }
 helio-vg-build = { workspace = true }
 helio-pass-object-batch = { workspace = true }
