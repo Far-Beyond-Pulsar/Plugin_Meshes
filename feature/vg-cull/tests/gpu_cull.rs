@@ -1474,7 +1474,10 @@ fn prefetch_requests_children_while_the_error_is_within_the_band() {
     let (requests, urgent) = requests_at(&g, &mut prefetching, &r, band);
     let (want, want_urgent) = reference(band, 4.0);
     assert_eq!(requests, want, "prefetch band requests at {band}");
-    assert!(urgent.is_empty() && want_urgent.is_empty(), "nothing is urgent yet");
+    assert!(
+        urgent.is_empty() && want_urgent.is_empty(),
+        "nothing is urgent yet"
+    );
     // Close enough that the cut needs the pages: those are urgent, and the band
     // still holds the prefetches below them.
     let (requests, urgent) = requests_at(&g, &mut prefetching, &r, band / 3.0);
@@ -1545,7 +1548,10 @@ fn overdraw_valve_coarsens_only_the_hot_tiles_stably() {
     let (open, _, tiles) = run(0.0, 2);
     let density = |t: &[u32; 3]| t[0] as f32 / (t[1] as f32).clamp(1.0, 256.0 * TILE_FIXED);
     let hot = tiles.iter().map(density).fold(0.0f32, f32::max);
-    assert!(hot > 25.0, "the stacked patch is not hot enough for the test: {hot}");
+    assert!(
+        hot > 25.0,
+        "the stacked patch is not hot enough for the test: {hot}"
+    );
     let triangles = |items: &BTreeSet<Item>, lone_only: bool| -> u32 {
         triangle_count(
             &s,
@@ -1567,10 +1573,337 @@ fn overdraw_valve_coarsens_only_the_hot_tiles_stably() {
     // The lone copy is not over the limit: its cut is exactly the unvalved one.
     let lone_open: BTreeSet<_> = open[1].iter().copied().filter(|i| i.0 == lone).collect();
     let lone_valved: BTreeSet<_> = last.iter().copied().filter(|i| i.0 == lone).collect();
-    assert_eq!(lone_valved, lone_open, "the valve moved an unrelated instance");
+    assert_eq!(
+        lone_valved, lone_open,
+        "the valve moved an unrelated instance"
+    );
     // Stable: the last frames are identical (no oscillation), within the ceiling.
     let tail = &valved[valved.len() - 8..];
-    assert!(tail.windows(2).all(|w| w[0] == w[1]), "the valve oscillates");
+    assert!(
+        tail.windows(2).all(|w| w[0] == w[1]),
+        "the valve oscillates"
+    );
     assert!(scales.iter().all(|&g| g <= TILE_SCALE_MAX + 1e-3));
     assert!(scales.iter().any(|&g| g > 1.5), "no tile coarsened");
+}
+
+// ── Viewport resizes and the tile estimate ─────────────────────────────────
+
+fn tile_grid(w: u32, h: u32) -> [u32; 2] {
+    [
+        w.max(1).div_ceil(helio_pass_vg_cull::DENSE_TILE),
+        h.max(1).div_ceil(helio_pass_vg_cull::DENSE_TILE),
+    ]
+}
+
+/// One cull frame at screen size `w` x `h` with an explicit `inputs`.
+fn sized_frame(
+    g: &Gpu,
+    core: &mut VgCullCore,
+    r: &Resources,
+    inputs: &VgCullInputs<'_>,
+    (w, h): (u32, u32),
+    eye: [f32; 3],
+) -> (PhaseOut, Vec<u32>) {
+    set_camera(g, r, eye);
+    r.reset_feedback(g);
+    core.begin_frame(
+        &g.device,
+        &g.queue,
+        &VgCullFrame {
+            width: w,
+            height: h,
+        },
+        inputs,
+    );
+    let phases = if core.config.two_phase_occlusion {
+        2
+    } else {
+        1
+    };
+    let mut merged: Option<(PhaseOut, Vec<u32>)> = None;
+    for phase in 0..phases {
+        let mut enc = g.device.create_command_encoder(&Default::default());
+        {
+            let mut rec = CommandRecorder::from_encoder(&mut enc);
+            core.record_phase(
+                &mut rec, &g.device, &g.queue, &r.camera, inputs, None, phase,
+            );
+        }
+        g.queue.submit([enc.finish()]);
+        // The items of every phase of the frame.
+        let (out, requests) = collect(g, core, r, phase as usize);
+        match &mut merged {
+            None => merged = Some((out, requests)),
+            Some((all, _)) => all.items.extend(out.items),
+        }
+    }
+    merged.expect("at least one phase")
+}
+
+/// The viewport is resized repeatedly, to tiny sizes and back, with a frame
+/// rendered at each size (two-phase, so both phases' buffers are exercised). The
+/// per-tile block lives in the `history` buffer, which `with_tiles` replaces on
+/// every grid change; after each frame the buffers the passes publish must be the
+/// ones for the new grid, sized for it, readable in full, and the estimate must be
+/// in range (#1645). Any validation error panics through the uncaptured-error
+/// handler.
+#[test]
+fn viewport_resizes_keep_the_tile_block_in_step_with_the_screen() {
+    use helio_pass_vg_cull::{TILE_FIXED, TILE_SCALE_MAX, TILE_WORDS};
+    let Some(g) = gpu() else {
+        return;
+    };
+    let s = scene(false);
+    let r = upload(&g, &s);
+    let mut core = VgCullCore::new(
+        &g.device,
+        VgCullConfig {
+            initial_bin_capacity: 1 << 14,
+            ..Default::default()
+        },
+    );
+    assert!(core.config.two_phase_occlusion && core.config.tile_density_limit > 0.0);
+    let sizes = [
+        (1920, 1080),
+        (640, 360),
+        (1, 1),
+        (16, 16),
+        (17, 33),
+        (3, 2000),
+        (1920, 1080),
+        (320, 180),
+        (2561, 1441),
+        (1920, 1080),
+    ];
+    let mut covered_frames = 0;
+    for (i, &(w, h)) in sizes.iter().enumerate() {
+        let eye = [-87.0, 0.0, 600.0 + 100.0 * i as f32];
+        let (out, _) = sized_frame(&g, &mut core, &r, &r.inputs(), (w, h), eye);
+        let grid = tile_grid(w, h);
+        let b = core.buffers();
+        assert_eq!(b.tiles, grid, "{w}x{h}: the buffers are for the old grid");
+        let words = u64::from(b.tile_base()) + u64::from(TILE_WORDS) * u64::from(grid[0] * grid[1]);
+        assert_eq!(
+            b.history.size(),
+            (words * 4).max(16),
+            "{w}x{h}: the history buffer is not sized for the grid"
+        );
+        let tiles = tile_block(&g, &core);
+        assert_eq!(tiles.len() as u32, grid[0] * grid[1]);
+        for t in &tiles {
+            let scale = f32::from_bits(t[2]);
+            assert!(
+                scale == 0.0 || (1.0 - 1e-3..=TILE_SCALE_MAX + 1e-3).contains(&scale),
+                "{w}x{h}: tile scale {scale}"
+            );
+        }
+        let estimated: f32 = tiles.iter().map(|t| t[0] as f32 / TILE_FIXED).sum();
+        let emitted_tris: u32 = out
+            .items
+            .iter()
+            .map(|&(_, slot, _)| s.dag.clusters[s.dag.index_of(slot)].tri_count())
+            .sum();
+        // A tile estimate can only be missing triangles (clusters wider than the
+        // estimate's limit or off screen), never invent them.
+        assert!(
+            estimated <= emitted_tris as f32 * 1.01 + 1.0,
+            "{w}x{h}: estimate {estimated} for {emitted_tris} emitted triangles"
+        );
+        if w >= 320 && h >= 180 && !out.items.is_empty() {
+            covered_frames += 1;
+        }
+    }
+    assert!(covered_frames >= 4, "the scene was never visible");
+}
+
+/// The dense mask has the raster grid (`dense_tiles`), which for the frame
+/// after a resize is not the cull grid. `cs_tiles` must read it by tile
+/// coordinate, not by the cull linear tile index: a tile the mask marks dense is
+/// exempt from the valve, and a different tile being exempt instead lets the hot
+/// stack be coarsened (#1645).
+#[test]
+fn the_dense_mask_is_read_by_tile_coordinate_when_the_grids_differ() {
+    use helio_pass_vg_cull::TILE_FIXED;
+    let Some(g) = gpu() else {
+        return;
+    };
+    const STACK: usize = 48;
+    let mut s = scene(false);
+    let make = |row: u32| {
+        RefInstance::translated_scaled(
+            [-150.0, 0.0, 0.0],
+            1.0,
+            GpuVgInstance {
+                asset_slot: 0,
+                flags: INST_ENABLED,
+                lod_error_scale: 1.0,
+                object_row: row,
+            },
+        )
+    };
+    s.instances = (0..STACK).map(|i| make(i as u32)).collect();
+    let r = upload(&g, &s);
+    let eye = [-87.0, 0.0, 1500.0];
+    // The cull screen is small; the mask comes from a larger raster grid.
+    let screen = (640, 360);
+    let (cull_grid, mask_grid) = (tile_grid(screen.0, screen.1), tile_grid(1920, 1080));
+    let config = |limit: f32| VgCullConfig {
+        initial_bin_capacity: 1 << 16,
+        tile_density_limit: limit,
+        ..stability_config()
+    };
+    let triangles = |items: &BTreeSet<Item>| {
+        let plain: BTreeSet<_> = items.iter().map(|&(i, c, _)| (i, c, 0)).collect();
+        triangle_count(&s, &plain)
+    };
+
+    // The hot tiles of the cull grid, from an unvalved frame.
+    let mut open = VgCullCore::new(&g.device, config(0.0));
+    let (open_out, _) = sized_frame(&g, &mut open, &r, &r.inputs(), screen, eye);
+    let density = |t: &[u32; 3]| t[0] as f32 / (t[1] as f32).clamp(1.0, 256.0 * TILE_FIXED);
+    let hot: Vec<u32> = tile_block(&g, &open)
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| density(t) > 25.0)
+        .map(|(i, _)| i as u32)
+        .collect();
+    assert!(!hot.is_empty(), "the stack is not hot");
+
+    // The mask marks exactly those tiles, in the mask grid layout.
+    let mut mask = vec![0u32; (mask_grid[0] * mask_grid[1]) as usize];
+    let mut misread = 0;
+    for &t in &hot {
+        let (x, y) = (t % cull_grid[0], t / cull_grid[0]);
+        mask[(y * mask_grid[0] + x) as usize] = 1;
+        misread += u32::from(mask[t as usize] == 0);
+    }
+    assert!(misread > 0, "the test cannot tell the two readings apart");
+    let mask_buf = buf(&g, "dense mask", &mask);
+    let mut inputs = r.inputs();
+    inputs.dense_mask = Some(&mask_buf);
+    inputs.dense_tiles = mask_grid;
+
+    // Every hot tile is dense: the valve leaves the stack alone.
+    let mut valved = VgCullCore::new(&g.device, config(16.0));
+    let mut last = BTreeSet::new();
+    for _ in 0..40 {
+        last = sized_frame(&g, &mut valved, &r, &inputs, screen, eye)
+            .0
+            .items;
+    }
+    assert_eq!(
+        triangles(&last),
+        triangles(&open_out.items),
+        "tiles the mask marks dense were coarsened: the mask was read at the wrong tiles"
+    );
+
+    // Control: without the mask the same stack is coarsened.
+    let mut plain = VgCullCore::new(&g.device, config(16.0));
+    let mut coarse = BTreeSet::new();
+    for _ in 0..40 {
+        coarse = sized_frame(&g, &mut plain, &r, &r.inputs(), screen, eye)
+            .0
+            .items;
+    }
+    assert!(
+        triangles(&coarse) * 10 < triangles(&open_out.items) * 9,
+        "the control was not coarsened, so the test proves nothing"
+    );
+}
+
+// ── The estimate's limit on cluster size ───────────────────────────────────
+
+/// `TILE_EST_MAX_R` in the shader.
+const TILE_EST_MAX_R: f32 = 32.0;
+
+/// Projected sphere radius in pixels, as `tile_footprint` computes it.
+fn projected_radius_px(v: &RefView, inst: &RefInstance, c: &GpuCluster) -> f32 {
+    let center = inst.to_world([c.sphere[0], c.sphere[1], c.sphere[2]]);
+    let d = v.view_depth(center).max(v.near);
+    c.sphere[3] * inst.scale() * v.proj_y * 0.5 * v.screen_height / d
+}
+
+/// A cluster whose bounding sphere projects wider than `TILE_EST_MAX_R` pixels is
+/// left out of the tile estimate (it cannot make a tile dense: at most
+/// `CLUSTER_MAX_TRIS` triangles over a 3200+ pixel disc), and every smaller one
+/// is counted. So the estimate is the triangles of the emitted clusters within
+/// the limit, however many large clusters there are (#1646).
+#[test]
+fn the_tile_estimate_leaves_out_clusters_wider_than_the_limit() {
+    use helio_pass_vg_cull::TILE_FIXED;
+    let Some(g) = gpu() else {
+        return;
+    };
+    // Two copies at different scales: at one distance their clusters straddle the
+    // limit.
+    let mut s = scene(false);
+    s.instances.truncate(2);
+    let r = upload(&g, &s);
+    // How the emitted clusters at a view split by projected size.
+    let split = |items: &BTreeSet<Item>, v: &RefView| -> (u32, u32, u32) {
+        let (mut small, mut large, mut large_clusters) = (0, 0, 0);
+        for &(i, slot, _) in items {
+            let c = &s.dag.clusters[s.dag.index_of(slot)];
+            if projected_radius_px(v, &s.instances[i as usize], c) > TILE_EST_MAX_R {
+                large += c.tri_count();
+                large_clusters += 1;
+            } else {
+                small += c.tri_count();
+            }
+        }
+        (small, large, large_clusters)
+    };
+    // Sweep the distance on one core: at every frame the estimate must be the
+    // clusters within the limit and nothing more; across the sweep there must be
+    // frames with clusters within the limit and frames with only large ones (the
+    // synthetic DAG rarely mixes both in one cut; when it does the same bound holds).
+    let mut core = VgCullCore::new(
+        &g.device,
+        VgCullConfig {
+            initial_bin_capacity: 1 << 14,
+            ..stability_config()
+        },
+    );
+    let (mut mixed, mut all_large, mut counted) = (0, 0, 0);
+    let mut z = 20.0f32;
+    while z < 4000.0 {
+        let eye = [-87.0, 0.0, z];
+        let v = set_camera(&g, &r, eye);
+        let (out, _) = frame_at(&g, &mut core, &r, eye);
+        let (small, large, large_clusters) = split(&out.items, &v);
+        let estimated: f32 = tile_block(&g, &core)
+            .iter()
+            .map(|t| t[0] as f32 / TILE_FIXED)
+            .sum();
+        // Counted: the small ones (less what falls off screen). Not counted: the large.
+        assert!(
+            estimated <= small as f32 * 1.01 + 1.0,
+            "z {z:.0}: the estimate {estimated} includes large clusters ({small} small, {large} large)"
+        );
+        if small > 0 {
+            counted += 1;
+            if large > 0 {
+                mixed += 1;
+            }
+            println!(
+                "mixed z {z:.0}: {small} triangles in clusters within {TILE_EST_MAX_R} px, {large} in {large_clusters} larger ones, estimated {estimated:.1}"
+            );
+            assert!(
+                estimated >= small as f32 * 0.5,
+                "z {z:.0}: lost the small clusters"
+            );
+        }
+        if small == 0 && large > 0 {
+            all_large += 1;
+            assert!(
+                estimated < 1.0,
+                "z {z:.0}: all-large frame estimated {estimated}"
+            );
+        }
+        z *= 1.07;
+    }
+    println!("frames with small clusters: {counted} (mixed with large: {mixed}), only large: {all_large}");
+    assert!(counted > 0, "no frame had clusters within the limit");
+    assert!(all_large > 0, "no frame had only large clusters");
 }

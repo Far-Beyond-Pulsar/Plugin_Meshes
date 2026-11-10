@@ -830,9 +830,16 @@ fn cs_tiles(@builtin(global_invocation_id) gid: vec3<u32>) {
     var g = max(bitcast<f32>(atomicLoad(&history[tile_word(t, 2u)])), 1.0);
     if params.tile_limit > 0.0 {
         let d = tris / max(min(area, f32(VGC_TILE * VGC_TILE)), 1.0);
+        // The mask has the raster's grid (`dense_tiles_*`), which is not this
+        // grid for the frame after a resize: read it by tile coordinate.
         var dense = false;
-        if (params.flags & VGC_FLAG_DENSE_MASK) != 0u && t < arrayLength(&dense_mask) {
-            dense = dense_mask[t] != 0u;
+        if (params.flags & VGC_FLAG_DENSE_MASK) != 0u {
+            let x = t % params.tiles_x;
+            let y = t / params.tiles_x;
+            let m = y * params.dense_tiles_x + x;
+            if x < params.dense_tiles_x && y < params.dense_tiles_y && m < arrayLength(&dense_mask) {
+                dense = dense_mask[m] != 0u;
+            }
         }
         if dense || d < params.tile_limit / (1.0 + VGC_TILE_BAND) {
             g = max(g * VGC_TILE_STEP_DOWN, 1.0);
