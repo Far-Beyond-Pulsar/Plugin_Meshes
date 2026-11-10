@@ -24,4 +24,4 @@ helio-pass-light-cull = { workspace = true }
 helio-mesh-host = { workspace = true }
 helio-components = { workspace = true }
 pollster = "0.4"
-naga = { version = "30", features = ["wgsl-in"] }
+naga = { version = "30", features = ["wgsl-in", "hlsl-out"] }

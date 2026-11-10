@@ -8,3 +8,6 @@ helio-mesh-api = { workspace = true }
 helio-core = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in", "hlsl-out"] }
