@@ -171,3 +171,62 @@ impl RenderHostPart for MeshesHostPart {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every project setting reaches the runtime settings the cull and raster
+    /// passes read (`feature/vg`'s `cull_settings` copies `tau_px`,
+    /// `prefetch_factor` and `tile_density_limit` into `VgCullDynamic`; the
+    /// raster reads `dense_sensitivity` and `tier3`). Distinct non-default
+    /// values, so a field mapped from the wrong source or left at its default
+    /// fails here.
+    #[test]
+    fn project_settings_are_forwarded_into_the_runtime_settings() {
+        let settings = VirtualGeometrySettings {
+            mode: VirtualGeometryMode::ForceHwRaster,
+            tau_pixels: 3.5,
+            prefetch_factor: 4.5,
+            tile_density_limit: 0.0,
+            dense_sensitivity: 2.5,
+            page_budget_mb: 777,
+            max_visible_clusters: 123_456,
+            two_phase_occlusion: false,
+            tier3: true,
+            ..VirtualGeometrySettings::default()
+        };
+        let runtime = virtual_geometry_runtime_settings(settings);
+        assert_eq!(runtime.mode, helio_vg_format::VgMode::ForceHwRaster);
+        assert_eq!(runtime.tau_px, 3.5);
+        assert_eq!(runtime.prefetch_factor, 4.5);
+        assert_eq!(
+            runtime.tile_density_limit, 0.0,
+            "0 (valve off) is forwarded"
+        );
+        assert_eq!(runtime.dense_sensitivity, 2.5);
+        assert_eq!(runtime.page_budget_mb, 777);
+        assert_eq!(runtime.max_visible_clusters, 123_456);
+        assert!(!runtime.two_phase_occlusion);
+        assert!(runtime.tier3);
+    }
+
+    #[test]
+    fn out_of_range_settings_are_clamped_before_they_are_forwarded() {
+        let runtime = virtual_geometry_runtime_settings(VirtualGeometrySettings {
+            prefetch_factor: 1000.0,
+            tile_density_limit: -4.0,
+            dense_sensitivity: 0.0,
+            ..VirtualGeometrySettings::default()
+        });
+        assert_eq!(
+            runtime.prefetch_factor,
+            VirtualGeometrySettings::PREFETCH_FACTOR_RANGE.1
+        );
+        assert_eq!(runtime.tile_density_limit, 0.0);
+        assert_eq!(
+            runtime.dense_sensitivity,
+            VirtualGeometrySettings::DENSE_SENSITIVITY_RANGE.0
+        );
+    }
+}
