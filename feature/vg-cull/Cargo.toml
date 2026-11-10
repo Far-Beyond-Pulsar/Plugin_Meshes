@@ -16,7 +16,7 @@ bytemuck = { workspace = true, features = ["derive"] }
 log = { workspace = true }
 
 [dev-dependencies]
-naga = { version = "30", features = ["wgsl-in"] }
+naga = { version = "30", features = ["wgsl-in", "hlsl-out"] }
 pollster = { version = "0.4" }
 glam = { workspace = true }
 helio-vg-build = { workspace = true }

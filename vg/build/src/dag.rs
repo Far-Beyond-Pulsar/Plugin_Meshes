@@ -17,10 +17,10 @@ use std::collections::BTreeMap;
 
 use rayon::prelude::*;
 
-use helio_vg_format::PAGE_BYTES;
+use helio_vg_format::{VertexAttr, PAGE_BYTES};
 
 use crate::cluster::cluster_tris;
-use crate::deviation::{measure, Measured};
+use crate::deviation::{measure, Measured, RefPoint, Shading, Surface};
 use crate::math::*;
 use crate::mesh::{mark_floating, weld, BuildError, MeshInput, Tri, VertexStore};
 use crate::partition::partition;
@@ -32,21 +32,6 @@ pub const NONE: u32 = u32::MAX;
 /// Safety factor on the measured deviation (covers the interior of original
 /// triangles, which reference points sample only at their vertices).
 const ERROR_MARGIN: f32 = 1.4;
-/// Selected triangles per screen pixel the hierarchy is built to stay under when
-/// a whole asset is drawn at one level. Below the 2 per pixel the project aims
-/// for, because cuts mix neighbouring levels and the silhouette is estimated.
-const DENSITY_TARGET: f32 = 1.5;
-/// A group whose children are over that density (an asset-wide level of `n`
-/// triangles over a silhouette of area `a` has more than `DENSITY_TARGET`
-/// triangles per pixel once a pixel is wider than `sqrt(target * a / n)`, and
-/// likewise once it is wider than the children's own triangles) may be selected
-/// before its measured error reaches the tolerance: its stored error is relaxed
-/// to that pixel width, but never below `measured / DENSITY_TOLERANCE_GAIN`.
-/// This bounds triangles per pixel on assets whose finest detail is far below a
-/// pixel at a distance (scans, foliage) without dropping geometry: the coarser
-/// level still stands in for all of it, with at most this many times the
-/// tolerance of deviation.
-const DENSITY_TOLERANCE_GAIN: f32 = 12.0;
 /// Per-group deviation budget handed to the simplifier: at least this multiple
 /// of the group's children's error ...
 const ERR_GROWTH: f32 = 2.0;
@@ -85,7 +70,7 @@ pub struct ClusterNode {
     /// Build-time only: original-surface reference points this cluster
     /// stands in for (empty at level 0, where the triangles are the surface,
     /// and again once the consuming group has measured them).
-    pub(crate) refs: Vec<V3>,
+    pub(crate) refs: Vec<RefPoint>,
 }
 
 /// A set of clusters sharing one parent: either the inputs of one
@@ -124,44 +109,6 @@ fn split_into_clusters(vs: &VertexStore, tris: &[([u32; 3], u32)]) -> Vec<(Vec<[
     out
 }
 
-/// Mean projected area of the mesh over the three axis directions: each
-/// vertex and triangle centroid marks a cell of a 128 x 128 grid over the
-/// bounds. Used only to estimate how many triangles per pixel a whole level
-/// of the hierarchy puts on screen.
-fn silhouette_area(vs: &VertexStore, tris: &[crate::mesh::Tri]) -> f32 {
-    const GRID: usize = 128;
-    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-    for t in tris {
-        for &v in &t.v {
-            let p = vs.pos[v as usize];
-            for k in 0..3 {
-                lo[k] = lo[k].min(p[k]);
-                hi[k] = hi[k].max(p[k]);
-            }
-        }
-    }
-    let mut total = 0.0f64;
-    for axis in 0..3 {
-        let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
-        let (du, dw) = ((hi[u] - lo[u]).max(1e-12), (hi[w] - lo[w]).max(1e-12));
-        let mut cells = vec![false; GRID * GRID];
-        let mut mark = |p: V3| {
-            let i = (((p[u] - lo[u]) / du * GRID as f32) as usize).min(GRID - 1);
-            let j = (((p[w] - lo[w]) / dw * GRID as f32) as usize).min(GRID - 1);
-            cells[j * GRID + i] = true;
-        };
-        for t in tris {
-            let p = t.v.map(|v| vs.pos[v as usize]);
-            for q in p {
-                mark(q);
-            }
-            mark(scale(add(add(p[0], p[1]), p[2]), 1.0 / 3.0));
-        }
-        let filled = cells.iter().filter(|&&c| c).count();
-        total += filled as f64 / (GRID * GRID) as f64 * du as f64 * dw as f64;
-    }
-    (total / 3.0) as f32
-}
 pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
     mesh.validate()?;
     let (mut vs, tris) = weld(mesh);
@@ -177,12 +124,22 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
         source_tris: tris.len(),
     };
 
+    // Vertex attribute records in the format's layout can be measured (normal,
+    // uv); any other stride is opaque and only positions are.
+    let stride = mesh.attribute_stride;
+    let attr_of = |vs: &VertexStore, v: u32| -> Option<VertexAttr> {
+        if stride != helio_vg_format::ATTR_STRIDE as usize {
+            return None;
+        }
+        let at = vs.attr[v as usize] as usize * stride;
+        VertexAttr::decode(mesh.attributes.get(at..at + stride)?)
+    };
+
     // ── level 0 ────────────────────────────────────────────────────────────
     let mut by_mat: BTreeMap<u32, Vec<[u32; 3]>> = BTreeMap::new();
     for t in &tris {
         by_mat.entry(t.mat).or_default().push(t.v);
     }
-    let silhouette = silhouette_area(&dag.vs, &tris);
     drop(tris);
     let per_mat: Vec<(u32, Vec<[u32; 3]>, Vec<Vec<u32>>)> = by_mat
         .into_par_iter()
@@ -364,37 +321,62 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
             .par_iter()
             .zip(parts.par_iter())
             .map(|(members, pieces)| {
-                let mut refs: Vec<V3> = Vec::new();
+                let mut refs: Vec<RefPoint> = Vec::new();
                 for &c in members {
                     let cn = &dag.clusters[c as usize];
                     if cn.level == 0 {
                         let mut ids: Vec<u32> = cn.tris.iter().flatten().copied().collect();
                         ids.sort_unstable();
                         ids.dedup();
-                        refs.extend(ids.iter().map(|&v| dag.vs.pos[v as usize]));
+                        // Vertices on an attribute seam carry no attributes: see
+                        // `deviation`. Elsewhere the original record is the truth.
+                        refs.extend(ids.iter().map(|&v| {
+                            RefPoint {
+                                p: dag.vs.pos[v as usize],
+                                shading: (!dag.vs.seam[v as usize])
+                                    .then(|| attr_of(&dag.vs, v).and_then(|a| Shading::of(&a)))
+                                    .flatten(),
+                            }
+                        }));
                         // Triangle centroids too: vertices alone under-sample the
                         // surface between them (high-frequency scan noise).
                         for t in &cn.tris {
                             let p = t.map(|v| dag.vs.pos[v as usize]);
-                            refs.push(scale(add(add(p[0], p[1]), p[2]), 1.0 / 3.0));
+                            let corners =
+                                t.map(|v| attr_of(&dag.vs, v).and_then(|a| Shading::of(&a)));
+                            let shading = match (corners[0], corners[1], corners[2]) {
+                                (Some(a), Some(b), Some(c)) => {
+                                    Shading::blend([&a, &b, &c], [1.0 / 3.0; 3])
+                                }
+                                _ => None,
+                            };
+                            refs.push(RefPoint {
+                                p: scale(add(add(p[0], p[1]), p[2]), 1.0 / 3.0),
+                                shading,
+                            });
                         }
                     } else {
                         refs.extend_from_slice(&cn.refs);
                     }
                 }
                 let piece_tris: Vec<&[[u32; 3]]> = pieces.iter().map(|p| p.0.as_slice()).collect();
-                let input: Vec<[V3; 3]> = members
+                let input: Vec<[u32; 3]> = members
                     .iter()
-                    .flat_map(|&c| dag.clusters[c as usize].tris.iter())
-                    .map(|t| t.map(|v| dag.vs.pos[v as usize]))
+                    .flat_map(|&c| dag.clusters[c as usize].tris.iter().copied())
                     .collect();
-                measure(&refs, &input, &piece_tris, &dag.vs.pos)
+                let attr = |v: u32| attr_of(&dag.vs, v);
+                measure(
+                    &refs,
+                    &input,
+                    &piece_tris,
+                    &Surface {
+                        pos: &dag.vs.pos,
+                        attr: &attr,
+                    },
+                )
             })
             .collect();
 
-        // Pixel width above which this whole level would put more than
-        // `DENSITY_TARGET` triangles on each pixel of the asset's silhouette.
-        let level_pixel = (DENSITY_TARGET * silhouette / old_tris.max(1) as f32).sqrt();
         let mut next: Vec<u32> = Vec::with_capacity(new_total);
         for (((members, st), pieces), meas) in
             groups.into_iter().zip(staged).zip(parts).zip(measured)
@@ -414,7 +396,8 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
                 }
             }
             // `meas.error` is the measured distance of original-surface points
-            // to this group's simplified surface, so it already includes all
+            // to this group's simplified surface (`meas.shading` the equivalent
+            // length of their normal / uv change), so it already includes all
             // deviation accumulated by earlier levels: take the max with the
             // children (monotone), never a sum. `st.error` (the simplifier's
             // own estimate) is deliberately not used.
@@ -428,22 +411,12 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
                         .max(floor)
                 }
                 None => {
-                    // Measured deviation, relaxed by at most `DENSITY_TOLERANCE_GAIN` while
-                    // the inputs are over the target density (see the constants).
-                    let geo = meas.error.max(meas.forward) * ERROR_MARGIN;
-                    let (mut area, mut count) = (0.0f64, 0usize);
-                    for &c in &members {
-                        for t in &dag.clusters[c as usize].tris {
-                            let p = t.map(|v| dag.vs.pos[v as usize]);
-                            area += 0.5 * length(cross(sub(p[1], p[0]), sub(p[2], p[0]))) as f64;
-                            count += 1;
-                        }
-                    }
-                    let footprint = (area / count.max(1) as f64).sqrt() as f32;
-                    let pixel = level_pixel.max(0.5 * footprint);
-                    child_err
-                        .max(geo.min(pixel.max(geo / DENSITY_TOLERANCE_GAIN)))
-                        .max(floor)
+                    // The measured deviation is the stored error: a true bound
+                    // on what swapping this group in changes (position, normal
+                    // and uv), with nothing relaxed for density. The runtime
+                    // controls overdraw per tile instead.
+                    let geo = meas.error.max(meas.shading).max(meas.forward) * ERROR_MARGIN;
+                    child_err.max(geo).max(floor)
                 }
             };
             if error <= child_err {

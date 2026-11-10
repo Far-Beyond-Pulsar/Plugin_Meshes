@@ -444,22 +444,10 @@ struct Decoded {
 
 /// uv0 of f16x2 bits.
 fn uv0(bits: u32) -> [f32; 2] {
-    [f16_to_f32(bits & 0xffff), f16_to_f32(bits >> 16)]
-}
-
-fn f16_to_f32(h: u32) -> f32 {
-    let (e, m) = ((h >> 10) & 31, h & 1023);
-    let v = match e {
-        0 => m as f32 * 2f32.powi(-24),
-        31 if m == 0 => f32::INFINITY,
-        31 => f32::NAN,
-        _ => f32::from_bits(((e + 112) << 23) | (m << 13)),
-    };
-    if h & 0x8000 != 0 {
-        -v
-    } else {
-        v
-    }
+    [
+        helio_vg_format::f16_to_f32(bits as u16),
+        helio_vg_format::f16_to_f32((bits >> 16) as u16),
+    ]
 }
 
 /// CPU decode of one cluster's positions (lattice + dequantized), its uv0s

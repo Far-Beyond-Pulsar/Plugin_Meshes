@@ -26,9 +26,9 @@
 //! (its finer clusters replace its own) when `project(error * lod_error_scale *
 //! instance_scale) > tau`, tau being the stable `tau_px` setting. There is no
 //! screen-wide density multiplier, so density follows geometry. The stored error
-//! is used as is; until the builder stores true deviation separately
-//! (`vg/build` `DENSITY_TOLERANCE_GAIN`), the relaxed error it bakes makes the
-//! cut coarser than `tau` implies.
+//! is used as is, and the builder stores the true deviation (position, normal and
+//! uv, monotone, never relaxed for density), so `error <= tau` pixels bounds what
+//! a swap can change.
 //!
 //! * **Hysteresis** ([`TAU_HYST`], [`EDGE_HYST`]). A group refined last frame
 //!   stays refined until its error drops under `tau / (1 + TAU_HYST)`, so the
@@ -549,4 +549,34 @@ pub fn validation_sources() -> Vec<(&'static str, String)> {
         "vg_cull.wgsl",
         helio_core::shader::resolve(&shader_source()).into_owned(),
     )]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One valve step changes a tile's density by about `step^-p`, `p` between 1
+    /// (curved surfaces: error ~ edge^2) and 2 (error ~ edge). The one-frame-old
+    /// estimate cannot make the valve jump across its dead band (width
+    /// `(1 + TILE_BAND)^2`) when each step changes density by less than that, in
+    /// either direction.
+    #[test]
+    fn tile_valve_steps_cannot_cross_the_dead_band() {
+        let band = (1.0 + TILE_BAND).powi(2);
+        assert!(TILE_STEP_UP > 1.0 && TILE_STEP_DOWN < 1.0);
+        for p in [1, 2] {
+            assert!(
+                TILE_STEP_UP.powi(p) < band,
+                "coarsening step overshoots the band"
+            );
+            assert!(
+                (1.0 / TILE_STEP_DOWN).powi(p) < band,
+                "relaxing step overshoots the band"
+            );
+        }
+        // Relaxing is slower than coarsening, so a cheap tile is not made
+        // expensive again at once.
+        assert!(1.0 / TILE_STEP_DOWN < TILE_STEP_UP);
+        assert!(TILE_SCALE_MAX > 1.0);
+    }
 }

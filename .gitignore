@@ -1,4 +1,5 @@
-/examples/assets
-/examples/assets
-/examples/assets
-/examples/assets
+# Large generated or downloaded VG stress data (provisioned by `vg_stress --prepare`).
+# Everything else under examples/assets is tracked (marble/, trees/ have their own .gitignore).
+/examples/assets/vg_stress/cache/
+/examples/assets/vg_stress/meshes/
+/examples/assets/vg_stress/source/

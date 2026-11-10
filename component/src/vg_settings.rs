@@ -532,4 +532,117 @@ mod tests {
         assert_eq!(settings.tau_pixels, 2.0);
         assert_eq!(settings.debug_view, VirtualGeometryDebugView::Overdraw);
     }
+
+    #[test]
+    fn new_fields_default_to_the_documented_values() {
+        let defaults = VirtualGeometrySettings::default();
+        assert_eq!(defaults.prefetch_factor, 2.0);
+        assert_eq!(defaults.tile_density_limit, 16.0);
+        assert_eq!(defaults.dense_sensitivity, 1.0);
+        assert!(!defaults.tier3);
+        // The defaults sit inside their own ranges, so sanitising keeps them.
+        assert_eq!(defaults.sanitized(), defaults);
+    }
+
+    #[test]
+    fn new_fields_clamp_at_both_ends() {
+        let read = |key: &'static str, value: f64| {
+            lookup(HashMap::from([(key, ConfigValue::from(value))]))
+        };
+        let (lo, hi) = VirtualGeometrySettings::PREFETCH_FACTOR_RANGE;
+        assert_eq!((lo, hi), (1.0, 8.0));
+        assert_eq!(read("prefetch_factor", -3.0).prefetch_factor, lo);
+        assert_eq!(read("prefetch_factor", 0.5).prefetch_factor, lo);
+        assert_eq!(read("prefetch_factor", 100.0).prefetch_factor, hi);
+
+        let (lo, hi) = VirtualGeometrySettings::TILE_DENSITY_LIMIT_RANGE;
+        assert_eq!((lo, hi), (0.0, 256.0));
+        assert_eq!(read("tile_density_limit", -5.0).tile_density_limit, lo);
+        assert_eq!(read("tile_density_limit", 1.0e6).tile_density_limit, hi);
+
+        let (lo, hi) = VirtualGeometrySettings::DENSE_SENSITIVITY_RANGE;
+        assert_eq!((lo, hi), (0.125, 8.0));
+        assert_eq!(read("dense_sensitivity", 0.0).dense_sensitivity, lo);
+        assert_eq!(read("dense_sensitivity", 64.0).dense_sensitivity, hi);
+
+        // Non-finite values fall back to the default, not a bound.
+        let defaults = VirtualGeometrySettings::default();
+        let bad = VirtualGeometrySettings {
+            prefetch_factor: f32::NAN,
+            tile_density_limit: f32::INFINITY,
+            dense_sensitivity: f32::NEG_INFINITY,
+            ..defaults
+        }
+        .sanitized();
+        assert_eq!(bad, defaults);
+    }
+
+    #[test]
+    fn a_zero_density_limit_turns_the_valve_off_and_survives() {
+        // 0 is the bottom of the range, so clamping must leave it alone: the
+        // passes read 0 as "valve off".
+        let settings = lookup(HashMap::from([(
+            "tile_density_limit",
+            ConfigValue::from(0.0_f64),
+        )]));
+        assert_eq!(settings.tile_density_limit, 0.0);
+        assert_eq!(
+            VirtualGeometrySettings::TILE_DENSITY_LIMIT_RANGE.0,
+            0.0,
+            "the range must include 0 (off)"
+        );
+        // Other fields do not accept 0: only the valve has an "off" value.
+        assert!(VirtualGeometrySettings::PREFETCH_FACTOR_RANGE.0 > 0.0);
+        assert!(VirtualGeometrySettings::DENSE_SENSITIVITY_RANGE.0 > 0.0);
+    }
+
+    #[test]
+    fn new_fields_round_trip_through_the_saved_form() {
+        let cfg: &'static ConfigManager = Box::leak(Box::new(ConfigManager::new()));
+        let handle = cfg.register(NS, OWNER, schema()).expect("register");
+        handle.set("prefetch_factor", 4.5_f64).expect("prefetch");
+        handle.set("tile_density_limit", 0.0_f64).expect("density");
+        handle
+            .set("dense_sensitivity", 2.0_f64)
+            .expect("sensitivity");
+        handle.set("tier3", true).expect("tier3");
+        let settings = VirtualGeometrySettings::from_config(cfg);
+        assert_eq!(settings.prefetch_factor, 4.5);
+        assert_eq!(settings.tile_density_limit, 0.0);
+        assert_eq!(settings.dense_sensitivity, 2.0);
+        assert!(settings.tier3);
+
+        // Values the schema validators reject never reach the saved form.
+        assert!(handle.set("prefetch_factor", 99.0_f64).is_err());
+        assert!(handle.set("tile_density_limit", -1.0_f64).is_err());
+        assert!(handle.set("dense_sensitivity", 0.0_f64).is_err());
+        assert_eq!(VirtualGeometrySettings::from_config(cfg), settings);
+    }
+
+    #[test]
+    fn older_saved_data_without_the_new_fields_loads_with_defaults() {
+        // A file written before prefetch, the valve, the sensitivity and tier 3
+        // existed has only the original keys.
+        let settings = lookup(HashMap::from([
+            ("mode", ConfigValue::from("force_hw_raster")),
+            ("tau_pixels", ConfigValue::from(3.0_f64)),
+            ("page_budget_mb", ConfigValue::from(256_i64)),
+        ]));
+        let defaults = VirtualGeometrySettings::default();
+        assert_eq!(settings.mode, VirtualGeometryMode::ForceHwRaster);
+        assert_eq!(settings.tau_pixels, 3.0);
+        assert_eq!(settings.page_budget_mb, 256);
+        assert_eq!(settings.prefetch_factor, defaults.prefetch_factor);
+        assert_eq!(settings.tile_density_limit, defaults.tile_density_limit);
+        assert_eq!(settings.dense_sensitivity, defaults.dense_sensitivity);
+        assert_eq!(settings.tier3, defaults.tier3);
+
+        // Wrong types read as defaults too.
+        let wrong = lookup(HashMap::from([
+            ("prefetch_factor", ConfigValue::from("fast")),
+            ("tile_density_limit", ConfigValue::from(true)),
+        ]));
+        assert_eq!(wrong.prefetch_factor, defaults.prefetch_factor);
+        assert_eq!(wrong.tile_density_limit, defaults.tile_density_limit);
+    }
 }

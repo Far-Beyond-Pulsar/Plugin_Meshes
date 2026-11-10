@@ -1,13 +1,13 @@
 # VG museum example
 
-From `crates/renderer/helio`, run:
+From the Pulsar-Native repository root (the superproject; this directory is
+`plugins/vendor/meshes/examples`, package `meshes-examples`), run:
 
 ```powershell
-cargo vg-stress
+cargo run -p meshes-examples --features vg-stress --bin vg_stress --release
 ```
 
-`cargo vg-stress` is an alias (`.cargo/config.toml`) for
-`cargo run -p examples --features vg-stress --bin vg_stress --release`. The
+There is no cargo alias for it. The
 `vg_stress` binary requires the `vg-stress` feature; other examples and default
 builds never download or compile any of the provisioning dependencies
 (`ureq`, `sha2`). Close a running copy before rebuilding on Windows.
@@ -98,7 +98,7 @@ download, the material keeps a flat colour and the scene still opens.
 | Density | `--density <v>` | `VG_STRESS_DENSITY` | `low` 0.4, `normal` 1 (default), `high` 3, `insane` 8, or a number (clamped to 128x) |
 | Textures | `--textures <v>` | `VG_STRESS_TEXTURES` | `low`, `balanced` (default), `max` |
 
-Pass CLI flags after `--`: `cargo vg-stress -- --trees small --density high`. The
+Pass CLI flags after `--`: `cargo run -p meshes-examples --features vg-stress --bin vg_stress --release -- --trees small --density high`. The
 build script only sees the environment, so `VG_STRESS_TREES=small` also limits the
 build-time download. The scene is seeded and deterministic; the startup log
 prints the instance counts, the expected source triangles, GPU texture memory and
@@ -178,12 +178,12 @@ passes shows no scans or trees (one warning).
 * **Progress.** The title bar and the console show
   `Cooking VG k/N assets (done of total tris) | now: <asset (tris, time)> | elapsed | ETA`;
   per-asset start/finish lines and a 15 s heartbeat go to the console.
-* **Forced recook.** `cargo vg-stress -- --force-recook` (or
+* **Forced recook.** `cargo run -p meshes-examples --features vg-stress --bin vg_stress --release -- --force-recook` (or
   `VG_STRESS_FORCE_RECOOK=1`; combine with `--prepare` to do it headless) ignores
   every valid `.vgeo` cache and cooks it again, once per asset per run, then
   overwrites the cache. Without it a cache is rebuilt only when its cook revision
   is stale.
-* **Headless prepare.** `cargo vg-stress -- --prepare` (or `VG_STRESS_PREPARE=1`)
+* **Headless prepare.** `cargo run -p meshes-examples --features vg-stress --bin vg_stress --release -- --prepare` (or `VG_STRESS_PREPARE=1`)
   provisions the sources and cooks every cache with no window or GPU, then exits
   (non-zero on errors). After that the demo starts with everything ready.
   `build.rs` cannot cook: the build script has no VG builder/importer
@@ -272,18 +272,20 @@ Three bounded mechanisms sit around that one rule, all in `VirtualGeometrySettin
   overdraw safety valve that coarsens only the 16x16 tiles above the limit, at
   most 4x, with a dead band; a tile resolved as dense is exempt.
 
-The stored error is used as is. The builder bakes a density relaxation into it
-(`DENSITY_TOLERANCE_GAIN`), so the cut can be coarser than `tau` implies until
-the builder stores true deviation separately.
+The stored error is used as is, and it is the true deviation (cook revision 12):
+the largest object-space distance, normal change or uv slide that swapping the
+group in can cause, measured against the original surface, monotone up the DAG
+and never relaxed for density. So `error <= tau` pixels is a real bound on what a
+swap changes, and overdraw is the runtime's job (the per-tile valve above).
 
 ## Validation
 
 ```powershell
 cargo test --release -p helio-vg-build --test build distant_sphere_has_bounded_density_and_sampled_surface_error -- --nocapture
 cargo test --release -p helio-pass-vg-cull -p helio-pass-vg-shade
-cargo test --release -p examples --features vg-stress --bin vg_stress
-# Checks the cooked caches (run `cargo vg-stress -- --prepare` first):
-cargo test --release -p examples --features vg-stress --bin vg_stress cached_museum_scans_reduce_triangles_with_distance -- --ignored --nocapture
+cargo test --release -p meshes-examples --features vg-stress --bin vg_stress
+# Checks the cooked caches (run `cargo run -p meshes-examples --features vg-stress --bin vg_stress --release -- --prepare` first):
+cargo test --release -p meshes-examples --features vg-stress --bin vg_stress cached_museum_scans_reduce_triangles_with_distance -- --ignored --nocapture
 ```
 
 The builder test samples actual simplified triangles against an analytic sphere
@@ -350,7 +352,7 @@ For a hidden startup smoke run:
 
 ```powershell
 $env:HELIO_VG_SMOKE_SECONDS = '18'
-cargo vg-stress
+cargo run -p meshes-examples --features vg-stress --bin vg_stress --release
 Remove-Item Env:HELIO_VG_SMOKE_SECONDS
 ```
 
@@ -397,6 +399,56 @@ runtime feedback has to raise tau, and texture cooking is not yet persistently
 cached. Passing these regressions does not establish full-scene visual
 stability or a production performance target.
 
+## Capture mode
+
+A scripted, deterministic render of the museum: no window input, a fixed 60 Hz
+step, one camera pose and settings per shot. From the Pulsar-Native root:
+
+```powershell
+$env:VG_STRESS_CAPTURE = 'out'          # or pass `-- --capture out` / `-- --capture=out`
+$env:VG_STRESS_SHOTS = 'vg_stress_shots/vg_runtime.json'
+$env:HELIO_VG_PROFILE = '1'
+cargo run -p meshes-examples --features vg-stress --bin vg_stress --release
+```
+
+| Setting | Meaning |
+|---|---|
+| `VG_STRESS_CAPTURE=<dir>` or `--capture <dir>` | Turns capture mode on and names the output directory. Relative paths resolve against the current directory. |
+| `VG_STRESS_SHOTS=<file>` | Shot list, relative to this directory (`plugins/vendor/meshes/examples`). Default: `assets/vg_stress/shots.json`, else the built-in list. |
+| `VG_STRESS_CAPTURE_RES=<w>x<h>` | Resolution for shots that do not set their own (default 1600x900). |
+| `VG_STRESS_CAPTURE_ONLY=a,b` | Run only shots whose name contains one of these. |
+| `VG_STRESS_CAPTURE_WAIT_MIN=<n>` | Bound, in minutes, on the wait for a cold cook before the first shot. |
+| `HELIO_VG_PROFILE=1` | Per-kernel GPU timestamps; they land in `gpu_ms` of each stats JSON (capture mode turns them on by itself). |
+
+Outputs, in the capture directory: one image per shot (`<name>.png`, or
+`<name>.jpg` when the shot sets `"format": "jpg"`; `vg_runtime.json` sets
+none, so its shots are PNG), a stats JSON per shot (`<name>.json`: camera,
+`tau_px`, debug view, `vg.selected_triangles`, tier cluster counts, cull and
+pool counters, `gpu_ms`) and `index.json` listing every shot with its image,
+stats file, frame count, `selected_triangles` and total `gpu_ms`. A shot
+list entry that is a camera path writes a numbered sequence in `<name>/`.
+
+`vg_stress_shots/vg_runtime.json` is the fixed list of the VG runtime work: 21
+shots (hero close-ups with triangle views, the forest crowd with tier and
+dense views, a normal overview, and the page residency (107) and error vs tau
+(109) views of the overview and the forest at tau 1.0 and 0.25). Run it before
+and after a change that touches the cut or the cooked errors and diff the
+stats JSON and the images.
+
+Reading view 109 (error vs tau): a pixel is heat-coloured while the drawn
+cluster's projected error is under tau and magenta above it. With the default
+settings some hot pixels are magenta on purpose: the per-tile valve
+(`tile_density_limit`, 16) raises the effective tau, up to 4x, in 16x16 tiles
+above 16 triangles per covered pixel. With the valve off (`tile_density_limit`
+0) the museum overview at tau 1.0 shows no magenta. Shots use a fixed 240
+settle frames, not a streaming-ready signal, so a shot that needs many pages
+(the cook revision 12 cut at tau 0.25) can still be filling the pool; compare
+`vg.pool.resident_pages` between runs.
+
+The forest shots need the Poly Haven trees; if their glTF fails to import
+(`KHR_texture_transform` is not supported by the importer) the forest views draw
+no VG triangles and only the museum shots carry information.
+
 ## Tier 3 measurements (dense tiles)
 
 Per-kernel GPU timestamps: with `HELIO_VG_PROFILE=1` (or capture mode) every
@@ -416,19 +468,10 @@ with ray queries), plus `-dense-overlap` views. Run one density at a time:
 ```powershell
 $env:VG_STRESS_DENSITY = '3'; $env:VG_STRESS_PAGE_MB = '2048'
 $env:VG_STRESS_CAPTURE = 'out'; $env:VG_STRESS_CAPTURE_ONLY = 'tier3-tier2,tier3-on-rt'
-$env:HELIO_VG_PROFILE = '1'; cargo vg-stress
+$env:HELIO_VG_PROFILE = '1'; cargo run -p meshes-examples --features vg-stress --bin vg_stress --release
 ```
 
-`VG_STRESS_SHOTS=<file>` (relative to this directory) replaces `assets/vg_stress/shots.json`.
-`vg_stress_shots/vg_runtime.json` is the fixed before/after list of the VG runtime
-work (hero close-ups, forest crowd and dense views, normal overview, and views 107
-page residency and 109 error vs tau at tau 1 and 0.25); diff the per-shot stats
-JSON (`vg.selected_triangles`, tier counts, `gpu_ms`) and the images between builds:
-
-```powershell
-$env:VG_STRESS_SHOTS = 'vg_stress_shots/vg_runtime.json'; $env:VG_STRESS_CAPTURE = 'outfter'
-$env:HELIO_VG_PROFILE = '1'; cargo vg-stress
-```
+The fixed shot list and its use are described under "Capture mode" above.
 
 Tier 3 is opt-in for this demo: set `VG_STRESS_TIER3=1` to run its ray-traced
 dense-tile backend when hardware and proxy residency allow it. The “Ray Trace vs
@@ -459,7 +502,7 @@ thresholds are scaled by sensitivity too).
 
 ```powershell
 $env:VG_STRESS_TIER3 = '1'
-cargo vg-stress
+cargo run -p meshes-examples --features vg-stress --bin vg_stress --release
 ```
 
 ### What the 93 ms was (forest shot, RTX 4090, 1600x900, density 1)
@@ -516,7 +559,7 @@ bit-identical on the forest shot and differ from Tier 2 only on 0.0135% of pixel
 N instances of ONE asset (default the Thai statue, `VG_STRESS_BENCH_ASSET=thai|lucy|pine`)
 in a seeded jittered grid with varied yaw and scale (spacing `VG_STRESS_BENCH_SPACING`,
 default 3.2 m) over a classic ground plane, nothing else. The scene is built by the normal
-loader from the cooked caches (run `cargo vg-stress -- --prepare` once); textures are skipped.
+loader from the cooked caches (run `cargo run -p meshes-examples --features vg-stress --bin vg_stress --release -- --prepare` once); textures are skipped.
 One process per N; it renders six fixed camera cases offscreen (no window) and exits. Tier 3
 stays off. A private-memory guard stops the process at `VG_STRESS_BENCH_MEM_GB` (default 14).
 
@@ -525,7 +568,7 @@ cd D:\GitHub\Pulsar-Native\crates\renderer\helio
 $env:HELIO_VG_STRESS_SKIP_PROVISION = '1'
 # Close a running vg_stress first (Windows locks the exe), or build into another target dir:
 #   $env:CARGO_TARGET_DIR = 'D:\GitHub\helio_bench_target'
-cargo build -p examples --features vg-stress --release --bin vg_stress
+cargo build -p meshes-examples --features vg-stress --release --bin vg_stress
 
 foreach ($n in 1000, 5000, 20000, 100000) {
   $env:VG_STRESS_INSTANCES = "$n"     # or: vg_stress.exe --instance-bench $n
@@ -609,7 +652,7 @@ local projected coverage. It also imposed geometric distance error on sparse
 foliage, making LOD selection retain much finer cuts. Its section-wide rejection
 rules could prevent simplification altogether. These changes are reverted.
 
-Run `cargo vg-stress -- --prepare` to rebuild stale caches, including revision 6.
+Run `cargo run -p meshes-examples --features vg-stress --bin vg_stress --release -- --prepare` to rebuild stale caches, including revision 6.
 Triangle-density adaptation remains opt-in and bounded; compare selection at a
 fixed tau with adaptation disabled when evaluating future builder changes.
 
@@ -637,15 +680,39 @@ nearest free cluster in a Morton window rather than the next one in curve order,
 which had been stringing far-apart clusters into one group and pinning the error
 of every ancestor.
 
-Revisions 9 and 10 bound selected triangles per pixel in the stored errors. A
-group whose children are over `DENSITY_TARGET` (1.5) triangles per pixel for a
-whole-asset level (level triangles over the mean silhouette area of the asset) may
-be selected before its measured error reaches the tolerance, never below
-`measured / 12`. Geometry is never dropped: the coarser level stands in for all of it.
+Revisions 9 to 11 bound selected triangles per pixel in the stored errors: a
+group over a target density could be selected before its measured error reached
+the tolerance, never below `measured / 12`. That made the stored error stop
+being a bound on deviation (a cluster swap could differ by far more than tau
+pixels), and the runtime now has the per-tile valve for overdraw, so revision 12
+removed the relaxation (`DENSITY_TARGET`, `DENSITY_TOLERANCE_GAIN` and the
+silhouette estimate are gone).
 
 Validate with `cargo test --release -p helio-vg-build --test lod_validation --
 --nocapture --include-ignored` (set `VG_LOD_OUT` for images). Real caches:
 `VG_CACHE_DIR=<cache dir> VG_REBUILD=1 ... real_cached_assets_ladder_and_images`.
+
+### Cook revision 12: stored error is the true deviation
+
+The stored group error is now `max(children, ERROR_MARGIN * max(position,
+shading, forward))`, nothing else:
+
+* `position`: distance of original-surface reference points to the simplified
+  surface (as before), `forward`: distance of simplified samples to the input.
+* `shading` (new): the normal and uv0/uv1 change at each reference point, in
+  object-space length (a normal tilt over half an output edge; a uv slide times
+  the object-space length per uv unit). It is measured only when the vertex
+  records use the format layout (`ATTR_STRIDE` 16: `helio_vg_format::VertexAttr`)
+  and not on attribute seams, which are locked by the simplifier anyway.
+* The 12x density relaxation (`DENSITY_TARGET`, `DENSITY_TOLERANCE_GAIN`) is
+  removed; only one error is stored, because the runtime has one reader (the
+  cut) and no density multiplier that would need a second.
+
+`COOK_REVISION` is 12 and `FORMAT_VERSION` 5 (the asset header lost the unused
+`LodTable`, 96 to 48 bytes), so old caches are rejected and cook again. Expect
+more selected triangles at the same tau than with revisions 9 to 11, because the
+error ladder is steeper; the per-tile valve (`tile_density_limit`) bounds the
+overdraw.
 
 ### Per-cluster cut and per-tile overdraw valve (replaces the screen-wide density solve)
 
@@ -654,6 +721,6 @@ The computed screen-wide density multiplier (`cs_density`, `VisibleFraction`,
 `HELIO_VG_SELECTION_*` variables) is removed: a view-wide tau moved every
 instance's LOD at once as the camera moved. The cull now runs `cs_tiles`, one
 thread per 16x16 tile, which turns last frame's per-tile triangle estimate into the
-valve scale. The asset header's `LodTable` is still written by the builder but no
-longer read at runtime. Merged foliage cards now take
+valve scale. The asset header's `LodTable` (and the builder code that wrote it)
+is deleted. Merged foliage cards now take
 all four corners' attributes from one member so their texture stays coherent.

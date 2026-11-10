@@ -15,5 +15,6 @@ wgpu = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
+naga = { version = "30", features = ["wgsl-in", "hlsl-out"] }
 pollster = { version = "0.4" }
 glam = { workspace = true }

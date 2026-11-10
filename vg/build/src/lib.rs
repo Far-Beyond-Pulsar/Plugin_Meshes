@@ -48,7 +48,8 @@ pub use reader::{PageView, ParseError, VgeoReader};
 /// (`deviation`), reduces 40% per level and stops stalled levels. Revision 5 builds a real DAG for disconnected/island geometry (floating pieces, proximity merging, appearance error) and bounds the pinned root set to `MAX_ROOT_PAGES`.
 /// Revision 7 restores revision 5 foliage simplification and coverage error.
 /// Revision 6 produced distorted foliage and excessive refinement; recook it.
-pub const COOK_REVISION: u32 = 11;
+/// Revision 12 stores the true deviation (position, normal and uv, no baked density relaxation).
+pub const COOK_REVISION: u32 = 12;
 
 pub fn is_current_cook(header: &helio_vg_format::VgeoHeader) -> bool {
     header.asset.flags >> 16 == COOK_REVISION

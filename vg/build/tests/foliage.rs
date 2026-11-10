@@ -128,12 +128,15 @@ fn disjoint_canopy_selection_tracks_screen_size() {
         s[4] * 20 < s[0],
         "selection must collapse with distance: {s:?}"
     );
-    // Sparse foliage must already coarsen at the second sample. Applying
+    // Sparse foliage must coarsen already at the second sample. Applying
     // point-to-surface distance as its coverage error retained 62,090 of
-    // 63,200 triangles here; the coverage metric selects about 15,763.
-    // Keep margin for partition changes while rejecting that regression.
+    // 63,200 triangles here (0.98 of the near selection). Since revision 12 the
+    // stored error is the true deviation, with no density relaxation, so a card
+    // is only dropped once the gap it leaves is under tau; the mid-distance
+    // selection keeps about two thirds of the near one, and the rest of the
+    // overdraw is the runtime's per-tile valve.
     assert!(
-        s[1] < mesh.tri_count() / 2,
+        s[1] * 5 < s[0] * 4,
         "mid-distance foliage failed to coarsen: {s:?}"
     );
     assert!(s[2] < mesh.tri_count() / 2, "{s:?}");

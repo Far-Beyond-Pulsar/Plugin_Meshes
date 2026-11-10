@@ -554,3 +554,105 @@ fn dense_mask_has_hysteresis_across_frames() {
     assert_eq!(dense[0], dense[1]);
     assert_eq!(dense[1], dense[2]);
 }
+
+/// A cull-shaped estimate buffer for a `tiles_x` x `tiles_y` grid: some words of
+/// unrelated data, then `TILE_WORDS` per tile with `hot(tile)` tiles holding 500
+/// estimated triangles (the rest 1).
+fn estimate_buffer(
+    g: &Gpu,
+    tiles: [u32; 2],
+    base_words: u32,
+    hot: impl Fn(u32) -> bool,
+) -> wgpu::Buffer {
+    use helio_pass_vg_cull::{TILE_FIXED, TILE_WORDS};
+    let mut words = vec![0xdead_beefu32; base_words as usize];
+    for t in 0..tiles[0] * tiles[1] {
+        let tris = if hot(t) { 500.0 } else { 1.0 };
+        words.extend_from_slice(&[(tris * TILE_FIXED) as u32, 0, 0][..TILE_WORDS as usize]);
+    }
+    buffer_init(g, "estimate", &words, wgpu::BufferUsages::STORAGE)
+}
+
+/// Resizing the viewport: the cull's tile grid and the raster's are rebuilt at
+/// different moments, so for a frame the classifier can be handed an estimate for
+/// the previous grid. That frame must classify from the counters alone (no
+/// validation error, no garbage from a stale estimate) and the next frame, with
+/// matching grids, must produce exactly the mask the estimate implies (#1645).
+#[test]
+fn dense_mask_survives_viewport_resizes() {
+    use helio_pass_vg_cull::VgTileEstimate;
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(g) = gpu() else { return };
+    let raster = VgRaster::new(
+        &g.device,
+        VgRasterConfig {
+            force_tile_fallback: true,
+            dense_tri_threshold: 64,
+            dense_hit_threshold: u32::MAX,
+            dense_hysteresis: 0.5,
+            dense_latch_frames: 8,
+            dense_max_tiles: 1 << 20,
+            ..Default::default()
+        },
+    );
+    // Shrink to tiny, grow, odd sizes, back: a stale estimate for the old grid
+    // is the wrong shape every time.
+    let sizes = [
+        (64, 64),
+        (16, 16),
+        (1, 1),
+        (3, 70),
+        (300, 200),
+        (64, 64),
+        (1281, 721),
+        (17, 17),
+    ];
+    const BASE: u32 = 7;
+    let hot = |t: u32| t % 3 == 0;
+    let mut previous: Option<([u32; 2], wgpu::Buffer)> = None;
+    for (w, h) in sizes {
+        let mut targets = VgTargets::new(&g.device, w, h, &raster);
+        let grid = [targets.tiles_x, targets.tiles_y];
+        let tiles = u64::from(grid[0] * grid[1]);
+        let classify = |targets: &mut VgTargets, est: &wgpu::Buffer, est_tiles: [u32; 2]| {
+            let mut enc = g.device.create_command_encoder(&Default::default());
+            {
+                let mut rec = helio_core::CommandRecorder::from_encoder(&mut enc);
+                raster.encode_classify(
+                    &g.device,
+                    &g.queue,
+                    &mut rec,
+                    targets,
+                    Some(VgTileEstimate {
+                        buffer: est,
+                        base_words: BASE,
+                        tiles: est_tiles,
+                    }),
+                );
+            }
+            g.queue.submit([enc.finish()]);
+            let mask: Vec<u32> =
+                bytemuck::cast_slice(&read_buffer(&g, targets.dense_mask_last_frame(), tiles * 4))
+                    .to_vec();
+            mask
+        };
+        // The frame right after the resize: the estimate is still the old grid's
+        // (when the grids differ), so nothing may be classified from it.
+        if let Some((old_tiles, old_est)) = &previous {
+            if *old_tiles != grid {
+                let mask = classify(&mut targets, old_est, *old_tiles);
+                assert!(
+                    mask.iter().all(|&m| m == 0),
+                    "{w}x{h}: a stale estimate for grid {old_tiles:?} classified tiles of grid {grid:?}"
+                );
+                // Fresh targets again: the next frame is the second one.
+                targets = VgTargets::new(&g.device, w, h, &raster);
+            }
+        }
+        let est = estimate_buffer(&g, grid, BASE, hot);
+        let mask = classify(&mut targets, &est, grid);
+        let want: Vec<u32> = (0..grid[0] * grid[1]).map(|t| u32::from(hot(t))).collect();
+        assert_eq!(mask, want, "{w}x{h}: dense mask from the matching estimate");
+        previous = Some((grid, est));
+    }
+}
