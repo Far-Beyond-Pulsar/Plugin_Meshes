@@ -45,7 +45,7 @@ fn frame_data<'a>(buffers: &'a VgCullBuffers, phase: u32) -> VgCullFrameData<'a>
         bin_capacity: buffers.bin_capacity,
         phase,
         tile_estimate: VgTileEstimate {
-            buffer: &buffers.history,
+            buffer: &buffers.state,
             base_words: buffers.tile_base(),
             tiles: buffers.tiles,
         },

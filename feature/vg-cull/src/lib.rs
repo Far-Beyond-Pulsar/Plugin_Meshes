@@ -4,12 +4,12 @@
 //! One instance-agnostic traversal answers "which clusters of which instances
 //! get rasterised this frame, and by which tier":
 //!
-//! 1. A persistent-workgroup job queue starts at the global instance BVH
-//!    (T4, `"vg_gcbvh_nodes"`/`"vg_gcbvh_header"`; stubbed by
-//!    `shaders/vg_bvh_stub.wgsl` until it lands), descends to instances, then
+//! 1. A job traversal starts at the global instance BVH
+//!    (`"vg_gcbvh_nodes"`/`"vg_gcbvh_header"`), descends to instances, then
 //!    into each instance's per-asset 4-wide cluster-group hierarchy
 //!    ([`helio_vg_format::GpuHierarchyNode`]). There is no per-instance
 //!    dispatch and no per-instance cluster list: a job is `{instance, node}`.
+//!    Each phase is **one persistent dispatch** (see "Traversal" below).
 //! 2. Every job tests its own bound: frustum, screen-space error entry test
 //!    (`project(max_parent_error) > tau`), two-phase Hi-Z occlusion.
 //! 3. A cluster is drawn iff its parent group is refined and its own is not
@@ -17,8 +17,11 @@
 //!    frustum/occlusion test. If the pages of the clusters it was simplified
 //!    from are not resident it is drawn *instead* (its parent group refined
 //!    alone) and those pages are requested.
-//! 4. Survivors are written, with atomics, into bins (below), together with
-//!    indirect draw/dispatch args for the raster tiers.
+//! 4. Survivors are written into bins (below), together with indirect
+//!    draw/dispatch args for the raster tiers. A workgroup stages the clusters
+//!    one wave emits and reserves their bin entries with one global atomic per
+//!    bin; their tile-estimate contributions are summed per tile in workgroup
+//!    memory and added once per tile per wave.
 //!
 //! # The cut
 //!
@@ -37,13 +40,18 @@
 //!   kept until `edge <= sw_edge_px * (1 + EDGE_HYST)`. The memory is the
 //!   visibility hash set, salted per decision, keyed by the group's (identical on
 //!   both sides) sphere and error, so the two sides of a decision always agree.
+//!   Decisions below the hold threshold skip hashing/history reads entirely.
+//!   History marking first tests this frame's accumulating marks (in `state`) to
+//!   avoid repeated atomic writes. Last frame's marks are copied to a read-only
+//!   buffer (`VgCullBuffers::history_ro`) and the marks cleared before the early
+//!   phase, so every per-job lookup is a cached load rather than an L2 atomic.
 //! * **Prefetch** ([`VgCullDynamic::prefetch_factor`]). Child pages are
 //!   requested (and resident ones touched) while `error * k > tau`, so fine pages
 //!   are resident before the cut needs them; a page the cut needs now is
 //!   *urgent* and is scheduled before every prefetch.
 //! * **Overdraw valve** ([`VgCullDynamic::tile_density_limit`]). Every emitted
 //!   cluster adds its triangles and covered area to the 16x16 tiles it covers
-//!   (`tile estimate`); next frame `cs_tiles` turns that into triangles per
+//!   (`tile estimate`, in `state`); next frame `cs_tiles` turns that into triangles per
 //!   covered pixel per tile. Only a tile over the limit coarsens, slowly and with
 //!   a dead band ([`TILE_BAND`]), by at most [`TILE_SCALE_MAX`]x, and only the
 //!   groups whose footprint covers it feel it. A tile in the dense-tile mask is
@@ -121,10 +129,35 @@
 //! later passes, a consumer must not bind it as storage in the same dispatch
 //! that reads it as the indirect buffer.
 //!
+//! # Traversal
+//!
+//! Each phase runs `cs_traverse` once, with [`VgCullConfig::max_groups`]
+//! persistent workgroups (Nanite's persistent culling, with work stealing):
+//!
+//! * A workgroup works depth-first: waves of up to 64 jobs from its own deque in
+//!   workgroup memory; children go back on the deque.
+//! * Work moves between workgroups through the phase's job queue (an append-only
+//!   array; a slot holds the complemented job, 0 = not written yet, and is
+//!   zeroed when taken). A workgroup whose deque is empty takes a
+//!   guided-self-scheduling share (backlog / workgroups, 1..64 jobs); one with
+//!   more than a wave shares half the excess from its deque bottom (the coarsest
+//!   jobs, the biggest subtrees) while fewer jobs are queued than there are
+//!   workgroups.
+//! * `state::OUTSTANDING` counts queued untaken jobs plus workgroups holding
+//!   work, raised before work appears and lowered after; every workgroup exits
+//!   when it reads 0. A waiting workgroup only waits on running ones (a taken
+//!   slot is written by the workgroup that reserved it, without waiting), so the
+//!   dispatch may be larger than what fits on the GPU at once.
+//! * Nothing is dropped at a capacity: a share that does not fit the queue stays
+//!   in the deque, a deferral that does not fit the late queue is processed in
+//!   the early phase, and a job is lost (`stats::JOB_OVERFLOW`, the queue grows)
+//!   only when its deque *and* the queue are both full.
+//!
 //! # Required device limits
 //!
-//! The main bind group has 20 storage buffers (the material table is the 20th) and one
-//! sampled texture; request `max_storage_buffers_per_shader_stage >= 20` (native adapters report far
+//! The bind group has 20 storage buffers (the material table is the 20th) and one
+//! sampled texture, and every pipeline uses only it and a uniform group; request
+//! `max_storage_buffers_per_shader_stage >= 20` (native adapters report far
 //! more, WebGPU defaults do not suffice; VG is off where unavailable).
 //!
 //! # Contracts with neighbouring crates (reconciled in T10a)
@@ -243,7 +276,7 @@ pub const TILE_BAND: f32 = 0.25;
 /// down when under it or dense) and its ceiling.
 pub const TILE_STEP_UP: f32 = 1.2;
 pub const TILE_STEP_DOWN: f32 = 0.95;
-pub const TILE_SCALE_MAX: f32 = 4.0;
+pub const TILE_SCALE_MAX: f32 = 32.0;
 /// Words per tile in the cull's tile block: estimated triangles and estimated
 /// covered area (both times [`TILE_FIXED`]) and the valve scale (f32 bits).
 pub const TILE_WORDS: u32 = 3;
@@ -271,16 +304,30 @@ pub mod state {
     pub const BINS: u32 = 0;
     /// [`stats`](super::stats) counters.
     pub const STATS: u32 = 8;
-    /// Queue tails: A, B, deferred.
+    /// Job queue tails (next free slot): 0 = the early phase's queue, 1 = the
+    /// deferred work the late phase starts from (and its queue).
     pub const Q_TAIL: u32 = 24;
+    /// Jobs not yet queued plus workgroups holding work, during a phase's
+    /// traversal (0 = the phase is done).
+    pub const OUTSTANDING: u32 = 27;
+    /// Job queue heads (next slot to take), per queue as [`Q_TAIL`].
     pub const Q_HEAD: u32 = 28;
     /// Clamped per-bin counts after phase 0.
     pub const PHASE0_COUNTS: u32 = 32;
     pub const RANGES: u32 = helio_vg_format::CULL_STATE_RANGES;
     pub const ARGS: u32 = 72;
     pub const ARGS_PHASE_WORDS: u32 = 32;
+    /// The counters, ranges and args above (what the stats read-back copies).
     pub const WORDS: u32 = 136;
+    /// First word of the rest of the buffer, the cull's own atomic memory
+    /// (cache-line aligned): this frame's visibility/hysteresis marks
+    /// (`VgCullBuffers::history_words`), then the per-tile block
+    /// ([`super::TILE_WORDS`] words per tile, `VgCullBuffers::tile_base`).
+    pub const HISTORY: u32 = 256;
 }
+const _: () = assert!(state::WORDS <= state::HISTORY);
+// The emission staging packs the bin into 3 bits (`emit_cluster`).
+const _: () = assert!(BIN_COUNT <= 8);
 
 pub const RANGES_BYTE_OFFSET: u64 = state::RANGES as u64 * 4;
 pub const ARGS_BYTE_OFFSET: u64 = state::ARGS as u64 * 4;
@@ -318,7 +365,8 @@ pub mod stats {
     pub const JOBS: u32 = 0;
     pub const CLUSTERS_TESTED: u32 = 1;
     pub const EMITTED: u32 = 2;
-    /// A job was dropped because a queue was full (geometry may be missing).
+    /// A job was dropped because the phase queue and the workgroup's deque
+    /// were both full (geometry may be missing; the queue grows).
     pub const JOB_OVERFLOW: u32 = 3;
     /// A cluster was dropped because its bin was full.
     pub const VISIBLE_OVERFLOW: u32 = 4;
@@ -329,8 +377,11 @@ pub mod stats {
     pub const CULLED_OCCLUSION: u32 = 9;
     pub const CULLED_CONE: u32 = 10;
     pub const CULLED_SSE: u32 = 11;
+    /// Jobs a workgroup shared through the phase queue (deque bottom when the
+    /// queue ran low, or a full deque).
     pub const SPILLED: u32 = 12;
-    /// Peak entries seen in a spill/deferred queue.
+    /// Peak entries seen in a job queue (the deferred one counts deferrals that
+    /// found it full, so it grows).
     pub const PEAK_QUEUE: u32 = 13;
     /// Triangles in successfully emitted clusters, across both phases.
     pub const TRIANGLES: u32 = 14;
@@ -466,6 +517,7 @@ pub fn wgsl_constants() -> String {
     u("VGC_ST_STATS", state::STATS);
     u("VGC_ST_Q_TAIL", state::Q_TAIL);
     u("VGC_ST_Q_HEAD", state::Q_HEAD);
+    u("VGC_ST_OUTSTANDING", state::OUTSTANDING);
     u("VGC_ST_PHASE1", state::PHASE0_COUNTS);
     u("VGC_ST_RANGES", state::RANGES);
     u("VGC_ST_ARGS", state::ARGS);
@@ -498,6 +550,7 @@ pub fn wgsl_constants() -> String {
         ("PEAK_QUEUE", stats::PEAK_QUEUE),
         ("TRIANGLES", stats::TRIANGLES),
         ("ROOT_SHORTCUT", stats::ROOT_SHORTCUT),
+        ("COUNT", stats::COUNT),
     ] {
         u(&format!("VGC_STAT_{name}"), v);
     }

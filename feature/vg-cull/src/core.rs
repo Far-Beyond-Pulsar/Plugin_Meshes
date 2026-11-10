@@ -14,9 +14,11 @@ use crate::{
     FLAG_SW_MASKED, FLAG_TWO_PHASE, MAX_BIN_CAPACITY,
 };
 
+/// Stride of the per-phase uniform blocks (dynamic-offset alignment).
 const ROUND_STRIDE: u64 = 256;
-/// Queue slots: A, B, deferred. (A fourth cursor, the sink, has no storage.)
-const QUEUES: u64 = 3;
+/// Job queues: the early phase's, and the deferred work the late phase starts
+/// from (see the crate docs, "Traversal").
+const QUEUES: u64 = 2;
 
 /// Tunables. Defaults match the plan (tau 1 px, SW at <= 2 px edges).
 #[derive(Clone, Debug)]
@@ -35,11 +37,9 @@ pub struct VgCullConfig {
     pub mode: VgMode,
     /// Last-frame-visible-first occlusion with a Hi-Z hook between phases.
     pub two_phase_occlusion: bool,
-    /// Traversal rounds per phase. Round `r+1` only runs work that round `r`
-    /// redistributed after bounded local traversal, or spilled from a full
-    /// workgroup stack. The final round drains its remaining work locally.
-    pub rounds: u32,
-    /// Cap on persistent workgroups per round.
+    /// Persistent workgroups of a phase's traversal dispatch. Any value is
+    /// correct (workgroups that do not fit on the GPU at once start late and
+    /// find the work done); more than fit only adds idle polling.
     pub max_groups: u32,
     /// Initial entries per bin. The default is the ceiling [`MAX_BIN_CAPACITY`]:
     /// a bin that overflows drops clusters for that frame, and growing only after
@@ -75,11 +75,10 @@ impl Default for VgCullConfig {
         Self {
             tau_px: 1.0,
             sw_edge_px: 2.0,
-            tile_density_limit: 16.0,
+            tile_density_limit: 8.0,
             prefetch_factor: 2.0,
             mode: VgMode::Auto,
             two_phase_occlusion: true,
-            rounds: 4,
             max_groups: 256,
             initial_bin_capacity: MAX_BIN_CAPACITY,
             initial_queue_capacity: 1 << 20,
@@ -132,27 +131,36 @@ pub struct VgCullFrame {
 /// grow; pass wrappers re-read it each frame.
 pub struct VgCullBuffers {
     pub visible: wgpu::Buffer,
+    /// Every word the cull writes with atomics: the counters, ranges and args
+    /// ([`crate::state`], words `0..state::WORDS`), then from
+    /// [`state::HISTORY`] this frame's visibility/hysteresis marks
+    /// (`history_words`) and the tile block at [`Self::tile_base`]
+    /// ([`crate::TILE_WORDS`] words per tile, see the crate docs).
     pub state: wgpu::Buffer,
     pub queues: wgpu::Buffer,
-    /// Two visibility halves (`history_words` each), then the tile block:
-    /// [`crate::TILE_WORDS`] words per tile (see the crate docs).
-    pub history: wgpu::Buffer,
+    /// What the traversal only reads, copied from `state` at the start of the
+    /// early phase: last frame's marks (`history_words`), then the tile block
+    /// with this frame's valve scales (at word `history_words`). Bound
+    /// read-only, so the per-job lookups are cached loads, not L2 atomics.
+    pub history_ro: wgpu::Buffer,
     pub bin_capacity: u32,
     pub queue_capacity: u32,
-    /// `u32` words per history half.
+    /// `u32` words of the visibility/hysteresis mark set.
     pub history_words: u32,
     /// The 16x16 tile grid of the screen the tile block is sized for.
     pub tiles: [u32; 2],
 }
 
 impl VgCullBuffers {
-    /// Word offset of the tile block in `history`.
+    /// Word offset of the tile block in `state`.
     pub fn tile_base(&self) -> u32 {
-        2 * self.history_words
+        state::HISTORY + self.history_words
     }
-}
 
-impl VgCullBuffers {
+    fn tile_block_words(tiles: [u32; 2]) -> u64 {
+        u64::from(crate::TILE_WORDS) * u64::from(tiles[0]) * u64::from(tiles[1])
+    }
+
     fn new(
         device: &wgpu::Device,
         bin_capacity: u32,
@@ -171,19 +179,16 @@ impl VgCullBuffers {
                 mapped_at_creation: false,
             })
         };
+        let (state, history_ro) = Self::history_buffers(device, history_words, tiles);
         Self {
             visible: mk(
                 "VgCull Visible",
                 crate::BIN_COUNT as u64 * bin_capacity as u64 * 8,
                 storage,
             ),
-            state: mk(
-                "VgCull State",
-                state::WORDS as u64 * 4,
-                storage | wgpu::BufferUsages::INDIRECT,
-            ),
+            state,
             queues: mk("VgCull Queues", QUEUES * queue_capacity as u64 * 8, storage),
-            history: Self::history_buffer(device, history_words, tiles),
+            history_ro,
             bin_capacity,
             queue_capacity,
             history_words,
@@ -191,27 +196,42 @@ impl VgCullBuffers {
         }
     }
 
-    fn history_buffer(device: &wgpu::Device, history_words: u32, tiles: [u32; 2]) -> wgpu::Buffer {
-        let words = 2 * u64::from(history_words)
-            + u64::from(crate::TILE_WORDS) * u64::from(tiles[0]) * u64::from(tiles[1]);
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("VgCull History"),
-            size: (words * 4).max(16),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
+    /// `state` and `history_ro`, sized for the mark set and the tile grid.
+    fn history_buffers(
+        device: &wgpu::Device,
+        history_words: u32,
+        tiles: [u32; 2],
+    ) -> (wgpu::Buffer, wgpu::Buffer) {
+        let usage =
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+        let tile_words = Self::tile_block_words(tiles);
+        let state_words = u64::from(state::HISTORY) + u64::from(history_words) + tile_words;
+        let ro_words = u64::from(history_words) + tile_words;
+        let state = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("VgCull State"),
+            size: state_words * 4,
+            usage: usage | wgpu::BufferUsages::INDIRECT,
             mapped_at_creation: false,
-        })
+        });
+        let history_ro = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("VgCull History (read-only copy)"),
+            size: (ro_words * 4).max(16),
+            usage,
+            mapped_at_creation: false,
+        });
+        (state, history_ro)
     }
 
-    /// These buffers with the tile block resized for a new screen grid: only the
-    /// history buffer is replaced (a window resize must not reallocate the bins).
+    /// These buffers with the tile block resized for a new screen grid: only
+    /// `state` and its read-only copy are replaced (a window resize must not
+    /// reallocate the bins).
     fn with_tiles(&self, device: &wgpu::Device, tiles: [u32; 2]) -> Self {
+        let (state, history_ro) = Self::history_buffers(device, self.history_words, tiles);
         Self {
             visible: self.visible.clone(),
-            state: self.state.clone(),
+            state,
             queues: self.queues.clone(),
-            history: Self::history_buffer(device, self.history_words, tiles),
+            history_ro,
             bin_capacity: self.bin_capacity,
             queue_capacity: self.queue_capacity,
             history_words: self.history_words,
@@ -233,8 +253,8 @@ struct GpuParams {
     bin_capacity: u32,
     queue_capacity: u32,
     history_bits_mask: u32,
-    hist_read_base: u32,
-    hist_write_base: u32,
+    hist_base: u32,
+    ro_tile_base: u32,
     flags: u32,
     dense_tiles_x: u32,
     dense_tiles_y: u32,
@@ -249,11 +269,10 @@ struct GpuParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuRound {
-    src: u32,
-    dst: u32,
+struct GpuPhase {
     phase: u32,
     hiz_valid: u32,
+    _pad: [u32; 2],
 }
 
 struct Readback {
@@ -267,7 +286,7 @@ struct Readback {
 struct Pipelines {
     tiles: wgpu::ComputePipeline,
     seed: wgpu::ComputePipeline,
-    prepare: wgpu::ComputePipeline,
+    phase_init: wgpu::ComputePipeline,
     traverse: wgpu::ComputePipeline,
     finalize: wgpu::ComputePipeline,
 }
@@ -283,10 +302,8 @@ pub struct VgCullCore {
     pipelines: Pipelines,
     bgl0: wgpu::BindGroupLayout,
     bg1: wgpu::BindGroup,
-    bg2: wgpu::BindGroup,
     params_buf: wgpu::Buffer,
     round_buf: wgpu::Buffer,
-    dispatch_args: wgpu::Buffer,
     sampler: wgpu::Sampler,
     dummy_view: wgpu::TextureView,
     dummy_buf: wgpu::Buffer,
@@ -298,6 +315,8 @@ pub struct VgCullCore {
     pending_capacity_stats: Option<Vec<u32>>,
     size: (u32, u32),
     prepared: bool,
+    /// An early phase deferred work that no late phase has taken yet.
+    late_owed: bool,
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -360,40 +379,34 @@ impl VgCullCore {
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
             count: None,
         });
-        for b in 18..=21 {
+        // 18..=20 state, queues, visible; 21 the read-only history copy; 22
+        // materials.
+        for b in 18..=20 {
             entries0.push(storage_entry(b, false));
         }
+        entries0.push(storage_entry(21, true));
         entries0.push(storage_entry(22, true));
         let bgl0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("VgCull BGL0"),
             entries: &entries0,
         });
         let bgl1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("VgCull BGL1 (round)"),
+            label: Some("VgCull BGL1 (phase)"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: true,
-                    min_binding_size: NonZeroU64::new(std::mem::size_of::<GpuRound>() as u64),
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<GpuPhase>() as u64),
                 },
                 count: None,
             }],
-        });
-        let bgl2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("VgCull BGL2 (dispatch args)"),
-            entries: &[storage_entry(0, false)],
         });
 
         let pl2 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("VgCull PL"),
             bind_group_layouts: &[Some(&bgl0), Some(&bgl1)],
-            immediate_size: 0,
-        });
-        let pl3 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("VgCull PL prepare"),
-            bind_group_layouts: &[Some(&bgl0), Some(&bgl1), Some(&bgl2)],
             immediate_size: 0,
         });
         let pipeline = |label: &str, layout: &wgpu::PipelineLayout, entry: &str| {
@@ -412,7 +425,7 @@ impl VgCullCore {
         let pipelines = Pipelines {
             tiles: pipeline("VgCull Tiles", &pl2, "cs_tiles"),
             seed: pipeline("VgCull Seed", &pl2, "cs_seed"),
-            prepare: pipeline("VgCull RoundPrepare", &pl3, "cs_round_prepare"),
+            phase_init: pipeline("VgCull PhaseInit", &pl2, "cs_phase_init"),
             traverse: pipeline("VgCull Traverse", &pl2, "cs_traverse"),
             finalize: pipeline("VgCull Finalize", &pl2, "cs_finalize"),
         };
@@ -423,19 +436,10 @@ impl VgCullCore {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let round_blocks = 2 * config.rounds.max(1) as u64 + 2;
         let round_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("VgCull Rounds"),
-            size: round_blocks * ROUND_STRIDE,
+            label: Some("VgCull Phases"),
+            size: 2 * ROUND_STRIDE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let dispatch_args = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("VgCull DispatchArgs"),
-            size: 16,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::INDIRECT
-                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -446,16 +450,8 @@ impl VgCullCore {
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &round_buf,
                     offset: 0,
-                    size: NonZeroU64::new(std::mem::size_of::<GpuRound>() as u64),
+                    size: NonZeroU64::new(std::mem::size_of::<GpuPhase>() as u64),
                 }),
-            }],
-        });
-        let bg2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("VgCull BG2"),
-            layout: &bgl2,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: dispatch_args.as_entire_binding(),
             }],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -505,10 +501,8 @@ impl VgCullCore {
             pipelines,
             bgl0,
             bg1,
-            bg2,
             params_buf,
             round_buf,
-            dispatch_args,
             sampler,
             dummy_view,
             dummy_buf,
@@ -526,6 +520,7 @@ impl VgCullCore {
             pending_capacity_stats: None,
             size: (1, 1),
             prepared: false,
+            late_owed: false,
         }
     }
 
@@ -555,8 +550,7 @@ impl VgCullCore {
     }
 
     /// Start of frame: finish any stats read-back (growing capacities), size
-    /// advance the history
-    /// parity and upload the frame constants.
+    /// the tile block for the screen and upload the frame constants.
     pub fn begin_frame(
         &mut self,
         device: &wgpu::Device,
@@ -622,7 +616,6 @@ impl VgCullCore {
         let b = &self.buffers;
         self.frame += 1;
         self.size = (frame.width.max(1), frame.height.max(1));
-        let parity = (self.frame & 1) as u32;
         let mut flags = 0;
         if self.config.two_phase_occlusion {
             flags |= FLAG_TWO_PHASE;
@@ -653,8 +646,8 @@ impl VgCullCore {
             bin_capacity: b.bin_capacity,
             queue_capacity: b.queue_capacity,
             history_bits_mask: b.history_words * 32 - 1,
-            hist_read_base: (1 - parity) * b.history_words,
-            hist_write_base: parity * b.history_words,
+            hist_base: state::HISTORY,
+            ro_tile_base: b.history_words,
             flags,
             dense_tiles_x: inputs.dense_tiles[0].max(1),
             dense_tiles_y: inputs.dense_tiles[1].max(1),
@@ -716,64 +709,63 @@ impl VgCullCore {
         phase: u32,
     ) {
         let b = self.buffers.clone();
-        let rounds = self.config.rounds.max(1);
+        let marks_bytes = u64::from(state::HISTORY) * 4;
+        let hist_bytes = u64::from(b.history_words) * 4;
         if phase == 0 {
-            rec.clear_buffer(&b.state, 0, None);
-            let parity = (self.frame & 1) as u64;
-            rec.clear_buffer(
-                &b.history,
-                parity * b.history_words as u64 * 4,
-                Some(b.history_words as u64 * 4),
-            );
+            // Last frame's marks become this frame's read-only set, then the
+            // counters and the marks start over. Nothing writes the read set
+            // during the frame, so both phases read the same snapshot.
+            rec.copy_buffer_to_buffer(&b.state, marks_bytes, &b.history_ro, 0, hist_bytes);
+            rec.clear_buffer(&b.state, 0, Some(marks_bytes + hist_bytes));
+            // The queues are all zero between phases (every reserved slot is
+            // taken and zeroed), except the deferred queue when the early
+            // phase's deferrals were never taken by a late phase.
+            if self.late_owed {
+                let q = u64::from(b.queue_capacity) * 8;
+                rec.clear_buffer(&b.queues, q, Some(q));
+            }
+            self.late_owed = self.config.two_phase_occlusion;
+        } else {
+            self.late_owed = false;
         }
         // Phase 0 trusts last frame's Hi-Z only from the second frame on
         // (frame 1 has no previous depth). Stale-but-valid is still safe.
         let hiz_valid =
             self.config.two_phase_occlusion && hiz.is_some() && (phase == 1 || self.frame >= 2);
 
-        for r in 0..rounds {
-            let (src, mut dst) = if phase == 0 {
-                if r % 2 == 0 {
-                    (0, 1)
-                } else {
-                    (1, 0)
-                }
-            } else if r == 0 {
-                (2, 0)
-            } else {
-                let s = (r - 1) % 2;
-                (s, 1 - s)
-            };
-            if r == rounds - 1 {
-                dst = 3;
-            }
-            let block = phase as u64 * rounds as u64 + r as u64;
-            let round = GpuRound {
-                src,
-                dst,
-                phase,
-                hiz_valid: hiz_valid as u32,
-            };
-            queue.write_buffer(
-                &self.round_buf,
-                block * ROUND_STRIDE,
-                bytemuck::bytes_of(&round),
-            );
-        }
-        let fin_block = 2 * rounds as u64 + phase as u64;
-        let fin = GpuRound {
-            src: 0,
-            dst: 0,
-            phase,
-            hiz_valid: 0,
-        };
+        let block = u64::from(phase) * ROUND_STRIDE;
         queue.write_buffer(
             &self.round_buf,
-            fin_block * ROUND_STRIDE,
-            bytemuck::bytes_of(&fin),
+            block,
+            bytemuck::bytes_of(&GpuPhase {
+                phase,
+                hiz_valid: hiz_valid as u32,
+                _pad: [0; 2],
+            }),
         );
 
         let bg0 = self.bind_group0(device, camera, inputs, hiz, phase as usize, &b);
+        if phase == 0 {
+            // The valve scales of this frame, then their read-only copy (the
+            // tile words the traversal accumulates into are copied too and
+            // never read from the copy).
+            let mut pass = rec.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("VgCull Tiles"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, &bg0, &[]);
+            pass.set_bind_group(1, &self.bg1, &[0]);
+            pass.set_pipeline(&self.pipelines.tiles);
+            pass.dispatch_workgroups((b.tiles[0] * b.tiles[1]).div_ceil(64), 1, 1);
+            drop(pass);
+            rec.copy_buffer_to_buffer(
+                &b.state,
+                u64::from(b.tile_base()) * 4,
+                &b.history_ro,
+                hist_bytes,
+                VgCullBuffers::tile_block_words(b.tiles) * 4,
+            );
+        }
         let mut pass = rec.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some(if phase == 0 {
                 "VgCull Early"
@@ -783,23 +775,18 @@ impl VgCullCore {
             timestamp_writes: None,
         });
         pass.set_bind_group(0, &bg0, &[]);
-        if phase == 0 {
-            pass.set_bind_group(1, &self.bg1, &[0]);
-            pass.set_pipeline(&self.pipelines.tiles);
-            pass.dispatch_workgroups((b.tiles[0] * b.tiles[1]).div_ceil(64), 1, 1);
-            pass.set_pipeline(&self.pipelines.seed);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
-        for r in 0..rounds {
-            let block = phase as u64 * rounds as u64 + r as u64;
-            pass.set_bind_group(1, &self.bg1, &[(block * ROUND_STRIDE) as u32]);
-            pass.set_pipeline(&self.pipelines.prepare);
-            pass.set_bind_group(2, &self.bg2, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-            pass.set_pipeline(&self.pipelines.traverse);
-            pass.dispatch_workgroups_indirect(&self.dispatch_args, 0);
-        }
-        pass.set_bind_group(1, &self.bg1, &[(fin_block * ROUND_STRIDE) as u32]);
+        pass.set_bind_group(1, &self.bg1, &[block as u32]);
+        // The phase's queued work: the root (early), the early phase's
+        // deferrals (late).
+        pass.set_pipeline(if phase == 0 {
+            &self.pipelines.seed
+        } else {
+            &self.pipelines.phase_init
+        });
+        pass.dispatch_workgroups(1, 1, 1);
+        // The whole traversal, one persistent dispatch (see the crate docs).
+        pass.set_pipeline(&self.pipelines.traverse);
+        pass.dispatch_workgroups(self.config.max_groups.max(1), 1, 1);
         pass.set_pipeline(&self.pipelines.finalize);
         pass.dispatch_workgroups(1, 1, 1);
         drop(pass);
@@ -842,7 +829,7 @@ impl VgCullCore {
             &b.state,
             &b.queues,
             &b.visible,
-            &b.history,
+            &b.history_ro,
         ]);
         bufs.push(materials);
         let key: Vec<wgpu::Buffer> = bufs.iter().map(|b| (*b).clone()).collect();
