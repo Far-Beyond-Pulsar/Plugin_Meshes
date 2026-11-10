@@ -377,6 +377,22 @@ fn read_vgeo_with(cache: &Path, content: u128, force: bool) -> Option<Arc<VgeoBy
 
 // ── cooking ──────────────────────────────────────────────────────────────────
 
+/// Content id of a sectioned mesh: [`stable_content_id`] when there is one
+/// section (`tri_material` empty, so single-material caches keep their id),
+/// else that id mixed with the per-triangle section of every triangle.
+pub fn sectioned_content_id(vertices: &[PackedVertex], indices: &[u32], tri_material: &[u32]) -> u128 {
+    let base = stable_content_id(vertices, indices);
+    if tri_material.is_empty() {
+        return base;
+    }
+    let (mut low, mut high) = (base as u64, (base >> 64) as u64);
+    for byte in bytemuck::cast_slice::<u32, u8>(tri_material).iter().copied() {
+        low = (low ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        high = (high ^ u64::from(byte).rotate_left(1)).wrapping_mul(0x9e3779b185ebca87);
+    }
+    (u128::from(high) << 64) | u128::from(low)
+}
+
 pub fn stable_content_id(vertices: &[PackedVertex], indices: &[u32]) -> u128 {
     let mut low = 0xcbf29ce484222325u64;
     let mut high = 0x84222325cbf29ce4u64;
@@ -417,6 +433,7 @@ pub fn load_or_build_vgeo_cache(
     content_id: u128,
     vertices: &[PackedVertex],
     indices: &[u32],
+    tri_material: &[u32],
     cache: &Path,
 ) -> Result<(Arc<VgeoBytes>, bool), String> {
     if let Some(vgeo) = read_vgeo(cache, content_id) {
@@ -429,7 +446,7 @@ pub fn load_or_build_vgeo_cache(
         attributes: &attributes,
         attribute_stride: helio_vg_format::ATTR_STRIDE as usize,
         indices: &indices[..indices.len() / 3 * 3],
-        tri_material: &[],
+        tri_material,
     };
     let bytes = helio_vg_build::build_vgeo(
         &mesh,
@@ -694,10 +711,10 @@ mod tests {
         let dir = scratch("cook");
         let (vertices, indices) = grid(40);
         let content = stable_content_id(&vertices, &indices);
-        let (_, hit) = load_or_build_vgeo_cache(content, &vertices, &indices, &dir).unwrap();
+        let (_, hit) = load_or_build_vgeo_cache(content, &vertices, &indices, &[], &dir).unwrap();
         assert!(!hit);
         assert!(read_vgeo(&dir, content).is_some());
-        let (_, hit) = load_or_build_vgeo_cache(content, &vertices, &indices, &dir).unwrap();
+        let (_, hit) = load_or_build_vgeo_cache(content, &vertices, &indices, &[], &dir).unwrap();
         assert!(hit);
         // A different content id is its own cache entry.
         assert!(read_vgeo(&dir, content ^ 1).is_none());
@@ -709,7 +726,7 @@ mod tests {
         let dir = scratch("force");
         let (vertices, indices) = grid(40);
         let content = stable_content_id(&vertices, &indices);
-        load_or_build_vgeo_cache(content, &vertices, &indices, &dir).unwrap();
+        load_or_build_vgeo_cache(content, &vertices, &indices, &[], &dir).unwrap();
         // As if a new run: nothing cooked yet.
         recooked().lock().unwrap().remove(&content);
         assert!(
@@ -731,7 +748,7 @@ mod tests {
             let _ = read_vgeo_with(&dir, content, true);
             let bytes_before = std::fs::read(vgeo_path(&dir, content)).unwrap();
             std::fs::remove_file(vgeo_path(&dir, content)).unwrap();
-            let r = load_or_build_vgeo_cache(content, &vertices, &indices, &dir).unwrap();
+            let r = load_or_build_vgeo_cache(content, &vertices, &indices, &[], &dir).unwrap();
             assert_eq!(
                 std::fs::read(vgeo_path(&dir, content)).unwrap(),
                 bytes_before,

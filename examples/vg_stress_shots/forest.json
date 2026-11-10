@@ -1,0 +1,8 @@
+{
+  "shots": [
+    { "name": "forest-ground", "camera": { "position": [50.0, 44.5, 50.0], "look_at": [150.0, 52.0, 10.0], "fov_deg": 60 }, "resolution": [1920, 1080], "settle_frames": 300, "post": true },
+    { "name": "forest-valley", "camera": { "position": [0.0, 70.0, 0.0], "look_at": [-600.0, 180.0, -500.0], "fov_deg": 60 }, "resolution": [1920, 1080], "settle_frames": 300, "post": true },
+    { "name": "forest-overview", "camera": { "position": [700.0, 150.0, -600.0], "look_at": [-700.0, 220.0, -700.0], "fov_deg": 60 }, "resolution": [1920, 1080], "settle_frames": 300, "post": true },
+    { "name": "forest-peaks", "camera": { "position": [-300.0, 260.0, 300.0], "look_at": [-1100.0, 330.0, -1000.0], "fov_deg": 60 }, "resolution": [1920, 1080], "settle_frames": 300, "post": true }
+  ]
+}

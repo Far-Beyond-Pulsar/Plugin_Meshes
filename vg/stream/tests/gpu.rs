@@ -64,6 +64,99 @@ fn read_buffer(
 const PAGES: u32 = 12;
 const ROOTS: u32 = 2;
 
+#[test]
+fn contended_feedback_preserves_requests_touches_and_urgency_after_reset() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no wgpu adapter; skipping");
+        return;
+    };
+    let layout = FeedbackLayout::new(128, 128);
+    let initial = layout.initial_words();
+    let feedback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("contended page feedback"),
+        size: layout.total_bytes(),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let residency = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("feedback test residency"),
+        size: 128 * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let pages: Vec<u32> = (0..128)
+        .map(|p| if p < 32 { p } else { PAGE_NOT_RESIDENT })
+        .collect();
+    queue.write_buffer(&residency, 0, bytemuck::cast_slice(&pages));
+    let source = format!(
+        "const VG_PAGE_NOT_RESIDENT: u32 = 0xffffffffu;
+         @group(0) @binding(0) var<storage, read_write> vg_feedback: array<atomic<u32>>;
+         @group(0) @binding(1) var<storage, read> vg_residency: array<u32>;
+         {}
+         @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
+             let page = id.x % 128u;
+             vg_demand_page(page, false);
+             vg_demand_page(page, true);
+             vg_use_or_request_page(page);
+         }}",
+        WGSL_FEEDBACK
+    );
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("contended feedback"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: feedback.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: residency.as_entire_binding(),
+            },
+        ],
+    });
+    // Repeated dispatches exercise both first-writer races and already-set bits;
+    // a new epoch must record the same pages again, including urgent upgrades.
+    for _ in 0..2 {
+        queue.write_buffer(&feedback, 0, bytemuck::cast_slice(&initial));
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            for _ in 0..3 {
+                pass.dispatch_workgroups(1024, 1, 1);
+            }
+        }
+        queue.submit([enc.finish()]);
+        let bytes = read_buffer(&device, &queue, &feedback, 0, layout.total_bytes());
+        let words: Vec<u32> = bytemuck::pod_collect_to_vec(&bytes);
+        assert_eq!(
+            words[0], 96,
+            "one append per missing page despite contention"
+        );
+        let decoded = feedback::decode(&words, layout, 128);
+        assert_eq!(decoded.requests, (32..128).collect::<Vec<_>>());
+        assert_eq!(decoded.urgent, decoded.requests);
+        assert_eq!(decoded.used, (0..32).collect::<Vec<_>>());
+        assert!(!decoded.overflowed);
+    }
+}
+
 fn shader() -> String {
     format!(
         "{}\n@group(1) @binding(0) var<storage, read_write> out_slots: array<u32>;\n\

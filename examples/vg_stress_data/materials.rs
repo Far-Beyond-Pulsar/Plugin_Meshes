@@ -37,6 +37,37 @@ pub enum Mat {
     StatueLimestone,
     /// `(index in catalog::TREES, slot index)`; textured from the tree glTF.
     Tree(u8, u8),
+    /// `(index in catalog::TREES, slot index, tint bucket)`: the same glTF
+    /// material with its base colour multiplied by [`tint`], so one species
+    /// does not read as copies. Forest scene only.
+    TreeTint(u8, u8, u8),
+    /// Terrain surface: 0 forest floor, 1 rock (`catalog::GROUNDS`).
+    Terrain(u8),
+}
+
+/// Tint buckets per tree material in the forest scene.
+pub const TINT_BUCKETS: u8 = 6;
+
+/// Base-colour multiplier of tint bucket `bucket`. Leaf and needle cards
+/// (`masked`, or fallback-green slots) shift hue and value (young yellow-green
+/// to old blue-green, some autumn-dry); bark only varies in value, because
+/// tinting a photographed bark hue looks painted.
+pub fn tint(bucket: u8, foliage: bool) -> [f32; 3] {
+    const FOLIAGE: [[f32; 3]; TINT_BUCKETS as usize] = [
+        [1.00, 1.00, 1.00],
+        [1.12, 1.08, 0.78],
+        [0.86, 1.00, 0.92],
+        [0.94, 0.90, 0.80],
+        [1.20, 1.04, 0.70],
+        [0.80, 0.92, 0.96],
+    ];
+    const BARK: [f32; TINT_BUCKETS as usize] = [1.0, 1.12, 0.88, 0.96, 1.2, 0.8];
+    let b = (bucket % TINT_BUCKETS) as usize;
+    if foliage {
+        FOLIAGE[b]
+    } else {
+        [BARK[b]; 3]
+    }
 }
 
 /// Scalar surface values of a material.
@@ -75,13 +106,32 @@ impl Mat {
     /// Every material the scene needs for `config` (scalar ones plus the
     /// material slots of the selected trees).
     pub fn all(config: &Config) -> Vec<Mat> {
+        let forest = config.scene == catalog::Scene::Forest;
         let mut v = Self::SCALAR.to_vec();
+        if forest {
+            v.extend((0..catalog::GROUNDS.len() as u8).map(Mat::Terrain));
+        }
         for (ti, tree) in catalog::TREES.iter().enumerate() {
             if config.has_tree(tree.id) {
                 v.extend((0..tree.slots.len()).map(|si| Mat::Tree(ti as u8, si as u8)));
+                if forest {
+                    for si in 0..tree.slots.len() {
+                        v.extend(
+                            (0..TINT_BUCKETS).map(|b| Mat::TreeTint(ti as u8, si as u8, b)),
+                        );
+                    }
+                }
             }
         }
         v
+    }
+
+    /// The material of tree `tree_id`'s glTF slot `slot` in tint bucket `bucket`.
+    pub fn tree_slot_tinted(tree_id: &str, slot: &str, bucket: u8) -> Option<Mat> {
+        match Self::tree_slot(tree_id, slot)? {
+            Mat::Tree(t, s) => Some(Mat::TreeTint(t, s, bucket % TINT_BUCKETS)),
+            _ => None,
+        }
     }
 
     /// The material of tree `tree_id`'s glTF slot `slot`.
@@ -116,7 +166,11 @@ impl Mat {
             Mat::StatueGreenStone => "statue_green_stone",
             Mat::StatueBronze => "statue_bronze",
             Mat::StatueLimestone => "statue_limestone",
-            Mat::Tree(t, s) => catalog::TREES[t as usize].slots[s as usize].name,
+            Mat::Tree(t, s) | Mat::TreeTint(t, s, _) => {
+                catalog::TREES[t as usize].slots[s as usize].name
+            }
+            Mat::Terrain(0) => "terrain_forest_floor",
+            Mat::Terrain(_) => "terrain_rock",
         }
     }
 
@@ -127,6 +181,7 @@ impl Mat {
             Mat::MarbleCartago => Some("grey_cartago_01"),
             Mat::MarbleGrey => Some("grey_cartago_03"),
             Mat::MarbleMosaic => Some("marble_mosaic_tiles"),
+            Mat::Terrain(i) => catalog::GROUNDS.get(i as usize).map(|g| g.id),
             _ => None,
         }
     }
@@ -134,7 +189,7 @@ impl Mat {
     /// `(tree, slot)` of a tree material.
     pub fn tree_part(self) -> Option<(&'static catalog::TreeDef, &'static catalog::TreeSlot)> {
         match self {
-            Mat::Tree(t, s) => {
+            Mat::Tree(t, s) | Mat::TreeTint(t, s, _) => {
                 let tree = &catalog::TREES[t as usize];
                 Some((tree, &tree.slots[s as usize]))
             }
@@ -178,14 +233,39 @@ impl Mat {
             Mat::StatueGreenStone => s([0.06, 0.20, 0.12, 1.0], 0.0, 0.10),
             Mat::StatueBronze => s([0.50, 0.30, 0.12, 1.0], 1.0, 0.24),
             Mat::StatueLimestone => s([0.70, 0.64, 0.52, 1.0], 0.0, 0.55),
-            Mat::Tree(..) => {
+            Mat::Tree(..) | Mat::TreeTint(..) => {
                 let (_, slot) = self.tree_part().unwrap();
+                let rgb = match self {
+                    // A glTF slot's texture carries the colour; the tint scales it.
+                    Mat::TreeTint(_, _, b) => tint(b, slot.masked || slot.fallback[1] > slot.fallback[0]),
+                    _ => [1.0; 3],
+                };
                 s(
-                    [slot.fallback[0], slot.fallback[1], slot.fallback[2], 1.0],
+                    [
+                        slot.fallback[0] * rgb[0],
+                        slot.fallback[1] * rgb[1],
+                        slot.fallback[2] * rgb[2],
+                        1.0,
+                    ],
                     0.0,
                     0.85,
                 )
             }
+            Mat::Terrain(0) => s([0.20, 0.16, 0.10, 1.0], 0.0, 0.95),
+            Mat::Terrain(_) => s([0.30, 0.29, 0.27, 1.0], 0.0, 0.9),
+        }
+    }
+
+    /// Base colour factor once the base-colour texture is bound: the texture
+    /// carries the colour, a tinted material only scales it.
+    pub fn texture_tint(self) -> [f32; 4] {
+        match self {
+            Mat::TreeTint(_, _, b) => {
+                let (_, slot) = self.tree_part().unwrap();
+                let [r, g, bl] = tint(b, slot.masked || slot.fallback[1] > slot.fallback[0]);
+                [r, g, bl, 1.0]
+            }
+            _ => [1.0; 4],
         }
     }
 

@@ -992,34 +992,98 @@ fn redistributed_frontier_matches_reference_without_lost_or_duplicate_clusters()
     let view = set_camera(&g, &r, [0.0, 0.0, 700.0]);
     let (want, _) = expected(&s, &view, 0.01, VgMode::Auto);
     assert!(want.len() > 4000);
-    for rounds in [2, 4, 8] {
-        for max_groups in [1, 256] {
-            let mut core = VgCullCore::new(
-                &g.device,
-                VgCullConfig {
-                    rounds,
-                    max_groups,
-                    two_phase_occlusion: false,
-                    tau_px: 0.01,
-                    initial_bin_capacity: 32768,
-                    initial_queue_capacity: 65536,
-                    ..Default::default()
-                },
-            );
+    // One persistent dispatch per phase, any workgroup count, and a job queue
+    // from roomy down to the minimum (shares that do not fit stay in the
+    // deque): the cut is exact, nothing lost or duplicated.
+    for (max_groups, queue_capacity) in [(1, 65536), (4, 65536), (256, 65536), (1, 256), (256, 256)] {
+        let mut core = VgCullCore::new(
+            &g.device,
+            VgCullConfig {
+                max_groups,
+                two_phase_occlusion: false,
+                tau_px: 0.01,
+                initial_bin_capacity: 32768,
+                initial_queue_capacity: queue_capacity,
+                ..Default::default()
+            },
+        );
+        r.reset_feedback(&g);
+        begin(&g, &mut core, &r);
+        run_phase(&g, &mut core, &r, 0);
+        let (out, _) = collect(&g, &core, &r, 0);
+        let what = format!("groups={max_groups}, queue={queue_capacity}");
+        assert_eq!(out.items, want, "{what}");
+        let stat = |i: u32| out.state[(state::STATS + i) as usize];
+        assert_eq!(stat(stats::JOB_OVERFLOW), 0, "{what}");
+        assert_eq!(stat(stats::VISIBLE_OVERFLOW), 0, "{what}");
+        assert!(stat(stats::PEAK_QUEUE) <= queue_capacity, "{what}");
+        assert_eq!(out.state[state::OUTSTANDING as usize], 0, "{what}");
+        if max_groups > 1 {
+            assert!(stat(stats::SPILLED) > 0, "{what}: work was never shared");
+        }
+    }
+}
+
+/// The two phases share the work through the deferred queue: their cuts are
+/// disjoint and together the reference, for any workgroup count and a
+/// minimum-size queue, and the queues are left clean for the next frame.
+#[test]
+fn two_phase_persistent_traversal_splits_the_cut_without_loss() {
+    use helio_pass_vg_bvh::{BvhMode, VgBvhPass};
+    let Some(g) = gpu() else {
+        return;
+    };
+    let mut s = scene(false);
+    let template = s.instances[0];
+    s.instances = (0..64)
+        .map(|i| {
+            let mut instance = template;
+            instance.matrix[12] = (i % 8) as f32 * 3.0 - 12.0;
+            instance.matrix[13] = (i / 8) as f32 * 3.0 - 12.0;
+            instance.inst.object_row = i;
+            instance
+        })
+        .collect();
+    let mut r = upload(&g, &s);
+    let mut bvh = VgBvhPass::new(&g.device);
+    bvh.run_for_testing(&g.device, &g.queue, &r.instances, &r.objects, BvhMode::Rebuild);
+    r.bvh_nodes = bvh.nodes_buffer().clone();
+    r.bvh_header = bvh.header_buffer().clone();
+    r.bvh_items = bvh.items_buffer().clone();
+    for max_groups in [1, 256] {
+        let mut core = VgCullCore::new(
+            &g.device,
+            VgCullConfig {
+                max_groups,
+                tau_px: 0.05,
+                initial_bin_capacity: 32768,
+                initial_queue_capacity: 256,
+                ..Default::default()
+            },
+        );
+        flush_history(&g, &mut core, &r);
+        // The same view each frame, so the hysteresis memory agrees with the
+        // stateless reference; frame 0 defers everything (empty history), the
+        // later frames replay it in the early phase.
+        for frame in 0..3 {
+            let view = set_camera(&g, &r, [0.0, 0.0, 700.0]);
+            let (want, _) = expected(&s, &view, 0.05, VgMode::Auto);
             r.reset_feedback(&g);
             begin(&g, &mut core, &r);
             run_phase(&g, &mut core, &r, 0);
-            let (out, _) = collect(&g, &core, &r, 0);
-            assert_eq!(out.items, want, "rounds={rounds}, groups={max_groups}");
-            assert_eq!(out.state[(state::STATS + stats::JOB_OVERFLOW) as usize], 0);
-            assert_eq!(
-                out.state[(state::STATS + stats::VISIBLE_OVERFLOW) as usize],
-                0
-            );
-            assert!(
-                out.state[(state::STATS + stats::SPILLED) as usize] > 0,
-                "exercise actual redistribution"
-            );
+            let (early, _) = collect(&g, &core, &r, 0);
+            run_phase(&g, &mut core, &r, 1);
+            let (late, _) = collect(&g, &core, &r, 1);
+            let what = format!("groups={max_groups}, frame {frame}");
+            assert!(early.items.is_disjoint(&late.items), "{what}: a cluster drawn in both phases");
+            let all: BTreeSet<Item> = early.items.union(&late.items).copied().collect();
+            assert_eq!(all, want, "{what}");
+            let stat = |i: u32| late.state[(state::STATS + i) as usize];
+            assert_eq!(stat(stats::JOB_OVERFLOW), 0, "{what}");
+            assert_eq!(late.state[state::OUTSTANDING as usize], 0, "{what}");
+            if frame > 0 {
+                assert!(!early.items.is_empty(), "{what}: history replayed nothing");
+            }
         }
     }
 }
@@ -1490,7 +1554,7 @@ fn prefetch_requests_children_while_the_error_is_within_the_band() {
 fn tile_block(g: &Gpu, core: &VgCullCore) -> Vec<[u32; 3]> {
     let b = core.buffers();
     let words = u64::from(b.tile_base()) + u64::from(b.tiles[0] * b.tiles[1]) * 3;
-    let all = read_words(g, &b.history, words);
+    let all = read_words(g, &b.state, words);
     all[b.tile_base() as usize..]
         .chunks_exact(3)
         .map(|c| [c[0], c[1], c[2]])
@@ -1643,7 +1707,7 @@ fn sized_frame(
 
 /// The viewport is resized repeatedly, to tiny sizes and back, with a frame
 /// rendered at each size (two-phase, so both phases' buffers are exercised). The
-/// per-tile block lives in the `history` buffer, which `with_tiles` replaces on
+/// per-tile block lives in the `state` buffer, which `with_tiles` replaces on
 /// every grid change; after each frame the buffers the passes publish must be the
 /// ones for the new grid, sized for it, readable in full, and the estimate must be
 /// in range (#1645). Any validation error panics through the uncaptured-error
@@ -1685,9 +1749,15 @@ fn viewport_resizes_keep_the_tile_block_in_step_with_the_screen() {
         assert_eq!(b.tiles, grid, "{w}x{h}: the buffers are for the old grid");
         let words = u64::from(b.tile_base()) + u64::from(TILE_WORDS) * u64::from(grid[0] * grid[1]);
         assert_eq!(
-            b.history.size(),
-            (words * 4).max(16),
-            "{w}x{h}: the history buffer is not sized for the grid"
+            b.state.size(),
+            words * 4,
+            "{w}x{h}: the state buffer is not sized for the grid"
+        );
+        let ro_words = u64::from(b.history_words) + u64::from(TILE_WORDS) * u64::from(grid[0] * grid[1]);
+        assert_eq!(
+            b.history_ro.size(),
+            (ro_words * 4).max(16),
+            "{w}x{h}: the read-only history copy is not sized for the grid"
         );
         let tiles = tile_block(&g, &core);
         assert_eq!(tiles.len() as u32, grid[0] * grid[1]);

@@ -5,10 +5,11 @@
 // Composed in Rust (see `shader_source()`): helio prelude, generated `VGC_*`
 // constants, vg_format.wgsl, helio-vg-stream bindings + helpers (binding 4..11),
 // helio-pass-vg-bvh `NODES_WGSL`, then this
-// file. Entry points: cs_tiles, cs_seed, cs_round_prepare, cs_traverse, cs_finalize.
+// file. Entry points: cs_tiles, cs_seed, cs_phase_init, cs_traverse, cs_finalize.
 //
-// Job = vec2<u32>(x, y), tag = y >> 30:
-//   0  GCBVH node          x = 0xffffffff, y = node index
+// Job = vec2<u32>(x, y), tag = y >> 30 (neither word is ever 0xffffffff: a
+// queue slot stores the complement, and 0 marks it empty):
+//   0  GCBVH node          x = 0,          y = node index
 //   1  asset hierarchy item x = instance,   y = TAG | (parent_node << 2 | slot)
 //   2  cluster item         x = instance,   y = TAG | cluster_slot (pool_slot << 11 | local)
 //   3  instance             x = instance,   y = TAG
@@ -30,8 +31,11 @@ struct CullParams {
     bin_capacity: u32,
     queue_capacity: u32,
     history_bits_mask: u32,
-    hist_read_base: u32,
-    hist_write_base: u32,
+    // Word offset in `state` of this frame's visibility/hysteresis marks (the
+    // set being written; last frame's is `hist_ro[0 ..]`).
+    hist_base: u32,
+    // Word offset in `hist_ro` of the copy of the tile block.
+    ro_tile_base: u32,
     flags: u32,
     dense_tiles_x: u32,
     dense_tiles_y: u32,
@@ -43,7 +47,7 @@ struct CullParams {
     // error exceeds tau / prefetch_k (>= 1).
     prefetch_k: f32,
     // Tile grid of the screen (16x16 px tiles) and the word offset of its
-    // per-tile block in `history` (3 words per tile: triangles, area, scale).
+    // per-tile block in `state` (3 words per tile: triangles, area, scale).
     tiles_x: u32,
     tiles_y: u32,
     tile_base: u32,
@@ -52,11 +56,11 @@ struct CullParams {
     pad2: u32,
 }
 
-struct RoundParams {
-    src: u32,
-    dst: u32,
+struct PhaseParams {
     phase: u32,
     hiz_valid: u32,
+    pad0: u32,
+    pad1: u32,
 }
 
 // GpuStaticObject row as published by the scene join (see
@@ -95,36 +99,106 @@ struct VgObjectRow {
 @group(0) @binding(15) var<storage, read> dense_mask: array<u32>;
 @group(0) @binding(16) var hiz_tex: texture_2d<f32>;
 @group(0) @binding(17) var hiz_samp: sampler;
+// Counters, args and ranges, then this frame's visibility/hysteresis marks
+// (`hist_base`) and the per-tile block (`tile_base`): every word the cull
+// writes with atomics.
 @group(0) @binding(18) var<storage, read_write> state: array<atomic<u32>>;
-@group(0) @binding(19) var<storage, read_write> queues: array<vec2<u32>>;
+// Two job queues of `queue_capacity` slots (2 words each): 0 is the early
+// phase's, 1 takes the early phase's deferred work and is the late phase's.
+// A slot holds the complemented job; 0 = not written yet (`queue_put`,
+// `queue_take`). Every slot a phase reserves is written and taken (and zeroed)
+// before the phase ends, so the buffer is all zero between phases.
+@group(0) @binding(19) var<storage, read_write> queues: array<atomic<u32>>;
 @group(0) @binding(20) var<storage, read_write> visible: array<vec2<u32>>;
-@group(0) @binding(21) var<storage, read_write> history: array<atomic<u32>>;
+// What the traversal only reads, snapshotted from `state` before it starts
+// (`VgCullCore::record_phase`): last frame's marks at 0, the tile block (with
+// this frame's valve scales) at `ro_tile_base`. Plain loads, so they are served
+// from the L1 instead of an L2 atomic per job.
+@group(0) @binding(21) var<storage, read> hist_ro: array<u32>;
 // GpuMaterial rows (24 words each); read only when VGC_FLAG_MASKED is set.
 @group(0) @binding(22) var<storage, read> vgc_materials: array<u32>;
 
-@group(1) @binding(0) var<uniform> rp: RoundParams;
-@group(2) @binding(0) var<storage, read_write> dispatch_args: array<u32>;
+@group(1) @binding(0) var<uniform> rp: PhaseParams;
 
 const WG: u32 = 64u;
-const SOURCE_CHUNK: u32 = 8u;
-const REDISTRIBUTE_WAVES: u32 = 8u;
 const STACK_CAP: u32 = 1024u;
+const STACK_MASK: u32 = 1023u;
+const NO_JOB: vec2<u32> = vec2<u32>(0xffffffffu, 0xffffffffu);
+// Bounds on spinning, so a broken invariant shows up as a counted overflow
+// instead of a device loss (never reached when the invariants hold): a taken
+// slot is written by a running workgroup right after it reserved it, and an
+// idle group only waits while some running group holds work.
+const SLOT_SPIN_MAX: u32 = 1048576u;
+const IDLE_SPIN_MAX: u32 = 1048576u;
 const INF_ERR: f32 = 1.0e30;
 const HUGE_PX: f32 = 3.0e38;
 const ROOT_ONLY_TAU: f32 = 1.0e30;
 
+// The workgroup's local deque of jobs (logical indices, `& STACK_MASK`):
+// pushed and popped at `wg_top`, shared from the bottom (`wg_bot`, the oldest
+// and coarsest jobs, the biggest subtrees). `wg_bot` only moves between
+// barriers, by thread 0.
 var<workgroup> wg_stack: array<vec2<u32>, 1024>;
-var<workgroup> wg_sp: atomic<u32>;
-var<workgroup> wg_mode: u32;
-var<workgroup> wg_n: u32;
-var<workgroup> wg_base: u32;
+var<workgroup> wg_top: atomic<u32>;
+var<workgroup> wg_bot: u32;
+
+// One wave's plan, decided by thread 0 (`wave_plan`) and read by every thread.
+//   mode 0: exit; 1: pop `n` jobs from the deque at `base`; 2: take `n` jobs
+//   from the phase queue at slot `base`; 3: nothing to do yet (wait).
+//   `share_n` jobs of the deque bottom (from `share_src`) go to queue slots
+//   `share_dst ..` in the same wave.
+struct Wave {
+    mode: u32,
+    n: u32,
+    base: u32,
+    share_n: u32,
+    share_src: u32,
+    share_dst: u32,
+}
+var<workgroup> wg_wave: Wave;
 var<workgroup> wg_planes: array<vec4<f32>, 5>;
+
+// Emission staging (`emit_cluster`): the clusters a wave emits are collected
+// here and their bin slots reserved with one global atomic per bin per wave
+// (`emit_reserve` / `emit_commit` in `cs_traverse`), instead of one per
+// cluster. Entry: {instance, cluster slot, bin | rank << 3, triangles} and the
+// world sphere (for the tile estimate). An emission past `EMIT_CAP` in one wave
+// reserves its slot directly.
+const EMIT_CAP: u32 = 128u;
+var<workgroup> wg_emit: array<vec4<u32>, 128>;
+var<workgroup> wg_emit_sph: array<vec4<f32>, 128>;
+var<workgroup> wg_emit_n: atomic<u32>;
+var<workgroup> wg_bin_n: array<atomic<u32>, VGC_BIN_COUNT>;
+var<workgroup> wg_bin_base: array<u32, VGC_BIN_COUNT>;
+
+// Tile-estimate aggregation (`tile_add`): a small open-addressed table of
+// tiles touched this wave, summed in workgroup memory and added to `state`
+// once per tile per wave (`tile_flush`). Integer sums of the same rounded
+// contributions, so the estimate is bit-identical to per-cluster atomics.
+const TILE_SLOTS: u32 = 64u;
+const TILE_PROBES: u32 = 4u;
+const TILE_EMPTY: u32 = 0xffffffffu;
+var<workgroup> wg_tile_key: array<atomic<u32>, 64>;
+var<workgroup> wg_tile_tris: array<atomic<u32>, 64>;
+var<workgroup> wg_tile_area: array<atomic<u32>, 64>;
 
 // ── Small helpers ──────────────────────────────────────────────────────────
 
+// Counters are kept per thread and added to `state` once, when the thread
+// leaves the traversal (`stats_flush`): a shared atomic per job put every
+// thread of the dispatch on the same few cache lines.
+var<private> p_stats: array<u32, VGC_STAT_COUNT>;
+
 fn stat_add(i: u32) {
     if (params.flags & VGC_FLAG_STATS) != 0u {
-        atomicAdd(&state[VGC_ST_STATS + i], 1u);
+        p_stats[i] += 1u;
+    }
+}
+
+fn stats_flush() {
+    for (var i = 0u; i < VGC_STAT_COUNT; i++) {
+        let n = p_stats[i];
+        if n != 0u { atomicAdd(&state[VGC_ST_STATS + i], n); }
     }
 }
 
@@ -140,16 +214,9 @@ fn vg_hash(a: u32, b: u32) -> u32 {
 
 fn job_key(job: vec2<u32>) -> u32 { return vg_hash(job.x, job.y); }
 
-fn history_test(key: u32) -> bool {
-    let bit = key & params.history_bits_mask;
-    let w = atomicLoad(&history[params.hist_read_base + (bit >> 5u)]);
-    return ((w >> (bit & 31u)) & 1u) != 0u;
-}
-
 fn history_mark(key: u32) {
     if (params.flags & VGC_FLAG_TWO_PHASE) == 0u { return; }
-    let bit = key & params.history_bits_mask;
-    atomicOr(&history[params.hist_write_base + (bit >> 5u)], 1u << (bit & 31u));
+    hyst_mark(key);
 }
 
 // Hysteresis memory: the same hash set, salted per decision kind and not gated
@@ -159,15 +226,22 @@ fn history_mark(key: u32) {
 const SALT_REFINE: u32 = 0x1b873593u;
 const SALT_SW: u32 = 0x51ed270bu;
 
+// Last frame's marks: the read-only snapshot, never written during the frame.
 fn hyst_test(key: u32) -> bool {
     let bit = key & params.history_bits_mask;
-    let w = atomicLoad(&history[params.hist_read_base + (bit >> 5u)]);
+    let w = hist_ro[bit >> 5u];
     return ((w >> (bit & 31u)) & 1u) != 0u;
 }
 
 fn hyst_mark(key: u32) {
     let bit = key & params.history_bits_mask;
-    atomicOr(&history[params.hist_write_base + (bit >> 5u)], 1u << (bit & 31u));
+    let word = params.hist_base + (bit >> 5u);
+    let mask = 1u << (bit & 31u);
+    // These marks only accumulate during traversal and are cleared before the
+    // next frame. Repeated group decisions need no further atomic writes.
+    if (atomicLoad(&state[word]) & mask) == 0u {
+        atomicOr(&state[word], mask);
+    }
 }
 
 fn vp_row(r: u32) -> vec4<f32> {
@@ -302,7 +376,7 @@ const POLICY_DROP: u32 = 2u;
 fn occlusion_policy(job: vec2<u32>, c: vec3<f32>, r: f32) -> u32 {
     if (params.flags & VGC_FLAG_TWO_PHASE) == 0u { return POLICY_PROCESS; }
     if rp.phase == 0u {
-        if !history_test(job_key(job)) { return POLICY_DEFER; }
+        if !hyst_test(job_key(job)) { return POLICY_DEFER; }
         if rp.hiz_valid != 0u && hiz_sphere_occluded(c, r * 1.02, cameras[0].prev_view_proj) {
             return POLICY_DEFER;
         }
@@ -315,50 +389,139 @@ fn occlusion_policy(job: vec2<u32>, c: vec3<f32>, r: f32) -> u32 {
 }
 
 // ── Queues ──────────────────────────────────────────────────────────────────
+//
+// One persistent dispatch per phase traverses the whole tree (`cs_traverse`).
+// A workgroup works depth-first from its local deque; the phase queue (an
+// unbounded-producer, multi-consumer array: append-only within the phase) is
+// how work moves between workgroups. `state[VGC_ST_OUTSTANDING]` counts the
+// queued jobs that no workgroup has taken plus the workgroups that hold work;
+// it is raised before work becomes visible and lowered after, so it reaches 0
+// exactly when the phase is done, and every workgroup then exits.
 
-fn spill_job(job: vec2<u32>) {
-    let t = atomicAdd(&state[VGC_ST_Q_TAIL + rp.dst], 1u);
-    // dst 3 is the sink of a phase's last round: nothing is stored, finalize
-    // reports the count as overflow.
-    if rp.dst == 3u { return; }
+fn queue_word(q: u32, slot: u32) -> u32 {
+    return 2u * (q * params.queue_capacity + slot);
+}
+
+fn queue_put(q: u32, slot: u32, job: vec2<u32>) {
+    let w = queue_word(q, slot);
+    atomicStore(&queues[w], ~job.x);
+    atomicStore(&queues[w + 1u], ~job.y);
+}
+
+// The job in a slot this workgroup has taken. Its producer reserved the slot
+// and writes it without waiting on anything, so the spin is short; both words
+// are checked, so a half-written slot is never read.
+fn queue_take(q: u32, slot: u32) -> vec2<u32> {
+    let w = queue_word(q, slot);
+    for (var spin = 0u; spin < SLOT_SPIN_MAX; spin++) {
+        let x = atomicLoad(&queues[w]);
+        let y = atomicLoad(&queues[w + 1u]);
+        if x != 0u && y != 0u {
+            atomicStore(&queues[w], 0u);
+            atomicStore(&queues[w + 1u], 0u);
+            return vec2<u32>(~x, ~y);
+        }
+    }
+    stat_add(VGC_STAT_JOB_OVERFLOW);
+    return NO_JOB;
+}
+
+fn queue_tail(q: u32) -> u32 {
+    return min(atomicLoad(&state[VGC_ST_Q_TAIL + q]), params.queue_capacity);
+}
+
+// Queued jobs not yet taken.
+fn queue_backlog(q: u32) -> u32 {
+    let t = queue_tail(q);
+    let h = atomicLoad(&state[VGC_ST_Q_HEAD + q]);
+    return select(0u, t - h, t > h);
+}
+
+// Reserves `n` consecutive slots for a share, or returns 0xffffffff when the
+// queue cannot take them all (the jobs then stay in the deque: nothing is
+// lost). `outstanding` is raised first, so it never undercounts.
+fn queue_reserve(q: u32, n: u32) -> u32 {
+    atomicAdd(&state[VGC_ST_OUTSTANDING], n);
+    var t = atomicLoad(&state[VGC_ST_Q_TAIL + q]);
+    loop {
+        if t + n > params.queue_capacity {
+            atomicSub(&state[VGC_ST_OUTSTANDING], n);
+            return 0xffffffffu;
+        }
+        let r = atomicCompareExchangeWeak(&state[VGC_ST_Q_TAIL + q], t, t + n);
+        if r.exchanged { break; }
+        t = r.old_value;
+    }
+    atomicMax(&state[VGC_ST_STATS + VGC_STAT_PEAK_QUEUE], t + n);
+    if (params.flags & VGC_FLAG_STATS) != 0u { p_stats[VGC_STAT_SPILLED] += n; }
+    return t;
+}
+
+// Takes up to a guided-self-scheduling share of the backlog (backlog / groups,
+// 1..WG jobs): large chunks while there is much, single jobs (the biggest
+// subtrees, shared from deque bottoms) when work is scarce. Returns
+// (first slot, count); count 0 when nothing is queued.
+fn queue_claim(q: u32) -> vec2<u32> {
+    var h = atomicLoad(&state[VGC_ST_Q_HEAD + q]);
+    loop {
+        let t = queue_tail(q);
+        if h >= t { return vec2<u32>(0u, 0u); }
+        let c = clamp((t - h) / params.max_groups, 1u, WG);
+        let r = atomicCompareExchangeWeak(&state[VGC_ST_Q_HEAD + q], h, h + c);
+        if r.exchanged { return vec2<u32>(h, c); }
+        h = r.old_value;
+    }
+    return vec2<u32>(0u, 0u);
+}
+
+// A job whose deque is full goes to the phase queue. Lost only when that is
+// full as well (the live frontier exceeds every queue and deque; counted, and
+// the queue grows for the next frame).
+fn share_job(job: vec2<u32>) {
+    let q = rp.phase;
+    atomicAdd(&state[VGC_ST_OUTSTANDING], 1u);
+    let t = atomicAdd(&state[VGC_ST_Q_TAIL + q], 1u);
     if t < params.queue_capacity {
-        queues[rp.dst * params.queue_capacity + t] = job;
+        queue_put(q, t, job);
         stat_add(VGC_STAT_SPILLED);
         atomicMax(&state[VGC_ST_STATS + VGC_STAT_PEAK_QUEUE], t + 1u);
     } else {
+        atomicSub(&state[VGC_ST_OUTSTANDING], 1u);
         stat_add(VGC_STAT_JOB_OVERFLOW);
     }
 }
 
 fn push_job(job: vec2<u32>) {
-    let i = atomicAdd(&wg_sp, 1u);
-    if i < STACK_CAP {
-        wg_stack[i] = job;
+    let i = atomicAdd(&wg_top, 1u);
+    if i - wg_bot < STACK_CAP {
+        wg_stack[i & STACK_MASK] = job;
     } else {
-        spill_job(job);
+        share_job(job);
     }
 }
 
-fn defer_job(job: vec2<u32>) {
-    let t = atomicAdd(&state[VGC_ST_Q_TAIL + 2u], 1u);
-    if t < params.queue_capacity {
-        queues[2u * params.queue_capacity + t] = job;
-        stat_add(VGC_STAT_DEFERRED);
-        atomicMax(&state[VGC_ST_STATS + VGC_STAT_PEAK_QUEUE], t + 1u);
-    } else {
-        stat_add(VGC_STAT_JOB_OVERFLOW);
-    }
+// Early phase: queues work for the late phase. False when the late queue is
+// full: the caller then processes the job now (drawn without the occlusion
+// retest, never lost). The tail may pass the capacity; `cs_phase_init`
+// clamps it and records it as the peak, so the queue grows.
+fn defer_job(job: vec2<u32>) -> bool {
+    let t = atomicAdd(&state[VGC_ST_Q_TAIL + 1u], 1u);
+    if t >= params.queue_capacity { return false; }
+    queue_put(1u, t, job);
+    stat_add(VGC_STAT_DEFERRED);
+    return true;
 }
 
 // ── Per-tile density: the overdraw valve and the dense-tile estimate ───────
 //
-// `history` carries, after its two visibility halves, three words per 16x16
-// tile: the triangles and the covered area the clusters emitted last frame
-// estimate into the tile (fixed point), and the valve's coarsening scale
-// `g >= 1` (f32 bits; 0 reads as 1). `cs_tiles` turns the estimate into the
-// scale and clears it; `emit_cluster` adds to it; the dense-tile classifier
-// reads the triangle word (so hardware-class clusters count towards "this tile
-// is dense" without the software raster having run).
+// `state` carries, after the marks, three words per 16x16 tile: the triangles
+// and the covered area the clusters emitted last frame estimate into the tile
+// (fixed point), and the valve's coarsening scale `g >= 1` (f32 bits; 0 reads
+// as 1). `cs_tiles` turns the estimate into the scale and clears it; the
+// traversal reads the scales from the `hist_ro` copy taken after `cs_tiles`;
+// `emit_cluster` adds to the estimate; the dense-tile classifier reads the
+// triangle word (so hardware-class clusters count towards "this tile is dense"
+// without the software raster having run).
 
 const TILE_EST_MAX_R: f32 = 32.0;
 
@@ -398,6 +561,11 @@ fn tile_footprint(cw: vec3<f32>, rw: f32) -> Footprint {
 
 fn tile_word(t: u32, w: u32) -> u32 { return params.tile_base + t * VGC_TILE_WORDS + w; }
 
+// This frame's valve scale of tile `t`, from the read-only copy.
+fn tile_scale_of(t: u32) -> f32 {
+    return bitcast<f32>(hist_ro[params.ro_tile_base + t * VGC_TILE_WORDS + 2u]);
+}
+
 // The valve's coarsening scale for a sphere: the largest scale of the tiles it
 // covers (1 when none is over the limit, or the valve is off).
 fn tile_scale(cw: vec3<f32>, rw: f32) -> f32 {
@@ -408,10 +576,30 @@ fn tile_scale(cw: vec3<f32>, rw: f32) -> f32 {
     for (var y = f.lo.y; y <= f.hi.y; y++) {
         for (var x = f.lo.x; x <= f.hi.x; x++) {
             let t = u32(y) * params.tiles_x + u32(x);
-            g = max(g, bitcast<f32>(atomicLoad(&history[tile_word(t, 2u)])));
+            g = max(g, tile_scale_of(t));
         }
     }
     return g;
+}
+
+// The smallest scale of the tiles a sphere covers. A hierarchy node may stop
+// the descent at this scale and stay coverage complete: every cluster below it
+// lies inside the node's sphere, so its own scale (the largest over its tiles,
+// a subset of the node's) is never smaller. Where the node's tiles are all
+// saturated (a distant tree: a few pixels, one tile) the whole subtree is
+// skipped; a node straddling an unsaturated tile still descends.
+fn tile_scale_min(cw: vec3<f32>, rw: f32) -> f32 {
+    if params.tile_limit <= 0.0 { return 1.0; }
+    let f = tile_footprint(cw, rw);
+    if !f.ok { return 1.0; }
+    var g = VGC_TILE_SCALE_MAX;
+    for (var y = f.lo.y; y <= f.hi.y; y++) {
+        for (var x = f.lo.x; x <= f.hi.x; x++) {
+            let t = u32(y) * params.tiles_x + u32(x);
+            g = min(g, tile_scale_of(t));
+        }
+    }
+    return max(g, 1.0);
 }
 
 // Adds an emitted cluster's triangles to the tiles it covers, weighted by the
@@ -430,10 +618,41 @@ fn tile_accumulate(cw: vec3<f32>, rw: f32, tris: u32) {
             let ox = max(min(f.px.x + f.r, tx + tile) - max(f.px.x - f.r, tx), 0.0);
             let share = ox * oy / sq;
             let t = u32(y) * params.tiles_x + u32(x);
-            atomicAdd(&history[tile_word(t, 0u)], u32(f32(tris) * share * VGC_TILE_FIXED + 0.5));
-            atomicAdd(&history[tile_word(t, 1u)], u32(disc * share * VGC_TILE_FIXED + 0.5));
+            tile_add(t, u32(f32(tris) * share * VGC_TILE_FIXED + 0.5), u32(disc * share * VGC_TILE_FIXED + 0.5));
         }
     }
+}
+
+// Adds to tile `t`'s estimate through the wave's tile table; straight to
+// `state` when its probe window is taken by other tiles. A spuriously failed
+// compare-exchange only moves on to the next slot: any split of a tile's sum
+// between slots and `state` adds up to the same total.
+fn tile_add(t: u32, tris_fx: u32, area_fx: u32) {
+    if (tris_fx | area_fx) == 0u { return; }
+    let h = (t * 0x9e3779b1u) >> 26u;
+    for (var p = 0u; p < TILE_PROBES; p++) {
+        let s = (h + p) & (TILE_SLOTS - 1u);
+        let r = atomicCompareExchangeWeak(&wg_tile_key[s], TILE_EMPTY, t);
+        if r.exchanged || r.old_value == t {
+            atomicAdd(&wg_tile_tris[s], tris_fx);
+            atomicAdd(&wg_tile_area[s], area_fx);
+            return;
+        }
+    }
+    atomicAdd(&state[tile_word(t, 0u)], tris_fx);
+    atomicAdd(&state[tile_word(t, 1u)], area_fx);
+}
+
+// One slot of the tile table to `state`, emptied for the next wave. Called by
+// thread `s` after the wave's last `tile_add` (behind a barrier).
+fn tile_flush(s: u32) {
+    let t = atomicLoad(&wg_tile_key[s]);
+    if t == TILE_EMPTY { return; }
+    let a = atomicExchange(&wg_tile_tris[s], 0u);
+    let b = atomicExchange(&wg_tile_area[s], 0u);
+    if a != 0u { atomicAdd(&state[tile_word(t, 0u)], a); }
+    if b != 0u { atomicAdd(&state[tile_word(t, 1u)], b); }
+    atomicStore(&wg_tile_key[s], TILE_EMPTY);
 }
 
 // ── Group refinement (the cut's one decision) ──────────────────────────────
@@ -448,12 +667,15 @@ fn tile_accumulate(cw: vec3<f32>, rw: f32, tris: u32) {
 fn group_refines(inst: u32, sph: vec4<f32>, err: f32, px: f32, tau: f32) -> bool {
     if err >= INF_ERR { return true; }
     if !(err > 0.0) { return false; }
+    // Below the hold threshold both histories choose coarse. No hash lookup
+    // or mark is necessary; only decisions inside the band depend on history.
+    if !(px > tau * VGC_TAU_HOLD) { return false; }
     var h = vg_hash(inst, bitcast<u32>(err));
     h = vg_hash(h, bitcast<u32>(sph.x));
     h = vg_hash(h, bitcast<u32>(sph.y));
     h = vg_hash(h, bitcast<u32>(sph.z));
     let key = h ^ SALT_REFINE;
-    let refine = px > select(tau, tau * VGC_TAU_HOLD, hyst_test(key));
+    let refine = px > tau || hyst_test(key);
     if refine { hyst_mark(key); }
     return refine;
 }
@@ -560,17 +782,52 @@ fn masked_bin(bin: u32) -> u32 {
     return VGC_BIN_HW_MASKED;
 }
 
+// Stages an emitted cluster for the wave's bin reservation (`emit_reserve`,
+// `emit_commit`). The stage slot is taken before the bin rank, so a cluster
+// that finds the stage full holds no rank and every reserved slot is written.
 fn emit_cluster(inst: u32, slot: u32, bin: u32, triangles: u32, cw: vec3<f32>, rw: f32) {
-    let k = atomicAdd(&state[VGC_ST_BINS + bin], 1u);
+    let e = atomicAdd(&wg_emit_n, 1u);
+    if e < EMIT_CAP {
+        let rank = atomicAdd(&wg_bin_n[bin], 1u);
+        wg_emit[e] = vec4<u32>(inst, slot, bin | (rank << 3u), triangles);
+        wg_emit_sph[e] = vec4<f32>(cw, rw);
+        return;
+    }
+    emit_store(bin, atomicAdd(&state[VGC_ST_BINS + bin], 1u), inst, slot, triangles, cw, rw);
+}
+
+// Writes a cluster to entry `k` of its bin (counted as overflow past the
+// capacity: the bin counter keeps the attempted count for growth).
+fn emit_store(bin: u32, k: u32, inst: u32, slot: u32, triangles: u32, cw: vec3<f32>, rw: f32) {
     if k >= params.bin_capacity {
         stat_add(VGC_STAT_VISIBLE_OVERFLOW);
         return;
     }
     visible[bin * params.bin_capacity + k] = vec2<u32>(inst, slot);
     // The selected triangle count is kept even when the other counters are off.
-    atomicAdd(&state[VGC_ST_STATS + VGC_STAT_TRIANGLES], triangles);
+    p_stats[VGC_STAT_TRIANGLES] += triangles;
     tile_accumulate(cw, rw, triangles);
     stat_add(VGC_STAT_EMITTED);
+}
+
+// Thread `b` (< VGC_BIN_COUNT): one global reservation for the wave's staged
+// clusters of bin `b`.
+fn emit_reserve(b: u32) {
+    let n = atomicLoad(&wg_bin_n[b]);
+    var base = 0u;
+    if n != 0u { base = atomicAdd(&state[VGC_ST_BINS + b], n); }
+    wg_bin_base[b] = base;
+}
+
+// Writes the staged clusters `lid, lid + WG, ..` to their reserved entries.
+fn emit_commit(lid: u32) {
+    let staged = min(atomicLoad(&wg_emit_n), EMIT_CAP);
+    for (var e = lid; e < staged; e += WG) {
+        let s = wg_emit[e];
+        let sph = wg_emit_sph[e];
+        let bin = s.z & 7u;
+        emit_store(bin, wg_bin_base[bin] + (s.z >> 3u), s.x, s.y, s.w, sph.xyz, sph.w);
+    }
 }
 
 // ── Cluster test (cut rule, cone, frustum, occlusion, binning) ─────────────
@@ -635,7 +892,7 @@ fn try_cluster(inst: u32, cs: u32, ic: InstCtx) {
     }
     let job = vec2<u32>(inst, (2u << 30u) | cs);
     let pol = occlusion_policy(job, cw, rw);
-    if pol == POLICY_DEFER { defer_job(job); return; }
+    if pol == POLICY_DEFER && defer_job(job) { return; }
     if pol == POLICY_DROP { stat_add(VGC_STAT_CULLED_OCCLUSION); return; }
     history_mark(job_key(job));
     let triangles = c.counts_material & 0xffu;
@@ -659,8 +916,31 @@ fn do_group(inst: u32, gidx: u32, ic: InstCtx, demanded: bool) {
     if slot == VG_PAGE_NOT_RESIDENT { return; }
     let first = g.first_cluster_count & 0xffffu;
     let count = g.first_cluster_count >> 16u;
+    // Each cluster becomes its own job on the workgroup stack, so the 64
+    // threads of the next wave test 64 clusters instead of this thread looping
+    // over the group while the other 63 wait at the wave's barrier. The group
+    // is reserved whole and only while it fits (compare-exchange), so the
+    // deque never passes `STACK_CAP` on its account and later pushes are not
+    // forced out to the phase queue. A group that does not fit is tested here.
+    let bot = wg_bot;
+    var base = atomicLoad(&wg_top);
+    var reserved = false;
+    loop {
+        if base - bot + count > STACK_CAP { break; }
+        let r = atomicCompareExchangeWeak(&wg_top, base, base + count);
+        if r.exchanged {
+            reserved = true;
+            break;
+        }
+        base = r.old_value;
+    }
     for (var i = 0u; i < count; i++) {
-        try_cluster(inst, (slot << VG_PAGE_CLUSTER_SHIFT) | (first + i), ic);
+        let cs = (slot << VG_PAGE_CLUSTER_SHIFT) | (first + i);
+        if reserved {
+            wg_stack[(base + i) & STACK_MASK] = vec2<u32>(inst, (2u << 30u) | cs);
+        } else {
+            try_cluster(inst, cs, ic);
+        }
     }
 }
 
@@ -677,7 +957,7 @@ fn job_gcbvh(job: vec2<u32>) {
     let c = (n.bmin + n.bmax) * 0.5;
     let r = length(n.bmax - n.bmin) * 0.5;
     let pol = occlusion_policy(job, c, r);
-    if pol == POLICY_DEFER { defer_job(job); return; }
+    if pol == POLICY_DEFER && defer_job(job) { return; }
     if pol == POLICY_DROP { stat_add(VGC_STAT_CULLED_OCCLUSION); return; }
     history_mark(job_key(job));
     if vg_bvh_is_leaf(n) {
@@ -691,8 +971,8 @@ fn job_gcbvh(job: vec2<u32>) {
             }
         }
     } else {
-        push_job(vec2<u32>(0xffffffffu, vg_bvh_child(n, 0u)));
-        push_job(vec2<u32>(0xffffffffu, vg_bvh_child(n, 1u)));
+        push_job(vec2<u32>(0u, vg_bvh_child(n, 0u)));
+        push_job(vec2<u32>(0u, vg_bvh_child(n, 1u)));
     }
 }
 
@@ -770,7 +1050,7 @@ fn job_asset_item(job: vec2<u32>) {
     // smallest threshold a group below may be held at (hysteresis).
     let mpe = vg_nodes[parent].max_parent_error[slot];
     let mpe_px = proj_err(mpe * ic.err_scale * ic.scale, cw, rw);
-    if mpe_px <= ic.tau * VGC_TAU_HOLD {
+    if mpe_px <= ic.tau * VGC_TAU_HOLD * tile_scale_min(cw, rw) {
         stat_add(VGC_STAT_CULLED_SSE);
         return;
     }
@@ -779,7 +1059,7 @@ fn job_asset_item(job: vec2<u32>) {
         return;
     }
     let pol = occlusion_policy(job, cw, rw);
-    if pol == POLICY_DEFER { defer_job(job); return; }
+    if pol == POLICY_DEFER && defer_job(job) { return; }
     if pol == POLICY_DROP { stat_add(VGC_STAT_CULLED_OCCLUSION); return; }
     history_mark(job_key(job));
     if (child & VG_NODE_LEAF_BIT) != 0u {
@@ -825,9 +1105,9 @@ fn process_job(job: vec2<u32>) {
 fn cs_tiles(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = gid.x;
     if t >= params.tiles_x * params.tiles_y { return; }
-    let tris = f32(atomicExchange(&history[tile_word(t, 0u)], 0u)) / VGC_TILE_FIXED;
-    let area = f32(atomicExchange(&history[tile_word(t, 1u)], 0u)) / VGC_TILE_FIXED;
-    var g = max(bitcast<f32>(atomicLoad(&history[tile_word(t, 2u)])), 1.0);
+    let tris = f32(atomicExchange(&state[tile_word(t, 0u)], 0u)) / VGC_TILE_FIXED;
+    let area = f32(atomicExchange(&state[tile_word(t, 1u)], 0u)) / VGC_TILE_FIXED;
+    var g = max(bitcast<f32>(atomicLoad(&state[tile_word(t, 2u)])), 1.0);
     if params.tile_limit > 0.0 {
         let d = tris / max(min(area, f32(VGC_TILE * VGC_TILE)), 1.0);
         // The mask has the raster's grid (`dense_tiles_*`), which is not this
@@ -849,7 +1129,7 @@ fn cs_tiles(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         g = 1.0;
     }
-    atomicStore(&history[tile_word(t, 2u)], bitcast<u32>(g));
+    atomicStore(&state[tile_word(t, 2u)], bitcast<u32>(g));
 }
 
 // One thread, frame start: seed the traversal with the GCBVH root.
@@ -857,94 +1137,149 @@ fn cs_tiles(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn cs_seed() {
     if params.mode == VGC_MODE_OFF { return; }
     if vg_gcbvh_header.node_count == 0u || vg_gcbvh_header.root_node == VG_BVH_INVALID || params.instance_count == 0u { return; }
-    queues[0] = vec2<u32>(0xffffffffu, vg_gcbvh_header.root_node);
+    queue_put(0u, 0u, vec2<u32>(0u, vg_gcbvh_header.root_node));
     atomicStore(&state[VGC_ST_Q_TAIL], 1u);
+    atomicStore(&state[VGC_ST_OUTSTANDING], 1u);
 }
 
-// One thread per round: reset queue cursors and size the persistent dispatch.
+// One thread, late phase start: the early phase's deferred jobs (queue 1) are
+// the late phase's queued work. A tail past the capacity (deferrals that found
+// the queue full and were processed early) is clamped and kept as the peak.
 @compute @workgroup_size(1)
-fn cs_round_prepare() {
-    let n = min(atomicLoad(&state[VGC_ST_Q_TAIL + rp.src]), params.queue_capacity);
-    atomicStore(&state[VGC_ST_Q_HEAD + rp.src], 0u);
-    atomicStore(&state[VGC_ST_Q_TAIL + rp.dst], 0u);
-    atomicStore(&state[VGC_ST_Q_HEAD + rp.dst], 0u);
-    dispatch_args[0] = min((n + SOURCE_CHUNK - 1u) / SOURCE_CHUNK, params.max_groups);
-    dispatch_args[1] = 1u;
-    dispatch_args[2] = 1u;
+fn cs_phase_init() {
+    let raw = atomicLoad(&state[VGC_ST_Q_TAIL + 1u]);
+    let n = min(raw, params.queue_capacity);
+    atomicMax(&state[VGC_ST_STATS + VGC_STAT_PEAK_QUEUE], raw);
+    atomicStore(&state[VGC_ST_Q_TAIL + 1u], n);
+    atomicStore(&state[VGC_ST_Q_HEAD + 1u], 0u);
+    atomicStore(&state[VGC_ST_OUTSTANDING], n);
 }
 
-// Persistent workgroups: pull 64-job chunks from the source queue, traverse
-// depth-first through a workgroup-local stack, spill to the next round's queue
-// only when that stack is full.
-@compute @workgroup_size(64)
-fn cs_traverse(@builtin(local_invocation_index) lid: u32) {
-    if lid < 5u { wg_planes[lid] = frustum_plane(lid); }
-    if lid == 0u { atomicStore(&wg_sp, 0u); }
-    let src = rp.src;
-    let src_n = min(atomicLoad(&state[VGC_ST_Q_TAIL + src]), params.queue_capacity);
-    workgroupBarrier();
-    var waves = 0u;
-    loop {
-        if lid == 0u {
-            let sp = min(atomicLoad(&wg_sp), STACK_CAP);
-            if sp > 0u {
-                let take = min(sp, WG);
-                atomicStore(&wg_sp, sp - take);
-                wg_n = take;
-                wg_base = sp - take;
-                wg_mode = 1u;
-            } else {
-                let base = atomicAdd(&state[VGC_ST_Q_HEAD + src], SOURCE_CHUNK);
-                if base >= src_n {
-                    wg_mode = 0u;
-                    wg_n = 0u;
-                    wg_base = 0u;
-                } else {
-                    wg_mode = 2u;
-                    wg_n = min(SOURCE_CHUNK, src_n - base);
-                    wg_base = base;
+// Thread 0's plan for the next wave (see `Wave`). `holding` says this
+// workgroup is counted in `outstanding` (it holds work); `idle` counts the
+// waves it has waited.
+fn wave_plan(q: u32, holding: ptr<function, bool>, idle: ptr<function, u32>) -> Wave {
+    var w = Wave(3u, 0u, 0u, 0u, 0u, 0u);
+    let bot = wg_bot;
+    let size = min(atomicLoad(&wg_top) - bot, STACK_CAP);
+    if size > 0u {
+        *idle = 0u;
+        // Work sharing: while fewer jobs are queued than there are
+        // workgroups (some may be starving), give away half of what exceeds
+        // one wave, from the deque bottom: the oldest, coarsest jobs, whose
+        // subtrees are the largest (work stealing's split).
+        if size > WG && queue_backlog(q) < params.max_groups {
+            let d = (size - WG) / 2u;
+            if d > 0u {
+                let dst = queue_reserve(q, d);
+                if dst != 0xffffffffu {
+                    w.share_n = d;
+                    w.share_src = bot;
+                    w.share_dst = dst;
                 }
             }
         }
-        workgroupBarrier();
-        let mode = workgroupUniformLoad(&wg_mode);
-        if mode == 0u { break; }
-        let n = workgroupUniformLoad(&wg_n);
-        let base = workgroupUniformLoad(&wg_base);
-        var job = vec2<u32>(0u);
-        let have = lid < n;
-        if have {
-            if mode == 1u {
-                job = wg_stack[base + lid];
+        let take = min(size - w.share_n, WG);
+        let top = bot + size - take;
+        atomicStore(&wg_top, top);
+        w.mode = 1u;
+        w.n = take;
+        w.base = top;
+        return w;
+    }
+    if !*holding {
+        if atomicLoad(&state[VGC_ST_OUTSTANDING]) == 0u {
+            w.mode = 0u;
+            return w;
+        }
+        if queue_backlog(q) == 0u {
+            *idle += 1u;
+            // Only a group holding nothing ever stops here, so giving up
+            // loses parallelism, never work (a guard against a hang).
+            if *idle >= IDLE_SPIN_MAX { w.mode = 0u; }
+            return w;
+        }
+        // Counted before claiming, so `outstanding` cannot read 0 while the
+        // claimed jobs are in flight.
+        atomicAdd(&state[VGC_ST_OUTSTANDING], 1u);
+        *holding = true;
+    }
+    let c = queue_claim(q);
+    if c.y > 0u {
+        atomicSub(&state[VGC_ST_OUTSTANDING], c.y);
+        *idle = 0u;
+        w.mode = 2u;
+        w.n = c.y;
+        w.base = c.x;
+    } else {
+        atomicSub(&state[VGC_ST_OUTSTANDING], 1u);
+        *holding = false;
+    }
+    return w;
+}
+
+// The traversal of one phase, in a single persistent dispatch: each workgroup
+// pops waves of up to 64 jobs from its local deque, depth-first, takes jobs
+// from the phase queue when the deque is empty, shares the bottom of its deque
+// when the queue runs low, and exits when `outstanding` reaches 0. Nothing
+// depends on the dispatch size: a workgroup that starts late finds the work
+// done, and a waiting one only waits on running ones.
+//
+// The barriers run every iteration and only the work is predicated: FXC (the
+// only compiler on Windows on ARM, which has no DXC) rejects a barrier inside
+// a branch it cannot prove uniform, and after the data-dependent `break` it
+// can prove nothing. The wave's emissions ride on the same barriers: bin slots
+// are reserved (one global atomic per bin) after the jobs ran, written in the
+// next section, and the tile table flushed and the staging reset in the last,
+// before the next wave can emit.
+@compute @workgroup_size(64)
+fn cs_traverse(@builtin(local_invocation_index) lid: u32) {
+    if lid < 5u { wg_planes[lid] = frustum_plane(lid); }
+    if lid == 0u {
+        atomicStore(&wg_top, 0u);
+        wg_bot = 0u;
+        atomicStore(&wg_emit_n, 0u);
+    }
+    if lid < VGC_BIN_COUNT { atomicStore(&wg_bin_n[lid], 0u); }
+    if lid < TILE_SLOTS {
+        atomicStore(&wg_tile_key[lid], TILE_EMPTY);
+        atomicStore(&wg_tile_tris[lid], 0u);
+        atomicStore(&wg_tile_area[lid], 0u);
+    }
+    let q = rp.phase;
+    var holding = false;
+    var idle = 0u;
+    loop {
+        if lid == 0u { wg_wave = wave_plan(q, &holding, &idle); }
+        let w = workgroupUniformLoad(&wg_wave);
+        if w.mode == 0u { break; }
+        // The shared jobs leave the deque bottom before any push this wave
+        // (pushes are bounded by the old `wg_bot`, so they cannot reach them).
+        for (var i = lid; i < w.share_n; i += WG) {
+            queue_put(q, w.share_dst + i, wg_stack[(w.share_src + i) & STACK_MASK]);
+        }
+        var job = NO_JOB;
+        if lid < w.n {
+            if w.mode == 1u {
+                job = wg_stack[(w.base + lid) & STACK_MASK];
             } else {
-                job = queues[src * params.queue_capacity + base + lid];
+                job = queue_take(q, w.base + lid);
             }
         }
         // Pops are read before any push may reuse the slots.
         workgroupBarrier();
-        if have { process_job(job); }
+        if job.y != NO_JOB.y { process_job(job); }
         workgroupBarrier();
-        waves += 1u;
-        // The seed is one job: draining its entire subtree on one SM leaves
-        // the rest of the GPU idle. Share a bounded frontier with the next
-        // dispatch, whose workgroup count reflects that expanded frontier.
-        // The final round drains normally; yielding there would drop work.
-        // The barriers below run every iteration and only the work is
-        // predicated: FXC (the only compiler on Windows on ARM, which has no
-        // DXC) rejects a barrier inside a branch it cannot prove uniform, and
-        // after the data-dependent `break` above it can prove nothing.
-        let redistribute = waves >= REDISTRIBUTE_WAVES && rp.dst != 3u;
-        if lid == 0u {
-            wg_n = select(0u, min(atomicLoad(&wg_sp), STACK_CAP), redistribute);
-        }
+        if lid < VGC_BIN_COUNT { emit_reserve(lid); }
+        if lid == 0u { wg_bot += w.share_n; }
         workgroupBarrier();
-        let pending = workgroupUniformLoad(&wg_n);
-        for (var i = lid; i < pending; i += WG) { spill_job(wg_stack[i]); }
+        emit_commit(lid);
         workgroupBarrier();
-        if lid == 0u && redistribute { atomicStore(&wg_sp, 0u); }
-        workgroupBarrier();
-        if redistribute { waves = 0u; }
+        if lid == 0u { atomicStore(&wg_emit_n, 0u); }
+        if lid < VGC_BIN_COUNT { atomicStore(&wg_bin_n[lid], 0u); }
+        if lid < TILE_SLOTS { tile_flush(lid); }
     }
+    stats_flush();
 }
 
 // One thread per phase end: clamp counts, publish ranges and indirect args.
@@ -952,10 +1287,12 @@ fn cs_traverse(@builtin(local_invocation_index) lid: u32) {
 fn cs_finalize() {
     let cap = params.bin_capacity;
     let phase = rp.phase;
-    let left = atomicLoad(&state[VGC_ST_Q_TAIL + 3u]);
+    // Work still counted at the end was abandoned by the spin guards (an
+    // invariant broke): report it as lost.
+    let left = atomicLoad(&state[VGC_ST_OUTSTANDING]);
     if left > 0u {
         atomicAdd(&state[VGC_ST_STATS + VGC_STAT_JOB_OVERFLOW], left);
-        atomicStore(&state[VGC_ST_Q_TAIL + 3u], 0u);
+        atomicStore(&state[VGC_ST_OUTSTANDING], 0u);
     }
     let args = VGC_ST_ARGS + phase * VGC_ARGS_PHASE_WORDS;
     let rng = VGC_ST_RANGES + phase * VGC_BIN_COUNT * 2u;

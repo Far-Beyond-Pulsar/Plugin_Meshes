@@ -10,6 +10,9 @@
 //!   "used" marks via `shaders/vg_stream.wgsl`; a non-blocking readback feeds
 //!   the [`PageScheduler`] (priority, per-frame budget, LRU eviction that
 //!   never evicts root pages).
+//!   Feedback bits accumulate until an ordered readback/reset. Shader helpers
+//!   first read the bit and avoid redundant atomic writes for shared pages;
+//!   racing request writers still elect one append with atomic OR.
 //! * CPU page bytes are held in SceneDB `Residency<PageBytes>` so they are
 //!   budgeted and visible in the Memory Explorer; the GPU pool is named
 //!   `vg-stream page pool` in the GPU allocator report.
