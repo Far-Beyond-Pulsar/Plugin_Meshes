@@ -132,24 +132,28 @@ fn stage_cluster(slot: u32, ci: u32, lid: u32) -> u32 {
         sh_verts = (c.counts_material >> 8u) & 0xffu;
     }
     let tris = workgroupUniformLoad(&sh_tris);
-    if tris == 0u { return 0u; }
-    let vis = visible[sh_vis];
-    let c = vgd_load_cluster(vis.cluster_slot);
-    let blk = vgd_pos_block(vis.cluster_slot, c, dense_asset(vis));
-    let m = dense_xform(vis);
-    let fw = f32(params.viewport.x);
-    let fh = f32(params.viewport.y);
-    for (var i = lid; i < sh_verts; i += WG_THREADS) {
-        let wp = m * vec4<f32>(vgd_pos(blk, i), 1.0);
-        let clip = params.view_proj * wp;
-        if clip.w > 1.0e-6 {
-            let ndc = clip.xyz / clip.w;
-            sv[i] = vec4<f32>((ndc.x * 0.5 + 0.5) * fw, (0.5 - ndc.y * 0.5) * fh, ndc.z, 1.0);
-//@M             sv_uv[i] = vga_uv0(vis.cluster_slot, blk, i);
-//@M             sv_iw[i] = 1.0 / clip.w;
-        } else {
-            sv[i] = vec4<f32>(0.0);
-//@M             sv_iw[i] = 0.0;
+    // No early return: FXC (the only compiler on Windows on ARM) cannot prove
+    // `tris` uniform, and a barrier after a return it thinks is divergent is an
+    // error (X3663). An empty cluster just skips the staging work.
+    if tris != 0u {
+        let vis = visible[sh_vis];
+        let c = vgd_load_cluster(vis.cluster_slot);
+        let blk = vgd_pos_block(vis.cluster_slot, c, dense_asset(vis));
+        let m = dense_xform(vis);
+        let fw = f32(params.viewport.x);
+        let fh = f32(params.viewport.y);
+        for (var i = lid; i < sh_verts; i += WG_THREADS) {
+            let wp = m * vec4<f32>(vgd_pos(blk, i), 1.0);
+            let clip = params.view_proj * wp;
+            if clip.w > 1.0e-6 {
+                let ndc = clip.xyz / clip.w;
+                sv[i] = vec4<f32>((ndc.x * 0.5 + 0.5) * fw, (0.5 - ndc.y * 0.5) * fh, ndc.z, 1.0);
+//@M                 sv_uv[i] = vga_uv0(vis.cluster_slot, blk, i);
+//@M                 sv_iw[i] = 1.0 / clip.w;
+            } else {
+                sv[i] = vec4<f32>(0.0);
+//@M                 sv_iw[i] = 0.0;
+            }
         }
     }
     workgroupBarrier();
