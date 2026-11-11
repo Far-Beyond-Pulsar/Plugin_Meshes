@@ -20,7 +20,7 @@ use bytemuck::{Pod, Zeroable};
 use helio_core::graph::ResourceBuilder;
 use helio_core::{PassContext, PrepareContext, RenderPass, Result as HelioResult};
 use helio_mats::radiant::{RadiantShaderCache, RadiantShaderKey};
-use pulsar_scenedb::gpu::{world_mirror::DEFAULT_AUTO_REGISTER_CAPACITY, BufferKey};
+use pulsar_scenedb::gpu::world_mirror::DEFAULT_AUTO_REGISTER_CAPACITY;
 
 /// The meshes' transparent program (`shaders/transparent.wgsl`): a
 /// material's transparent template (its `radiant_eval_transparent`) is
@@ -406,9 +406,9 @@ impl RenderPass for TransparentPass {
             helio_mesh_api::MESH_INDICES.name(),
             helio_mesh_api::MESH_VERTICES.name(),
             helio_mats::MATERIALS.name(),
-            helio_light_api::LIGHT_LIST,
-            helio_mesh_api::SKELETAL_BONE_PALETTE,
-            helio_mesh_api::SKELETAL_SKIN_VERTICES,
+            helio_light_api::SCENE_LIGHTS.name(),
+            helio_mesh_api::BONE_PALETTE.name(),
+            helio_mesh_api::SKIN_VERTICES.name(),
         ];
         LIST
     }
@@ -478,7 +478,7 @@ impl RenderPass for TransparentPass {
         // `light_mode_direct_index` doc for the full reasoning.
         let scene_lights = ctx
             .scene_buffers
-            .get(BufferKey::of(helio_light_api::LIGHT_LIST));
+            .get(helio_light_api::SCENE_LIGHTS.key());
         let use_direct_index = scene_lights.is_some();
         let light_count = scene_lights.map_or(0, |lights| lights.row_capacity());
         ctx.write_buffer(
@@ -615,7 +615,7 @@ impl RenderPass for TransparentPass {
         );
         let lights_handle = ctx
             .scene_buffers
-            .get(BufferKey::of(helio_light_api::LIGHT_LIST));
+            .get(helio_light_api::SCENE_LIGHTS.key());
         let lights_buf = lights_handle
             .map(|handle| &handle.buffer)
             .unwrap_or(batch.instances);
@@ -685,12 +685,12 @@ impl RenderPass for TransparentPass {
         // built once at construction time (mirrors `bind_group_1`'s pattern).
         let skin_buf = ctx
             .scene_buffers
-            .get(BufferKey::of(helio_mesh_api::SKELETAL_SKIN_VERTICES))
+            .get(helio_mesh_api::SKIN_VERTICES.key())
             .map(|h| h.buffer.clone())
             .unwrap_or_else(|| batch.instances.clone());
         let palette_buf = ctx
             .scene_buffers
-            .get(BufferKey::of(helio_mesh_api::SKELETAL_BONE_PALETTE))
+            .get(helio_mesh_api::BONE_PALETTE.key())
             .map(|h| h.buffer.clone())
             .unwrap_or_else(|| batch.instances.clone());
         let bg0_key = [

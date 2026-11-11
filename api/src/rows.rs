@@ -113,6 +113,53 @@ pub const SKELETAL_BONE_PALETTE: &str = "skeletal_bone_palette";
 /// instance, which the VG host derives and the VG passes read.
 pub const VG_INSTANCES: &str = "vg_instances";
 
+/// Per-vertex four-influence skin data of [`SKELETAL_SKIN_VERTICES`]. Kept in
+/// a storage buffer parallel to [`MESH_VERTICES`], so static geometry keeps
+/// its established vertex ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SkinVertex {
+    pub joints: [u32; 4],
+    pub weights: [f32; 4],
+}
+unsafe impl pulsar_scenedb::page::Pod for SkinVertex {}
+
+/// [`SKELETAL_SKIN_VERTICES`] as a contract: a pool of [`SkinVertex`]es the
+/// skinned drawers read by instance range.
+pub const SKIN_VERTICES: helio_core::PoolContract<SkinVertex> =
+    helio_core::PoolContract::new(SKELETAL_SKIN_VERTICES);
+
+/// [`SKELETAL_BONE_PALETTE`] as a contract: a pool of joint matrices (the
+/// current palette followed by the previous frame's, per instance).
+pub const BONE_PALETTE: helio_core::PoolContract<[[f32; 4]; 4]> =
+    helio_core::PoolContract::new(SKELETAL_BONE_PALETTE);
+
+/// [`VG_INSTANCES`] as a contract: [`helio_vg_format::GpuVgInstance`] rows.
+pub const VG_INSTANCE_ROWS: helio_core::BufferContract<helio_vg_format::GpuVgInstance> =
+    helio_core::BufferContract::new(VG_INSTANCES);
+
+/// The scene join's structure marker: a buffer whose `content_generation`
+/// moves only when objects are added, removed or change what they are (mesh,
+/// material, flags), not when they move. It carries no rows (handle
+/// `row_bytes` 0), only the generation; consumers that sort and group on the
+/// objects keep their work while it is unchanged.
+pub const OBJECTS_STRUCTURE: helio_core::BufferContract<()> =
+    helio_core::BufferContract::new("scene_objects_structure");
+
+/// The object slots (rows of [`STATIC_OBJECTS`]) a frame that only moved
+/// objects rewrote, as `[total, fresh, slot, ..]` words: this frame's moved
+/// slots plus the previous frame's. Published only for a run whose list is
+/// complete; like [`OBJECTS_STRUCTURE`] it has no row stride (handle
+/// `row_bytes` 0).
+pub const OBJECTS_MOVED: helio_core::BufferContract<()> =
+    helio_core::BufferContract::new("scene_objects_moved");
+
+/// One `u32` per [`STATIC_OBJECTS`] row: non-zero = the row belongs to a
+/// virtual-geometry-active instance, so the main view's classic draw skips it
+/// (shadows keep the classic geometry as the proxy).
+pub const CLASSIC_SUPPRESSED: helio_core::BufferContract<u32> =
+    helio_core::BufferContract::new("classic_suppressed");
+
 /// The buffer the renderer reads [`StaticObjectRow`]s from. Engines produce it
 /// (a SceneDB component stored under this key, or a scene derivation).
 pub const STATIC_OBJECTS: helio_core::BufferContract<StaticObjectRow> =

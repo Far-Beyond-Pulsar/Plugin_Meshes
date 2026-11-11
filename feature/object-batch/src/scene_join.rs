@@ -104,7 +104,7 @@ pub struct SceneJoinKeys {
     pub material_keys: BufferKey,
 }
 
-pub const OBJECTS_KEY: BufferKey = BufferKey::of("static_objects");
+pub const OBJECTS_KEY: BufferKey = helio_mesh_api::STATIC_OBJECTS.key();
 /// The materials' table the object rows index (the material instances'
 /// rows, not this join's).
 pub const MATERIALS_KEY: BufferKey = helio_mats::MATERIALS.key();
@@ -113,13 +113,13 @@ pub const MATERIALS_KEY: BufferKey = helio_mats::MATERIALS.key();
 /// material or flags changed), not when objects merely move. The object batch
 /// keeps its sort and grouping while this is unchanged. The name is shared
 /// with `helio-pass-object-batch`, which reads it.
-pub const OBJECTS_STRUCTURE_KEY: BufferKey = BufferKey::of("scene_objects_structure");
+pub const OBJECTS_STRUCTURE_KEY: BufferKey = helio_mesh_api::OBJECTS_STRUCTURE.key();
 /// The object slots (rows of `static_objects`) a frame that only moved objects
 /// rewrote, as `[total, fresh, slot, ..]` words: this frame's moved slots plus
 /// the previous frame's, so a consumer can settle both. Published only for a
 /// run whose list is complete (`content_generation` equals the objects' own);
 /// otherwise every object row must be treated as moved.
-pub const OBJECTS_MOVED_KEY: BufferKey = BufferKey::of("scene_objects_moved");
+pub const OBJECTS_MOVED_KEY: BufferKey = helio_mesh_api::OBJECTS_MOVED.key();
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

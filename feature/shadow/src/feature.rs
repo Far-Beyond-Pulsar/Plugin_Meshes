@@ -23,6 +23,11 @@ impl Feature for ShadowDrawers {
     }
 
     fn register(&self, registrar: &mut FeatureRegistrar<'_>) {
+        registrar.consumes(helio_mesh_api::MESH_INDICES);
+        registrar.consumes(helio_mesh_api::MESH_VERTICES);
+        registrar.consumes(helio_mats::MATERIALS);
+        registrar.consumes(helio_mesh_api::BONE_PALETTE);
+        registrar.consumes(helio_mesh_api::SKIN_VERTICES);
         // What shader hot reload may swap without rebuilding the graph: the
         // dirty pass holds the lights' dirty flags (whose passes declare the
         // same handle) and shares its face buffers with the shadow pass.

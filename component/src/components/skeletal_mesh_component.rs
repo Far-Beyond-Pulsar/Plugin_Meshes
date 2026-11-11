@@ -32,15 +32,8 @@ pub const SKELETAL_MESH_ASSET_KIND: &str = SkeletalMeshAssetKind::KIND;
 pub const SKELETAL_SKIN_HANDLES_BUFFER: &str = "skeletal_skin_vertices::handles";
 pub const SKELETAL_PALETTE_HANDLES_BUFFER: &str = "skeletal_bone_palette::handles";
 
-/// Per-vertex four-influence skin data. Kept in a storage buffer parallel to
-/// `builtin_mesh_vertex`, so static geometry keeps its established vertex ABI.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct SkinVertex {
-    pub joints: [u32; 4],
-    pub weights: [f32; 4],
-}
-unsafe impl pulsar_scenedb::page::Pod for SkinVertex {}
+/// Per-vertex skin data: the meshes api owns the row (`SKIN_VERTICES`).
+pub use helio_mesh_api::SkinVertex;
 
 #[derive(Clone)]
 pub struct LoadedSkeletalMesh(pub Arc<skeletal_assets::skmesh::SkeletalMeshAsset>);
@@ -100,7 +93,7 @@ pub struct SkeletalMeshComponent {
     #[gpu(buffer = "builtin_mesh_index", mirror = Once, content_id = "geometry_key")]
     #[serde(skip)]
     pub indices: Vec<u32>,
-    // `helio_mesh_api::SKELETAL_SKIN_VERTICES` (an attribute takes no const;
+    // `helio_mesh_api::SKIN_VERTICES` (an attribute takes no const;
     // `skin_buffers_are_the_mesh_api_keys` pins it).
     #[gpu(buffer = "skeletal_skin_vertices", mirror = Once, content_id = "geometry_key")]
     #[serde(skip)]

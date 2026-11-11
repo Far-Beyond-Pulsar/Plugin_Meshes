@@ -84,7 +84,7 @@ pub use helio_vg_format::{
 
 /// The VG instance rows (`GpuVgInstance`, 16 B each), one per VG-active
 /// instance. See the module doc.
-pub const VG_INSTANCES_KEY: BufferKey = BufferKey::of(helio_mesh_api::VG_INSTANCES);
+pub const VG_INSTANCES_KEY: BufferKey = helio_mesh_api::VG_INSTANCE_ROWS.key();
 /// One 16-byte row; word 0 is the number of valid rows in [`VG_INSTANCES_KEY`].
 pub const VG_INSTANCE_COUNT_KEY: BufferKey = BufferKey::of("vg_instance_count");
 /// Generic authored-LOD suppression flags, one `u32` per object entity index.
@@ -92,7 +92,7 @@ pub const LOD_SUPPRESSED_KEY: BufferKey = BufferKey::of("lod_suppressed");
 /// One `u32` per `static_objects` row: non-zero = the row belongs to a VG-active
 /// instance, so the classic main view must not draw it (the object batch honours
 /// the key generically; shadows keep using the classic geometry as the proxy).
-pub const CLASSIC_SUPPRESSED_KEY: BufferKey = BufferKey::of("classic_suppressed");
+pub const CLASSIC_SUPPRESSED_KEY: BufferKey = helio_mesh_api::CLASSIC_SUPPRESSED.key();
 /// Asset readiness rows published by `helio-vg-stream`. See the module doc.
 pub const VG_ASSET_READY_KEY: BufferKey = BufferKey::of("vg_asset_ready");
 

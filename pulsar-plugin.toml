@@ -6,7 +6,17 @@ id = "pulsar.meshes"
 name = "Meshes"
 description = "Static, skeletal and virtual-geometry meshes: their batching, culling, drawers and asset import"
 enabled_by_default = true
-requires = []
+provides = [
+    { id = "pulsar.meshes.rows", kind = "buffer", members = ["static_objects", "render_groups", "builtin_mesh_vertex", "builtin_mesh_index", "skeletal_skin_vertices", "skeletal_bone_palette", "vg_instances", "scene_objects_structure", "scene_objects_moved", "classic_suppressed"], version = 1 },
+    { id = "pulsar.meshes.api", kind = "api", members = ["helio-mesh-api", "meshes_component", "helio-pass-gbuffer", "helio-pass-object-batch", "helio-pass-indirect-dispatch", "helio-pass-occlusion-cull"], version = 1 },
+]
+requires = [
+    { id = "pulsar.lights.rows", optional = true },
+    { id = "pulsar.lights.api", optional = true },
+    { id = "pulsar.materials.table", optional = true },
+    { id = "pulsar.materials.api", optional = true },
+    { id = "pulsar.animation.api", optional = true },
+]
 
 # The plugin's root crate (the package in this directory): the one place it
 # registers everything it contributes. A game links it without its `editor`

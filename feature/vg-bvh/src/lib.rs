@@ -67,13 +67,13 @@ pub const BUILD_WGSL: &str = include_str!("../shaders/vg_bvh_build.wgsl");
 /// Names of the buffers this pass reads and publishes.
 pub mod keys {
     /// Input: `array<GpuVgInstance>` (scene buffer).
-    pub const INSTANCES: &str = helio_mesh_api::VG_INSTANCES;
+    pub const INSTANCES: &str = helio_mesh_api::VG_INSTANCE_ROWS.name();
     /// Input: the scene join's object rows (scene buffer).
-    pub const STATIC_OBJECTS: &str = "static_objects";
+    pub const STATIC_OBJECTS: &str = helio_mesh_api::STATIC_OBJECTS.name();
     /// Input: the scene join's structure marker, as in `helio-pass-object-batch`.
-    pub const STRUCTURE: &str = "scene_objects_structure";
+    pub const STRUCTURE: &str = helio_mesh_api::OBJECTS_STRUCTURE.name();
     /// Input: the scene join's moved-slot list (see crate docs).
-    pub const MOVED: &str = "scene_objects_moved";
+    pub const MOVED: &str = helio_mesh_api::OBJECTS_MOVED.name();
     /// Output: `array<VgBvhNode>`.
     pub const NODES: &str = "vg_gcbvh_nodes";
     /// Output: `VgBvhHeader`.
