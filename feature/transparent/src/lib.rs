@@ -476,9 +476,7 @@ impl RenderPass for TransparentPass {
         // `LightsFrameData` bridge's `movable_light_count`, production's
         // actual light count today -- see `ForwardLitPass`'s identical
         // `light_mode_direct_index` doc for the full reasoning.
-        let scene_lights = ctx
-            .scene_buffers
-            .get(helio_light_api::SCENE_LIGHTS.key());
+        let scene_lights = ctx.scene_buffers.get(helio_light_api::SCENE_LIGHTS.key());
         let use_direct_index = scene_lights.is_some();
         let light_count = scene_lights.map_or(0, |lights| lights.row_capacity());
         ctx.write_buffer(
@@ -613,9 +611,7 @@ impl RenderPass for TransparentPass {
         let cluster = ctx.registry.get::<helio_light_api::ClusterLightGrid<'_>>(
             helio_core::ResourceKey::new(helio_light_api::CLUSTER_LIGHT_GRID),
         );
-        let lights_handle = ctx
-            .scene_buffers
-            .get(helio_light_api::SCENE_LIGHTS.key());
+        let lights_handle = ctx.scene_buffers.get(helio_light_api::SCENE_LIGHTS.key());
         let lights_buf = lights_handle
             .map(|handle| &handle.buffer)
             .unwrap_or(batch.instances);

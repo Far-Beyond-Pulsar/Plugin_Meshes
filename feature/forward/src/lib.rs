@@ -464,9 +464,7 @@ impl RenderPass for ForwardLitPass {
         let num_tiles_y = ctx.height.div_ceil(TILE_SIZE);
 
         // The lights' light list (its live rows).
-        let scene_lights = ctx
-            .scene_buffers
-            .get(helio_light_api::SCENE_LIGHTS.key());
+        let scene_lights = ctx.scene_buffers.get(helio_light_api::SCENE_LIGHTS.key());
         let light_count = scene_lights.map_or(0, |lights| lights.row_capacity());
 
         let globals = ForwardLitGlobals {
@@ -535,9 +533,7 @@ impl RenderPass for ForwardLitPass {
             .unwrap_or(stand_in.rows());
         let materials_epoch = materials_handle.map(|handle| handle.epoch).unwrap_or(0);
 
-        let lights_handle = ctx
-            .scene_buffers
-            .get(helio_light_api::SCENE_LIGHTS.key());
+        let lights_handle = ctx.scene_buffers.get(helio_light_api::SCENE_LIGHTS.key());
         let lights_buf = lights_handle
             .map(|handle| &handle.buffer)
             .unwrap_or(batch.instances);

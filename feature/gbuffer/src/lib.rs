@@ -840,12 +840,8 @@ impl RenderPass for GBufferPass {
         let coordinate_spaces_prev_buf = coord_spaces
             .map(|c| c.coordinate_spaces_prev)
             .unwrap_or(ctx.camera);
-        let skin_handle = ctx
-            .scene_buffers
-            .get(helio_mesh_api::SKIN_VERTICES.key());
-        let palette_handle = ctx
-            .scene_buffers
-            .get(helio_mesh_api::BONE_PALETTE.key());
+        let skin_handle = ctx.scene_buffers.get(helio_mesh_api::SKIN_VERTICES.key());
+        let palette_handle = ctx.scene_buffers.get(helio_mesh_api::BONE_PALETTE.key());
         let skin_buf = skin_handle
             .map(|handle| &handle.buffer)
             .unwrap_or(&self.fallback_skeletal_storage);

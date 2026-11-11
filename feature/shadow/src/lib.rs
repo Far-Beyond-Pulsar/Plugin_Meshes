@@ -651,12 +651,8 @@ impl RenderPass for ShadowPass {
             return Ok(());
         };
         let desired = data.desired_matrices.unwrap_or(data.shadow_matrices);
-        let skin = ctx
-            .scene_buffers
-            .get(helio_mesh_api::SKIN_VERTICES.key());
-        let palette = ctx
-            .scene_buffers
-            .get(helio_mesh_api::BONE_PALETTE.key());
+        let skin = ctx.scene_buffers.get(helio_mesh_api::SKIN_VERTICES.key());
+        let palette = ctx.scene_buffers.get(helio_mesh_api::BONE_PALETTE.key());
         let key = [
             desired.clone(),
             batch.instances.clone(),

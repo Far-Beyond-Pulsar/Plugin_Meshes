@@ -1,9 +1,9 @@
 //! What the meshes plugin registers for a game (and the editor): every
 //! runtime contribution, grouped by the engine seam it plugs into.
 
-use engine_backend::scene::{ClassSpec, ComponentsBuilder};
-use engine_backend::scene::ObjectJoinRegistration;
 use engine_backend::scene::game_hooks::ContentReportRegistration;
+use engine_backend::scene::ObjectJoinRegistration;
+use engine_backend::scene::{ClassSpec, ComponentsBuilder};
 use engine_backend::subsystems::render::helio_renderer::{
     ContentGeometryRegistration, RenderHostPartRegistration,
 };
@@ -14,7 +14,7 @@ use helio_component::skinning::SkinnedMeshAccess;
 use meshes_component::components::{self, SkeletalMeshComponent};
 use meshes_component::mesh_materials::MeshMaterialInstances;
 use meshes_component::{
-    LODComponent, MESH_BOUNDS_BUFFER, StaticMeshComponent, VirtualGeometryComponent,
+    LODComponent, StaticMeshComponent, VirtualGeometryComponent, MESH_BOUNDS_BUFFER,
 };
 use plugin_editor_api::AssetKind;
 use pulsar_scenedb::gpu::BufferKey;
@@ -97,7 +97,11 @@ pub(crate) fn build(p: &mut pulsar_plugins::PluginBuilder) {
     p.add(MovabilityRegistration {
         origin: p.origin(),
         name: "meshes",
-        of: |world, instance| world.get::<StaticMeshComponent>(instance).map(|mesh| mesh.movability),
+        of: |world, instance| {
+            world
+                .get::<StaticMeshComponent>(instance)
+                .map(|mesh| mesh.movability)
+        },
     });
 
     // An animator (the animation plugin's) finds the skinned mesh it drives and
@@ -212,10 +216,9 @@ mod tests {
             .into_iter()
             .filter(|summary| summary.origin == pulsar_plugins::origin!())
             .collect();
-        assert!(
-            ours.iter()
-                .any(|summary| summary.category == "component.class")
-        );
+        assert!(ours
+            .iter()
+            .any(|summary| summary.category == "component.class"));
         for summary in &ours {
             assert_eq!(
                 pulsar_plugins::plugin_of(summary.origin).map(|plugin| plugin.id.as_str()),

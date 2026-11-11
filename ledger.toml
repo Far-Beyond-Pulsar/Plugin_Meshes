@@ -203,7 +203,7 @@ status = "unverified"
 [[buffer]]
 key = "classic_suppressed"
 producers = []
-consumers = ["meshes_component"]
+consumers = ["helio-pass-object-batch", "meshes_component"]
 owner = "helio_component::virtual_geometry_instances (output); helio-pass-object-batch (reader)"
 disposition = "keep: execution data. One u32 per static_objects row, non-zero for every section row of a VG-active instance; the object batch tags the instance INSTANCE_FLAG_CLASSIC_SUPPRESSED and the main-view frustum cull skips it so virtual geometry does not double-draw. Shadow passes still draw the row: the classic geometry is the shadow proxy (plan D5). Neither side knows the other's types"
 target_contract = "Phase 4; 03-gpu-reflection-and-rendering.md"
@@ -223,7 +223,7 @@ status = "verified"
 [[buffer]]
 key = "static_mesh_draw_bounds"
 producers = ["StaticMeshDraw"]
-consumers = []
+consumers = ["meshes_component", "meshes_plugin"]
 owner = "meshes_component::components::static_mesh_draw"
 disposition = "keep: a mesh instance's local bounds; the scene join transforms them for culling"
 target_contract = "Phase 2; 03-gpu-reflection-and-rendering.md"
@@ -233,7 +233,7 @@ status = "verified"
 [[buffer]]
 key = "static_mesh_draw_flags"
 producers = ["StaticMeshDraw"]
-consumers = []
+consumers = ["meshes_component"]
 owner = "meshes_component::components::static_mesh_draw"
 disposition = "keep: a mesh instance's object-row flags (movable); static/movable edits reach the draw rows through it"
 target_contract = "Phase 2; 03-gpu-reflection-and-rendering.md"
@@ -243,7 +243,7 @@ status = "verified"
 [[buffer]]
 key = "static_mesh_draw_sections"
 producers = ["StaticMeshDraw"]
-consumers = []
+consumers = ["meshes_component"]
 owner = "meshes_component::components::static_mesh_draw"
 disposition = "keep: one draw section with its resolved material per mesh section; one output object row per pool slot"
 target_contract = "Phase 2; 03-gpu-reflection-and-rendering.md"
@@ -263,7 +263,7 @@ status = "verified"
 [[buffer]]
 key = "skeletal_bone_palette"
 producers = ["SkeletalMeshComponent"]
-consumers = []
+consumers = ["helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-portal-instances", "helio-pass-shadow", "helio-pass-transparent"]
 owner = "helio_component (SkeletalMeshComponent)"
 disposition = "keep: each instance's current and previous joint matrices, in the mesh's own space; passes skin the vertex before the instance's model matrix, so a moved camera origin needs nothing here"
 target_contract = "SceneDB#84; 03-gpu-reflection-and-rendering.md"
@@ -273,7 +273,7 @@ status = "unverified"
 [[buffer]]
 key = "skeletal_skin_vertices"
 producers = ["SkeletalMeshComponent"]
-consumers = []
+consumers = ["helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-portal-instances", "helio-pass-shadow", "helio-pass-transparent"]
 owner = "helio_component (SkeletalMeshComponent)"
 disposition = "keep: four joint indices and weights per vertex, parallel to builtin_mesh_vertex so static geometry keeps its vertex layout"
 target_contract = "SceneDB#84; 03-gpu-reflection-and-rendering.md"
@@ -283,7 +283,7 @@ status = "unverified"
 [[buffer]]
 key = "builtin_mesh_index"
 producers = ["MeshComponent", "SkeletalMeshComponent", "StaticMeshComponent"]
-consumers = ["meshes_component"]
+consumers = ["helio-mesh-host", "helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-gi", "helio-pass-portal-instances", "helio-pass-shadow", "helio-pass-transparent", "meshes_component"]
 owner = "helio_component (StaticMeshComponent pools); also declared by gbuffer's MeshComponent"
 disposition = "keep: same as builtin_mesh_vertex"
 target_contract = "Phase 2; 03-gpu-reflection-and-rendering.md"
@@ -293,7 +293,7 @@ status = "verified"
 [[buffer]]
 key = "builtin_mesh_vertex"
 producers = ["MeshComponent", "SkeletalMeshComponent", "StaticMeshComponent"]
-consumers = ["meshes_component"]
+consumers = ["helio-mesh-host", "helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-gi", "helio-pass-portal-instances", "helio-pass-shadow", "helio-pass-transparent", "meshes_component"]
 owner = "helio_component (StaticMeshComponent pools); also declared by gbuffer's MeshComponent"
 disposition = "keep: authored StaticMeshComponent pools are the canonical geometry; retire or merge the second, pass-owned producer"
 target_contract = "Phase 2; 03-gpu-reflection-and-rendering.md"
@@ -303,7 +303,7 @@ status = "verified"
 [[buffer]]
 key = "mesh_material_rows"
 producers = ["MeshMaterialRows"]
-consumers = []
+consumers = ["meshes_component"]
 owner = "meshes_component::mesh_materials (MeshMaterialRows)"
 disposition = "keep: each mesh's slot -> material instance row table; the scene join reads it per section"
 target_contract = "p17; plugin-migration.md (material instances)"
@@ -373,7 +373,7 @@ status = "unverified"
 [[buffer]]
 key = "scene_objects_moved"
 producers = []
-consumers = ["helio-pass-object-batch"]
+consumers = ["helio-pass-object-batch", "helio-pass-vg-bvh"]
 owner = "helio-pass-object-batch"
 disposition = "keep: the kind's own, moved with it into its plugin (plugin-migration.md Phases B and C)"
 target_contract = "Phase C; plugin-migration.md"
@@ -383,7 +383,7 @@ status = "unverified"
 [[buffer]]
 key = "scene_objects_structure"
 producers = []
-consumers = ["helio-pass-object-batch"]
+consumers = ["helio-pass-object-batch", "helio-pass-vg-bvh"]
 owner = "helio-pass-object-batch"
 disposition = "keep: the kind's own, moved with it into its plugin (plugin-migration.md Phases B and C)"
 target_contract = "Phase C; plugin-migration.md"
@@ -395,7 +395,7 @@ status = "unverified"
 [[pass]]
 crate = "helio-pass-forward-lit"
 in_default_graph = false
-reads = []
+reads = ["builtin_mesh_index", "builtin_mesh_vertex", "materials", "scene_lights", "skeletal_bone_palette", "skeletal_skin_vertices"]
 owner = "helio-presets (mapping); helio-pass-forward-lit (algorithm)"
 disposition = "not in the engine's graph: part of Helio's forward graph, not the engine's deferred graph"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -405,7 +405,7 @@ status = "out-of-scope"
 [[pass]]
 crate = "helio-pass-gbuffer"
 in_default_graph = false
-reads = []
+reads = ["builtin_mesh_index", "builtin_mesh_vertex", "materials", "scene_lights", "skeletal_bone_palette", "skeletal_skin_vertices"]
 owner = "helio-presets (mapping); helio-pass-gbuffer (algorithm)"
 disposition = "keep: draws the joined mesh rows and the authored mesh pools (Phase 2)"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -425,7 +425,7 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-object-batch"
 in_default_graph = false
-reads = ["scene_objects_moved", "scene_objects_structure", "static_objects"]
+reads = ["classic_suppressed", "materials", "scene_objects_moved", "scene_objects_structure", "static_objects"]
 owner = "helio-presets (mapping); helio-pass-object-batch (algorithm)"
 disposition = "keep: reads the scene join's draw and material rows (static_objects, materials), built on the GPU from authored StaticMeshComponent pools (Phase 2)"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -445,7 +445,7 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-shadow"
 in_default_graph = false
-reads = []
+reads = ["builtin_mesh_index", "builtin_mesh_vertex", "materials", "skeletal_bone_palette", "skeletal_skin_vertices"]
 owner = "helio-presets (mapping); helio-pass-shadow (algorithm)"
 disposition = "keep: draws the authored mesh pools into shadow maps for the joined lights"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -465,7 +465,7 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-transparent"
 in_default_graph = false
-reads = []
+reads = ["builtin_mesh_index", "builtin_mesh_vertex", "materials", "scene_lights", "skeletal_bone_palette", "skeletal_skin_vertices"]
 owner = "helio-presets (mapping); helio-pass-transparent (algorithm)"
 disposition = "keep: reads the authored mesh pools, materials and joined lights, all verified upstream; the pass runs in the editor graph"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -475,7 +475,7 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-vg-bvh"
 in_default_graph = false
-reads = []
+reads = ["scene_objects_moved", "scene_objects_structure", "static_objects", "vg_instances"]
 owner = "helio-presets (mapping); helio-pass-vg-bvh (algorithm)"
 disposition = "keep: the global instance BVH (GPU LBVH + refit, batch leaves) built from the vg_instances and static_objects scene buffers each frame; execution data only (vg_gcbvh_nodes/header/items are graph resources, not a second scene owner)"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -495,7 +495,7 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-vg-dense"
 in_default_graph = false
-reads = []
+reads = ["materials"]
 owner = "helio-presets (mapping); helio-pass-vg-dense (algorithm)"
 disposition = "keep: Tier 3 over dense tiles, the 3-NonRT depth peel driven from the graph; the 3-RT backend exists and is tested but is not driven from the graph (it needs a CPU instance list and proxy-LOD assets, T13). Execution data only"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -505,7 +505,7 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-vg-raster"
 in_default_graph = false
-reads = []
+reads = ["materials"]
 owner = "helio-presets (mapping); helio-pass-vg-raster (algorithm)"
 disposition = "keep: Tier 1 hardware raster by vertex pulling, Tier 2 software micro-raster (64-bit atomic or tiled fallback), the phase-0 Hi-Z build and dense-tile classification, as early/late graph passes over the visible-cluster bins; execution data only"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -515,7 +515,7 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-vg-shade"
 in_default_graph = false
-reads = []
+reads = ["materials", "scene_lights"]
 owner = "helio-presets (mapping); helio-pass-vg-shade (algorithm)"
 disposition = "keep: vis resolve, material binning, shading through the classic G-buffer material evaluator (reads the materials scene buffer; the light count from scene_lights) and the final depth; writes the same G-buffer and depth the classic pass writes"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -525,7 +525,7 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-vg"
 in_default_graph = false
-reads = []
+reads = ["materials", "static_objects"]
 owner = "helio-pass-vg"
 disposition = "keep: the kind's own, moved with it into its plugin (plugin-migration.md Phases B and C)"
 target_contract = "Phase C; plugin-migration.md"
@@ -617,9 +617,83 @@ status = "out-of-scope"
 [[buffer]]
 key = "static_objects"
 producers = ["StaticObjectComponent"]
-consumers = ["helio-pass-object-batch"]
+consumers = ["helio-pass-object-batch", "helio-pass-vg", "helio-pass-vg-bvh", "meshes_component"]
 owner = "helio-scene-derivations scene join (execution output; Helio demos still insert StaticObjectComponent)"
 disposition = "keep: draw rows are joined on the GPU from authored mesh instances, owner transform and visibility each frame the inputs change (Phase 2)"
 target_contract = "Phase 2; 03-gpu-reflection-and-rendering.md"
 test = "plugins/vendor/meshes/tests/scene_join_rows.rs"
+status = "verified"
+
+# ── Standalone-host rows linked by the meshes editor's thumbnails ──
+
+[[schema]]
+type = "MeshComponent"
+path = "helio_mesh_api::host_rows::MeshComponent"
+buffers = ["builtin_mesh_index", "builtin_mesh_vertex"]
+clears_on_remove = false
+releases_var_len = true
+registered = true
+writer = "the standalone host's scene (helio_snapshot's thumbnail World); the engine joins these rows from its own components"
+owner = "helio_mesh_api::host_rows"
+disposition = "standalone-host row: linked into the editor only by the meshes editor's thumbnail renderer (helio_snapshot, which renders through Helio's standalone host, helio-mesh-host and helio-light-host); written only in the snapshot's own offscreen World, never in a level's"
+target_contract = "Phase 4; plugin-migration.md (host rows for standalone hosts)"
+test = "plugins/vendor/meshes/snapshot (thumbnails); plugins/vendor/meshes/editor thumbnails"
+status = "verified"
+
+[[schema]]
+type = "RenderGroupComponent"
+path = "helio_mesh_api::host_rows::RenderGroupComponent"
+buffers = ["render_groups"]
+clears_on_remove = true
+releases_var_len = false
+registered = false
+writer = "the standalone host's scene (helio_snapshot's thumbnail World); the engine joins these rows from its own components"
+owner = "helio_mesh_api::host_rows"
+disposition = "standalone-host row: linked into the editor only by the meshes editor's thumbnail renderer (helio_snapshot, which renders through Helio's standalone host, helio-mesh-host and helio-light-host); written only in the snapshot's own offscreen World, never in a level's"
+target_contract = "Phase 4; plugin-migration.md (host rows for standalone hosts)"
+test = "plugins/vendor/meshes/snapshot (thumbnails); plugins/vendor/meshes/editor thumbnails"
+status = "verified"
+
+[[schema]]
+type = "StaticObjectComponent"
+path = "helio_mesh_api::host_rows::StaticObjectComponent"
+buffers = ["static_objects"]
+clears_on_remove = true
+releases_var_len = false
+registered = true
+writer = "the standalone host's scene (helio_snapshot's thumbnail World); the engine joins these rows from its own components"
+owner = "helio_mesh_api::host_rows"
+disposition = "standalone-host row: linked into the editor only by the meshes editor's thumbnail renderer (helio_snapshot, which renders through Helio's standalone host, helio-mesh-host and helio-light-host); written only in the snapshot's own offscreen World, never in a level's"
+target_contract = "Phase 4; plugin-migration.md (host rows for standalone hosts)"
+test = "plugins/vendor/meshes/snapshot (thumbnails); plugins/vendor/meshes/editor thumbnails"
+status = "verified"
+
+[[buffer]]
+key = "skeletal_bone_palette::handles"
+producers = []
+consumers = ["meshes_component"]
+owner = "meshes plugin (skeletal bone palette pool handles)"
+disposition = "keep: each skinned mesh's palette range, written by meshes_component; seen since the scan follows contract consts (p22)"
+target_contract = "Phase 3; .agents/PLUGIN_API_REFACTOR_PLAN.md section 14"
+test = "none: no test covers SkeletalMeshComponent yet"
+status = "unverified"
+
+[[buffer]]
+key = "skeletal_skin_vertices::handles"
+producers = []
+consumers = ["meshes_component"]
+owner = "meshes plugin (skin vertex pool handles)"
+disposition = "keep: each skinned mesh's skin stream range, written by meshes_component; seen since the scan follows contract consts (p22)"
+target_contract = "Phase 3; .agents/PLUGIN_API_REFACTOR_PLAN.md section 14"
+test = "none: no test covers SkeletalMeshComponent yet"
+status = "unverified"
+
+[[buffer]]
+key = "vg_instances"
+producers = []
+consumers = ["helio-pass-vg-bvh", "meshes_component"]
+owner = "meshes plugin (virtual geometry instances; contract helio_mesh_api::VG_INSTANCE_ROWS)"
+disposition = "keep: the virtual-geometry instances, read through the meshes' contract const since p22"
+target_contract = "Phase 3; .agents/PLUGIN_API_REFACTOR_PLAN.md section 14"
+test = "plugins/installed/tests/virtual_geometry_acceptance.rs"
 status = "verified"
