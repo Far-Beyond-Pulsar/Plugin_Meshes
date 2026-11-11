@@ -7,7 +7,7 @@ pub mod feature;
 pub use feature::ShadowDrawers;
 
 use helio_core::graph::ResourceBuilder;
-use helio_core::{BufferKey, PassContext, PrepareContext, RenderPass, Result as HelioResult};
+use helio_core::{PassContext, PrepareContext, RenderPass, Result as HelioResult};
 use std::sync::Arc;
 
 mod transmittance;
@@ -546,8 +546,8 @@ impl RenderPass for ShadowPass {
             helio_mesh_api::MESH_INDICES.name(),
             helio_mesh_api::MESH_VERTICES.name(),
             helio_mats::MATERIALS.name(),
-            helio_mesh_api::SKELETAL_BONE_PALETTE,
-            helio_mesh_api::SKELETAL_SKIN_VERTICES,
+            helio_mesh_api::BONE_PALETTE.name(),
+            helio_mesh_api::SKIN_VERTICES.name(),
         ];
         LIST
     }
@@ -651,12 +651,8 @@ impl RenderPass for ShadowPass {
             return Ok(());
         };
         let desired = data.desired_matrices.unwrap_or(data.shadow_matrices);
-        let skin = ctx
-            .scene_buffers
-            .get(BufferKey::of(helio_mesh_api::SKELETAL_SKIN_VERTICES));
-        let palette = ctx
-            .scene_buffers
-            .get(BufferKey::of(helio_mesh_api::SKELETAL_BONE_PALETTE));
+        let skin = ctx.scene_buffers.get(helio_mesh_api::SKIN_VERTICES.key());
+        let palette = ctx.scene_buffers.get(helio_mesh_api::BONE_PALETTE.key());
         let key = [
             desired.clone(),
             batch.instances.clone(),

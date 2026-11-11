@@ -18,7 +18,6 @@ editor = ["dep:meshes_editor", "dep:ui_level_editor", "dep:ui_common", "dep:ui",
 helio-mesh-api = { workspace = true }
 # The plugin gate and the registrations' collection.
 pulsar_plugins = { workspace = true }
-inventory = { workspace = true }
 # The plugin's crates.
 meshes_component = { workspace = true }
 meshes_editor = { workspace = true, optional = true }

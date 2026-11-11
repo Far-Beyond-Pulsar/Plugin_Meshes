@@ -9,8 +9,7 @@
 
 use helio_core::graph::ResourceBuilder;
 use helio_core::{
-    BufferKey, PassContext, PrepareContext, RenderPass, ResourceKey, Result as HelioResult,
-    ViewGroup,
+    PassContext, PrepareContext, RenderPass, ResourceKey, Result as HelioResult, ViewGroup,
 };
 use helio_pass_vg_cull::{VgCullFrameData, VgCullInputs, KEY_CULL, KEY_INPUTS};
 use helio_pass_vg_dense::{VgDenseFrameData, KEY_DENSE};
@@ -179,7 +178,10 @@ impl VgShadePass {
 
 impl RenderPass for VgShadePass {
     fn scene_buffers(&self) -> &'static [&'static str] {
-        const LIST: &[&str] = &[helio_mats::MATERIALS.name(), helio_light_api::LIGHT_LIST];
+        const LIST: &[&str] = &[
+            helio_mats::MATERIALS.name(),
+            helio_light_api::SCENE_LIGHTS.name(),
+        ];
         LIST
     }
 
@@ -252,7 +254,7 @@ impl RenderPass for VgShadePass {
             delta_time: ctx.delta_time,
             light_count: ctx
                 .scene_buffers
-                .get(BufferKey::of(helio_light_api::LIGHT_LIST))
+                .get(helio_light_api::SCENE_LIGHTS.key())
                 .map_or(0, |lights| lights.row_capacity()),
             ambient_intensity,
             ambient_color,

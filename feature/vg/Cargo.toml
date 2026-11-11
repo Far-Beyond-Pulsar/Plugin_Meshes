@@ -8,6 +8,8 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # The instances' buffer, declared untraced geometry.
 helio-mesh-api = { workspace = true }
+# The light list the shade pass reads, recorded as this feature's read.
+helio-light-api = { workspace = true }
 helio-mats = { workspace = true }
 helio-frame-api = { workspace = true }
 helio-core = { workspace = true }

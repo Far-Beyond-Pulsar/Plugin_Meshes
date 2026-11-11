@@ -3,6 +3,7 @@
 
 use engine_backend::scene::ObjectJoinRegistration;
 use engine_backend::scene::game_hooks::ContentReportRegistration;
+use engine_backend::scene::{ClassSpec, ComponentsBuilder};
 use engine_backend::subsystems::render::helio_renderer::{
     ContentGeometryRegistration, RenderHostPartRegistration,
 };
@@ -18,107 +19,95 @@ use meshes_component::{
 use plugin_editor_api::AssetKind;
 use pulsar_scenedb::gpu::BufferKey;
 
-// ── Component classes ───────────────────────────────────────────────────────
+/// Everything the plugin registers for a game (and the editor).
+pub(crate) fn build(p: &mut pulsar_plugins::PluginBuilder) {
+    // ── Component classes ───────────────────────────────────────────────────
 
-pulsar_world_registry::submit_world_component!(
-    StaticMeshComponent,
-    SkeletalMeshComponent,
-    LODComponent,
-    VirtualGeometryComponent,
-);
+    p.components()
+        .class::<StaticMeshComponent>(ClassSpec::default())
+        .class::<SkeletalMeshComponent>(ClassSpec::default())
+        .class::<LODComponent>(ClassSpec::default())
+        .class::<VirtualGeometryComponent>(ClassSpec::default());
 
-// ── Rendering ───────────────────────────────────────────────────────────────
+    // ── Rendering ───────────────────────────────────────────────────────────
 
-// The object batch (first in the frame's prepare slot), its culling, the
-// G-buffer, shadow, forward and transparent drawers and virtual geometry.
-inventory::submit! {
-    RenderFeatureRegistration {
-        origin: pulsar_plugins::origin!(),
+    // The object batch (first in the frame's prepare slot), its culling, the
+    // G-buffer, shadow, forward and transparent drawers and virtual geometry.
+    p.add(RenderFeatureRegistration {
+        origin: p.origin(),
         features: meshes_component::render_features,
         configure: meshes_component::configure_renderer,
-    }
-}
+    });
 
-// The scene join: first, since the other joins and the row joins read the
-// object rows it writes.
-inventory::submit! {
-    ObjectJoinRegistration {
-        origin: pulsar_plugins::origin!(),
+    // The scene join: first, since the other joins and the row joins read the
+    // object rows it writes.
+    p.add(ObjectJoinRegistration {
+        origin: p.origin(),
         name: "meshes",
         order: 0,
         owner_bounds: Some(BufferKey::of(MESH_BOUNDS_BUFFER)),
         register_columns: meshes_component::register_columns,
         derivation: meshes_component::scene_join,
-    }
-}
+    });
 
-// The virtual-geometry host and the authored LOD selection.
-inventory::submit! {
-    RenderHostPartRegistration {
-        origin: pulsar_plugins::origin!(),
+    // The virtual-geometry host and the authored LOD selection.
+    p.add(RenderHostPartRegistration {
+        origin: p.origin(),
         name: "meshes",
         new: || Box::new(meshes_component::host_part::MeshesHostPart::new()),
-    }
-}
+    });
 
-// Picking, framing and debug geometry over enabled meshes.
-inventory::submit! {
-    ContentGeometryRegistration {
-        origin: pulsar_plugins::origin!(),
+    // Picking, framing and debug geometry over enabled meshes.
+    p.add(ContentGeometryRegistration {
+        origin: p.origin(),
         name: "meshes",
         local_bounds: meshes_component::mesh_local_bounds,
         hit: meshes_component::mesh_hit,
         triangles: meshes_component::mesh_triangles,
-    }
-}
+    });
 
-// A mesh drawn with a shader graph that reads the frame clock animates; the
-// answer changes when a mesh does or when an instance binds its material.
-inventory::submit! {
-    AnimatedContentRegistration {
-        origin: pulsar_plugins::origin!(),
+    // A mesh drawn with a shader graph that reads the frame clock animates; the
+    // answer changes when a mesh does or when an instance binds its material.
+    p.add(AnimatedContentRegistration {
+        origin: p.origin(),
         name: "meshes.mesh_changes",
         watch: |world| world.open_change_cursor::<StaticMeshComponent>(),
         animated: meshes_component::meshes_read_time,
-    }
-}
+    });
 
-inventory::submit! {
-    AnimatedContentRegistration {
-        origin: pulsar_plugins::origin!(),
+    p.add(AnimatedContentRegistration {
+        origin: p.origin(),
         name: "meshes.material_instance_changes",
         watch: |world| {
             world.open_change_cursor::<helio_mats::instance::MaterialInstanceComponent>()
         },
         animated: meshes_component::meshes_read_time,
-    }
-}
+    });
 
-// ── Scene ───────────────────────────────────────────────────────────────────
+    // ── Scene ───────────────────────────────────────────────────────────────
 
-// The material instances a mesh's slots hold.
-inventory::submit! {
-    pulsar_world_registry::SceneSubsystemRegistration {
-        origin: pulsar_plugins::origin!(),
+    // The material instances a mesh's slots hold.
+    p.add(pulsar_world_registry::SceneSubsystemRegistration {
+        origin: p.origin(),
         name: MeshMaterialInstances::NAME,
         install: |scene| scene.register_subsystem(MeshMaterialInstances::default()),
-    }
-}
+    });
 
-// What an object's mesh instances author fixes the object.
-inventory::submit! {
-    MovabilityRegistration {
-        origin: pulsar_plugins::origin!(),
+    // What an object's mesh instances author fixes the object.
+    p.add(MovabilityRegistration {
+        origin: p.origin(),
         name: "meshes",
-        of: |world, instance| world.get::<StaticMeshComponent>(instance).map(|mesh| mesh.movability),
-    }
-}
+        of: |world, instance| {
+            world
+                .get::<StaticMeshComponent>(instance)
+                .map(|mesh| mesh.movability)
+        },
+    });
 
-// An animator (the animation plugin's) finds the skinned mesh it drives and
-// shows its pose there (`helio_component::skinning`).
-inventory::submit! {
-    SkinnedMeshAccess {
-        origin: pulsar_plugins::origin!(),
+    // An animator (the animation plugin's) finds the skinned mesh it drives and
+    // shows its pose there (`helio_component::skinning`).
+    p.add(SkinnedMeshAccess {
+        origin: p.origin(),
         name: "meshes.skeletal",
         instance: |world, owner, ordinal| {
             pulsar_world_registry::instances::resolve_instance(
@@ -139,81 +128,67 @@ inventory::submit! {
                 .map(|mut mesh| mesh.show_pose(bones, pose))
                 .is_some()
         },
-    }
-}
+    });
 
-// A headless run reports the mesh components and how many bound geometry.
-inventory::submit! {
-    ContentReportRegistration {
-        origin: pulsar_plugins::origin!(),
+    // A headless run reports the mesh components and how many bound geometry.
+    p.add(ContentReportRegistration {
+        origin: p.origin(),
         key: "meshes",
         report: meshes_component::content_report,
-    }
-}
+    });
 
-// The `project.virtual_geometry` settings.
-inventory::submit! {
-    pulsar_settings::project::ProjectSettingsRegistration {
-        origin: pulsar_plugins::origin!(),
+    // The `project.virtual_geometry` settings.
+    p.add(pulsar_settings::project::ProjectSettingsRegistration {
+        origin: p.origin(),
         name: "meshes.virtual_geometry",
         register: meshes_component::vg_settings::register,
-    }
-}
+    });
 
-// ── Assets ──────────────────────────────────────────────────────────────────
+    // ── Assets ──────────────────────────────────────────────────────────────
 
-// A mesh asset dropped in a level becomes a static mesh component.
-inventory::submit! {
-    AssetComponentRegistration {
-        origin: pulsar_plugins::origin!(),
+    // A mesh asset dropped in a level becomes a static mesh component.
+    p.add(AssetComponentRegistration {
+        origin: p.origin(),
         asset_kind: AssetKind::Mesh,
         class_name: "StaticMeshComponent",
         value_for: |path| Box::new(StaticMeshComponent::for_mesh_asset(path)),
-    }
-}
+    });
 
-// A changed mesh file reloads its mesh asset.
-inventory::submit! {
-    AssetReloadRegistration {
-        origin: pulsar_plugins::origin!(),
+    // A changed mesh file reloads its mesh asset.
+    p.add(AssetReloadRegistration {
+        origin: p.origin(),
         name: "meshes",
         kind: AssetKind::Mesh,
         sources_for_file: |path| vec![meshes_component::mesh_source_for_file(path)],
-    }
-}
+    });
 
-// Models (FBX, glTF, OBJ, USD...) import as native mesh assets.
-inventory::submit! {
-    asset_import::importer::ImporterRegistration {
-        origin: pulsar_plugins::origin!(),
+    // Models (FBX, glTF, OBJ, USD...) import as native mesh assets.
+    p.add(asset_import::importer::ImporterRegistration {
+        origin: p.origin(),
         importer: &meshes_component::import::ModelImporter,
-    }
-}
+    });
 
-// ── Level records ───────────────────────────────────────────────────────────
+    // ── Level records ───────────────────────────────────────────────────────
 
-inventory::submit! {
-    pulsar_class::records::RecordMigrationRegistration {
-        origin: pulsar_plugins::origin!(),
+    p.add(pulsar_class::records::RecordMigrationRegistration {
+        origin: p.origin(),
         name: "meshes.fold_material_override",
         description: meshes_component::records::FOLDED,
         entries: Some(meshes_component::records::fold_material_override),
         from_props: None,
         stale_props: &[],
         retired_fields: &[],
-    }
-}
+    });
 
-inventory::submit! {
-    pulsar_class::records::RecordMigrationRegistration {
-        origin: pulsar_plugins::origin!(),
+    p.add(pulsar_class::records::RecordMigrationRegistration {
+        origin: p.origin(),
         name: "meshes.mesh_from_props",
         description: meshes_component::records::FROM_PROPS,
         entries: None,
         from_props: Some(meshes_component::records::mesh_from_props),
         stale_props: &["mesh_asset"],
         retired_fields: &[],
-    }
+    });
 }
 
 #[cfg(test)]

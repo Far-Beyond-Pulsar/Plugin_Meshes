@@ -55,7 +55,6 @@ use helio_core::graph::{ResourceBuilder, ResourceFormat, ResourceSize};
 use helio_core::{
     DebugViewDescriptor, PassContext, PrepareContext, RenderPass, Result as HelioResult,
 };
-use pulsar_scenedb::gpu::BufferKey;
 use std::collections::HashMap;
 
 // ── Uniform types ─────────────────────────────────────────────────────────────
@@ -458,9 +457,9 @@ impl RenderPass for GBufferPass {
             helio_mesh_api::MESH_INDICES.name(),
             helio_mesh_api::MESH_VERTICES.name(),
             helio_mats::MATERIALS.name(),
-            helio_light_api::LIGHT_LIST,
-            helio_mesh_api::SKELETAL_BONE_PALETTE,
-            helio_mesh_api::SKELETAL_SKIN_VERTICES,
+            helio_light_api::SCENE_LIGHTS.name(),
+            helio_mesh_api::BONE_PALETTE.name(),
+            helio_mesh_api::SKIN_VERTICES.name(),
         ];
         LIST
     }
@@ -780,9 +779,7 @@ impl RenderPass for GBufferPass {
             delta_time: ctx.delta_time,
             light_count: ctx
                 .scene_buffers
-                .get(pulsar_scenedb::gpu::BufferKey::of(
-                    helio_light_api::LIGHT_LIST,
-                ))
+                .get(helio_light_api::SCENE_LIGHTS.key())
                 .map_or(0, |lights| lights.row_capacity()),
             ambient_intensity,
             ambient_color,
@@ -843,12 +840,8 @@ impl RenderPass for GBufferPass {
         let coordinate_spaces_prev_buf = coord_spaces
             .map(|c| c.coordinate_spaces_prev)
             .unwrap_or(ctx.camera);
-        let skin_handle = ctx
-            .scene_buffers
-            .get(BufferKey::of(helio_mesh_api::SKELETAL_SKIN_VERTICES));
-        let palette_handle = ctx
-            .scene_buffers
-            .get(BufferKey::of(helio_mesh_api::SKELETAL_BONE_PALETTE));
+        let skin_handle = ctx.scene_buffers.get(helio_mesh_api::SKIN_VERTICES.key());
+        let palette_handle = ctx.scene_buffers.get(helio_mesh_api::BONE_PALETTE.key());
         let skin_buf = skin_handle
             .map(|handle| &handle.buffer)
             .unwrap_or(&self.fallback_skeletal_storage);

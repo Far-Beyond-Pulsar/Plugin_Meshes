@@ -16,6 +16,11 @@ impl Feature for ObjectBatchFeature {
     }
 
     fn register(&self, registrar: &mut FeatureRegistrar<'_>) {
+        registrar.consumes(helio_mats::MATERIALS);
+        registrar.consumes(helio_mesh_api::STATIC_OBJECTS);
+        registrar.consumes(helio_mesh_api::OBJECTS_STRUCTURE);
+        registrar.consumes(helio_mesh_api::OBJECTS_MOVED);
+        registrar.consumes(helio_mesh_api::CLASSIC_SUPPRESSED);
         // What shader hot reload may swap without rebuilding the graph.
         registrar.swappable::<ObjectBatchPass>();
         registrar.node(

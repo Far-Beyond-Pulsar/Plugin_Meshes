@@ -33,14 +33,14 @@ const WG: u32 = 256;
 /// The scene join's structure marker (`crate::scene_join::
 /// OBJECTS_STRUCTURE_KEY`): moves only when objects are added, removed or
 /// change what they are, not when they move.
-const STRUCTURE_KEY: &str = "scene_objects_structure";
+const STRUCTURE_KEY: &str = helio_mesh_api::OBJECTS_STRUCTURE.name();
 /// The scene join's list of the object slots a frame that only moved objects
 /// rewrote (`crate::scene_join::OBJECTS_MOVED_KEY`).
-const MOVED_KEY: &str = "scene_objects_moved";
+const MOVED_KEY: &str = helio_mesh_api::OBJECTS_MOVED.name();
 /// Scene buffer of per-`static_objects`-row flags: a non-zero row is drawn by
 /// another renderer (virtual geometry), so the main view's frustum cull skips
 /// it. Shadows still see the row: the classic geometry is the shadow proxy.
-const CLASSIC_SUPPRESSED_KEY: &str = "classic_suppressed";
+const CLASSIC_SUPPRESSED_KEY: &str = helio_mesh_api::CLASSIC_SUPPRESSED.name();
 /// Byte offset of the one-workgroup-per-group dispatch size in
 /// `dispatch_args_groups` (see `cs_prepare_groups`).
 const GROUP_DISPATCH_OFFSET: u64 = 12;
@@ -1478,7 +1478,7 @@ impl ObjectBatchPass {
         }
         let capacity = ctx
             .scene_buffers
-            .get(BufferKey::of("static_objects"))
+            .get(helio_mesh_api::STATIC_OBJECTS.key())
             .map_or(0, |h| {
                 (h.buffer.size() / std::mem::size_of::<StaticObjectRow>() as u64) as u32
             });
@@ -1602,7 +1602,7 @@ impl RenderPass for ObjectBatchPass {
     }
 
     fn prepare(&mut self, ctx: &PrepareContext) -> HelioResult<()> {
-        let static_objects_handle = ctx.scene_buffers.get(BufferKey::of("static_objects"));
+        let static_objects_handle = ctx.scene_buffers.get(helio_mesh_api::STATIC_OBJECTS.key());
         let capacity = static_objects_handle
             .as_ref()
             .map(|h| (h.buffer.size() / std::mem::size_of::<StaticObjectRow>() as u64) as u32)
@@ -1756,7 +1756,7 @@ impl RenderPass for ObjectBatchPass {
             return Ok(());
         }
         let capacity = {
-            let handle = ctx.scene_buffers.get(BufferKey::of("static_objects"));
+            let handle = ctx.scene_buffers.get(helio_mesh_api::STATIC_OBJECTS.key());
             handle
                 .map(|h| (h.buffer.size() / std::mem::size_of::<StaticObjectRow>() as u64) as u32)
                 .unwrap_or(0)

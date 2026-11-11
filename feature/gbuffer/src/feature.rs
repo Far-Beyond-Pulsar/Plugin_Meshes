@@ -16,6 +16,12 @@ impl Feature for GBufferDrawers {
     }
 
     fn register(&self, registrar: &mut FeatureRegistrar<'_>) {
+        registrar.consumes(helio_mesh_api::MESH_INDICES);
+        registrar.consumes(helio_mesh_api::MESH_VERTICES);
+        registrar.consumes(helio_mats::MATERIALS);
+        registrar.consumes(helio_light_api::SCENE_LIGHTS);
+        registrar.consumes(helio_mesh_api::BONE_PALETTE);
+        registrar.consumes(helio_mesh_api::SKIN_VERTICES);
         registrar.node(
             pass_node(
                 helio_frame_api::gbuffer::GROUP,

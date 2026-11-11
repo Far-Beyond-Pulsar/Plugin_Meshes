@@ -18,6 +18,7 @@ host-rows = ["dep:helio-components", "dep:pulsar_scenedb_derive", "dep:pulsar_re
 bytemuck = { workspace = true, features = ["derive"] }
 glam = { workspace = true }
 helio-core = { workspace = true }
+helio-vg-format = { workspace = true }
 pulsar_scenedb = { workspace = true }
 wgpu = { workspace = true }
 helio-components = { workspace = true, optional = true }

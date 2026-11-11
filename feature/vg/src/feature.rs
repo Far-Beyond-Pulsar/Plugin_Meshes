@@ -16,6 +16,11 @@ impl Feature for VgFeature {
     }
 
     fn register(&self, registrar: &mut FeatureRegistrar<'_>) {
+        registrar.consumes(helio_mats::MATERIALS);
+        registrar.consumes(helio_light_api::SCENE_LIGHTS);
+        registrar.consumes(helio_mesh_api::VG_INSTANCE_ROWS);
+        registrar.consumes(helio_mesh_api::STATIC_OBJECTS);
+        registrar.consumes(helio_mesh_api::OBJECTS_STRUCTURE);
         // Virtual-geometry instances are traced only through their proxies
         // (a ray-tracing projection with a VG runtime).
         registrar.untraced_geometry(helio_mesh_api::VG_INSTANCES);

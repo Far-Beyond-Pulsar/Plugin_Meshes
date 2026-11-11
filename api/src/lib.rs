@@ -34,8 +34,9 @@ pub use draw_slots::{DrawSlots, DRAW_SLOT_LAYOUT, DRAW_SLOT_LOCATION};
 pub use indirect_draw::{multi_draw_indexed_indirect, GpuDrawCount, DRAW_INDEXED_INDIRECT_STRIDE};
 pub use object_batch_frame_data::{IndirectDispatchArgs, ObjectBatchFrameData};
 pub use rows::{
-    RenderGroupRow, StaticObjectRow, MESH_INDICES, MESH_VERTICES, RENDER_GROUPS,
-    SKELETAL_BONE_PALETTE, SKELETAL_SKIN_VERTICES, STATIC_OBJECTS, VG_INSTANCES,
+    RenderGroupRow, SkinVertex, StaticObjectRow, BONE_PALETTE, CLASSIC_SUPPRESSED, MESH_INDICES,
+    MESH_VERTICES, OBJECTS_MOVED, OBJECTS_STRUCTURE, RENDER_GROUPS, SKELETAL_BONE_PALETTE,
+    SKELETAL_SKIN_VERTICES, SKIN_VERTICES, STATIC_OBJECTS, VG_INSTANCES, VG_INSTANCE_ROWS,
 };
 
 /// The meshes' surfaces as rays see them, for a tracer's WGSL
