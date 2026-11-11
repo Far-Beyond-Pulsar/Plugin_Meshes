@@ -35,3 +35,6 @@ bytemuck = { workspace = true, features = ["derive"] }
 
 # Image decoding
 image = { workspace = true, features = ["png", "jpeg"] }
+
+[lints]
+workspace = true

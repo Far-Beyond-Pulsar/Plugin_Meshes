@@ -43,7 +43,7 @@ use std::sync::{Mutex, OnceLock};
 pub use asset_import::options::{FieldConstraints, ImportField, OptionsSchema};
 use bytemuck::Zeroable;
 use helio_mesh_api::{MeshUpload, PackedVertex};
-use pulsar_reflection::{RUNTIME_TYPE_REGISTRY, RuntimeTypeInfo, TypeStructure};
+use pulsar_reflection::{RuntimeTypeInfo, TypeStructure, RUNTIME_TYPE_REGISTRY};
 
 const MAGIC: &[u8; 4] = b"PMSH";
 /// Current WRITE version — every fresh `encode` call produces this.
@@ -386,12 +386,11 @@ pub fn is_importable_model(ext: &str) -> bool {
 /// with what's cached) is treated as a miss, so an edited file mints a new
 /// id on its next resolve rather than serving a stale one forever.
 static CONTENT_ID_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<PathBuf, (std::time::SystemTime, u64, u128)>>,
+    std::sync::Mutex<HashMap<PathBuf, (u128, u64, u128)>>,
 > = std::sync::OnceLock::new();
 const MAX_CONTENT_ID_CACHE_ENTRIES: usize = 4096;
 
-fn content_id_cache()
--> &'static std::sync::Mutex<HashMap<PathBuf, (std::time::SystemTime, u64, u128)>> {
+fn content_id_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, (u128, u64, u128)>> {
     CONTENT_ID_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -415,7 +414,7 @@ fn content_id_cache()
 /// `HandleId::ZERO`-on-failure convention at its call site.
 pub fn content_id_for_path(abs_path: &Path) -> Option<u128> {
     if abs_path.extension().and_then(|e| e.to_str()) == Some("mesh") {
-        if let Ok(bytes) = std::fs::read(abs_path) {
+        if let Ok(bytes) = engine_fs::virtual_fs::read_file(abs_path) {
             if bytes.len() >= HEADER_V2 && &bytes[0..4] == MAGIC {
                 if let Ok(version) = bytes[4..8].try_into().map(u32::from_le_bytes) {
                     if version == VERSION
@@ -432,10 +431,10 @@ pub fn content_id_for_path(abs_path: &Path) -> Option<u128> {
         }
     }
 
-    let canonical = std::fs::canonicalize(abs_path).ok()?;
-    let meta = std::fs::metadata(&canonical).ok()?;
-    let mtime = meta.modified().ok()?;
-    let len = meta.len();
+    let canonical = engine_fs::virtual_fs::canonicalize(abs_path).ok()?;
+    let meta = engine_fs::virtual_fs::metadata(&canonical).ok()?;
+    let mtime = meta.modified_nanos()?;
+    let len = meta.size;
 
     {
         let cache = content_id_cache()
@@ -448,7 +447,7 @@ pub fn content_id_for_path(abs_path: &Path) -> Option<u128> {
         }
     }
 
-    let bytes = std::fs::read(&canonical).ok()?;
+    let bytes = engine_fs::virtual_fs::read_file(&canonical).ok()?;
     let id = twox_hash::XxHash3_128::oneshot(&bytes);
     let mut cache = content_id_cache()
         .lock()
@@ -473,17 +472,19 @@ pub fn content_id_for_path(abs_path: &Path) -> Option<u128> {
 /// [`content_id_for_path`]'s own silent-`None` tolerance — priming is an
 /// optimization, never load-bearing for correctness).
 pub fn prime_content_id_cache(abs_path: &Path, id: u128) {
-    let Ok(canonical) = std::fs::canonicalize(abs_path) else {
+    let Ok(canonical) = engine_fs::virtual_fs::canonicalize(abs_path) else {
         return;
     };
-    let Ok(meta) = std::fs::metadata(&canonical) else {
+    let Ok(meta) = engine_fs::virtual_fs::metadata(&canonical) else {
         return;
     };
-    let Ok(mtime) = meta.modified() else { return };
+    let Some(mtime) = meta.modified_nanos() else {
+        return;
+    };
     let mut cache = content_id_cache()
         .lock()
         .expect("content id cache mutex poisoned");
-    cache.insert(canonical, (mtime, meta.len(), id));
+    cache.insert(canonical, (mtime, meta.size, id));
     while cache.len() > MAX_CONTENT_ID_CACHE_ENTRIES {
         if let Some(oldest) = cache.keys().next().cloned() {
             cache.remove(&oldest);
@@ -652,7 +653,8 @@ pub fn embedded_vgeo(bytes: &[u8]) -> Option<&[u8]> {
 /// preserving its decoded classic geometry and authored material metadata.
 /// The mesh content id remains the identity of the original vertex/index data.
 pub fn write_embedded_vgeo(path: &Path, content_id: u128, vgeo: &[u8]) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let bytes = engine_fs::virtual_fs::read_file(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
     let (asset, stored_id) = decode_asset(&bytes)
         .ok_or_else(|| format!("{} is not a valid native mesh", path.display()))?;
     if stored_id != content_id {
@@ -663,9 +665,10 @@ pub fn write_embedded_vgeo(path: &Path, content_id: u128, vgeo: &[u8]) -> Result
     }
     let updated = encode_asset_with_vgeo(&asset, stored_id, Some(vgeo));
     let tmp = path.with_extension("mesh.vgeo.tmp");
-    std::fs::write(&tmp, updated).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
+    engine_fs::virtual_fs::write_file(&tmp, &updated)
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    engine_fs::virtual_fs::rename(&tmp, path).map_err(|e| {
+        let _ = engine_fs::virtual_fs::delete_path(&tmp);
         format!("replace {}: {e}", path.display())
     })?;
     prime_content_id_cache(path, stored_id);
@@ -998,19 +1001,20 @@ pub fn ensure_uv0(mesh: &mut MeshUpload) {
 /// their shared GPU geometry; a mesh `AssetUpdated` is published so open
 /// levels re-resolve their slots.
 pub fn set_default_materials(path: &Path, materials: &[String]) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let bytes = engine_fs::virtual_fs::read_file(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
     let (mut asset, id) =
         decode_asset(&bytes).ok_or_else(|| format!("{} is not a valid .mesh", path.display()))?;
     for (slot, material) in asset.material_slots.iter_mut().zip(materials) {
         slot.material_asset = material.trim().to_owned();
     }
-    let tmp = path.with_extension("mesh.tmp");
     let encoded = embedded_vgeo(&bytes)
         .filter(|vgeo| !vgeo.is_empty())
         .map(|vgeo| encode_asset_with_vgeo(&asset, id, Some(vgeo)))
         .unwrap_or_else(|| encode_asset(&asset, id));
-    std::fs::write(&tmp, encoded)
-        .and_then(|()| std::fs::rename(&tmp, path))
+    let tmp = path.with_extension("mesh.tmp");
+    engine_fs::virtual_fs::write_file(&tmp, &encoded)
+        .and_then(|()| engine_fs::virtual_fs::rename(&tmp, path))
         .map_err(|e| format!("write {}: {e}", path.display()))?;
     prime_content_id_cache(path, id);
     pulsar_events::publish_asset_updated(
@@ -1022,7 +1026,10 @@ pub fn set_default_materials(path: &Path, materials: &[String]) -> Result<(), St
 /// A reimport rewrites the `.mesh`; keep the default materials authored on
 /// the previous version. Slots match by source material index, then by name.
 fn carry_over_default_materials(native: &Path, upload: &mut MeshAssetUpload) {
-    let Some((previous, _)) = std::fs::read(native).ok().and_then(|b| decode_asset(&b)) else {
+    let Some((previous, _)) = engine_fs::virtual_fs::read_file(native)
+        .ok()
+        .and_then(|b| decode_asset(&b))
+    else {
         return;
     };
     for slot in &mut upload.material_slots {
@@ -1154,7 +1161,7 @@ fn sanitize_file_name(name: &str) -> String {
 fn write_mesh_asset(mut upload: MeshAssetUpload, native: &Path) -> Result<PathBuf, String> {
     carry_over_default_materials(native, &mut upload);
     let content_id = content_id_for_bytes(&upload.geometry);
-    std::fs::write(native, encode_asset(&upload, content_id))
+    engine_fs::virtual_fs::write_file(native, &encode_asset(&upload, content_id))
         .map_err(|e| format!("failed to write native mesh {}: {e}", native.display()))?;
 
     // Placed meshes naming this asset reload it (the level editor subscribes).

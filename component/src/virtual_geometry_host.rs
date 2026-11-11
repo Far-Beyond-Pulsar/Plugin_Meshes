@@ -23,21 +23,21 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use helio_core::{BufferKey, SceneDerivation, SceneDerivationContext, SceneDerivationOutput};
 use helio_mesh_api::PackedVertex;
-use helio_vg_format::{FORMAT_VERSION, VgAssetReadyRow};
-use helio_vg_stream::{VgRuntime, VgRuntimeSettings, VgeoBytes, VgeoSource, content_words};
+use helio_vg_format::{VgAssetReadyRow, FORMAT_VERSION};
+use helio_vg_stream::{content_words, VgRuntime, VgRuntimeSettings, VgeoBytes, VgeoSource};
 use pulsar_scenedb::gpu::GpuMirrorHandle;
 use pulsar_scenedb::handle_ledger::HandleId;
 use pulsar_scenedb::{Entity, World};
 
 use crate::components::{MeshAssetPath, StaticMeshComponent, VirtualGeometryComponent};
 use crate::virtual_geometry_instances::{
-    Output, VG_ASSET_READY_KEY, VG_ASSET_READY_ROW_BYTES, VgInstanceControl, VgInstanceKeys,
-    VirtualGeometryInstances,
+    Output, VgInstanceControl, VgInstanceKeys, VirtualGeometryInstances, VG_ASSET_READY_KEY,
+    VG_ASSET_READY_ROW_BYTES,
 };
 
 /// How often (in `sync` calls) the world is rescanned when no build is in
@@ -302,7 +302,7 @@ fn build_or_load(
     sections: &[(u32, u32)],
 ) -> Result<Arc<VgeoBytes>, String> {
     if let Some(path) = native_mesh {
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(bytes) = engine_fs::virtual_fs::read_file(path) {
             if let Some(embedded) = crate::mesh_cache::embedded_vgeo(&bytes) {
                 if let Ok(loaded) = VgeoBytes::new(embedded.to_vec()) {
                     if loaded.header().content_id == content_words(content)
@@ -313,7 +313,7 @@ fn build_or_load(
                 }
             }
         }
-    } else if let Ok(bytes) = std::fs::read(fallback) {
+    } else if let Ok(bytes) = engine_fs::virtual_fs::read_file(fallback) {
         if let Ok(loaded) = VgeoBytes::new(bytes) {
             if loaded.header().content_id == content_words(content)
                 && helio_vg_build::is_current_cook(&loaded.header())
@@ -359,10 +359,8 @@ fn build_or_load(
             );
         }
     } else {
-        if let Some(parent) = fallback.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(fallback, &bytes);
+        // `write_file` creates the parent folders.
+        let _ = engine_fs::virtual_fs::write_file(fallback, &bytes);
     }
     VgeoBytes::new(bytes).map(Arc::new)
 }

@@ -46,7 +46,7 @@ pub fn load_mesh_asset_upload(path: &Path) -> Option<crate::mesh_cache::MeshAsse
     // Engine-native baked mesh asset (`.mesh`), produced at import time from the
     // source model. Load it directly — no conversion or options (issues #391/#409).
     if path.extension().and_then(|e| e.to_str()) == Some("mesh") {
-        let bytes = std::fs::read(path).ok()?;
+        let bytes = engine_fs::virtual_fs::read_file(path).ok()?;
         let (mut asset, id) = crate::mesh_cache::decode_asset(&bytes)?;
 
         // Content-id provenance (Pulsar-Native#658): prime the memoization
@@ -67,8 +67,8 @@ pub fn load_mesh_asset_upload(path: &Path) -> Option<crate::mesh_cache::MeshAsse
         if bytes.len() >= 8 && u32::from_le_bytes(bytes[4..8].try_into().unwrap_or_default()) == 1 {
             let upgraded = crate::mesh_cache::encode_asset(&asset, id);
             let tmp = path.with_extension("mesh.tmp");
-            if std::fs::write(&tmp, &upgraded).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
+            if engine_fs::virtual_fs::write_file(&tmp, &upgraded).is_ok() {
+                let _ = engine_fs::virtual_fs::rename(&tmp, path);
             }
         }
 
@@ -85,7 +85,7 @@ pub fn load_mesh_asset_upload(path: &Path) -> Option<crate::mesh_cache::MeshAsse
     };
 
     // Try disk first.
-    if path.exists() {
+    if engine_fs::virtual_fs::exists(path).unwrap_or(false) {
         let scene = helio_asset_compat::load_scene_file_with_config(path, cfg).ok()?;
         return crate::mesh_cache::mesh_asset_from_converted_scene(scene);
     }

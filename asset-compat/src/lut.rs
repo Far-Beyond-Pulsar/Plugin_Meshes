@@ -3,9 +3,6 @@
 //! Supports 1D and 3D LUTs per the Cube LUT specification v1 and v2.
 //! Returns flat RGBA16F texel data ready for GPU upload.
 
-use std::fs;
-use std::path::Path;
-
 /// Errors that can occur during LUT parsing.
 #[derive(Debug)]
 pub enum LutError {
@@ -143,12 +140,6 @@ impl CubeLut {
             domain_max,
             data,
         })
-    }
-
-    /// Load a `.cube` file from disk.
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, LutError> {
-        let bytes = fs::read(path.as_ref())?;
-        Self::parse(&bytes)
     }
 }
 
