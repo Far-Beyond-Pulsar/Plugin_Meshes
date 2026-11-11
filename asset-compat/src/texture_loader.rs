@@ -69,6 +69,10 @@ fn extension_variants(path: &Path) -> Vec<PathBuf> {
     variants
 }
 
+// Helio-layer format crate (below Pulsar, so no `engine_fs`): the scene's loader
+// (`solid_rs`) opens the model by real path, and its textures are looked up
+// beside it the same way.
+#[allow(clippy::disallowed_methods)]
 fn image_path_candidates(path: &str, base_dir: &Path) -> Vec<PathBuf> {
     let candidate = PathBuf::from(path);
     let mut base_candidates = Vec::new();
@@ -172,6 +176,10 @@ fn image_path_candidates(path: &str, base_dir: &Path) -> Vec<PathBuf> {
     candidates
 }
 
+// Helio-layer format crate (below Pulsar, so no `engine_fs`): the scene's loader
+// (`solid_rs`) opens the model by real path, and its textures are looked up
+// beside it the same way.
+#[allow(clippy::disallowed_methods)]
 fn resolve_image_path(path: &str, base_dir: &Path) -> Result<PathBuf> {
     let candidates = image_path_candidates(path, base_dir);
     let mut last_error: Option<(PathBuf, io::Error)> = None;
@@ -208,6 +216,10 @@ fn resolve_image_path(path: &str, base_dir: &Path) -> Result<PathBuf> {
     )))
 }
 
+// Helio-layer format crate (below Pulsar, so no `engine_fs`): the scene's loader
+// (`solid_rs`) opens the model by real path, and its textures are looked up
+// beside it the same way.
+#[allow(clippy::disallowed_methods)]
 fn resolve_image_bytes(image: &Image, base_dir: &Path) -> Result<Vec<u8>> {
     match &image.source {
         ImageSource::Embedded { data, .. } => Ok(data.clone()),

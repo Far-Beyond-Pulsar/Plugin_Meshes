@@ -17,3 +17,6 @@ helio-core = { workspace = true }
 naga = { version = "30.0.0", features = ["wgsl-in"] }
 pollster = { version = "0.4" }
 helio-vg-build = { workspace = true }
+
+[lints]
+workspace = true

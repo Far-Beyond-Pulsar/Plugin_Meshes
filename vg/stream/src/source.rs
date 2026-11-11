@@ -49,10 +49,17 @@ enum Storage {
     /// pages are read as the scheduler asks for them, so a multi-gigabyte cache
     /// costs megabytes of resident memory, not gigabytes.
     File {
-        file: std::sync::Mutex<std::fs::File>,
+        file: std::sync::Mutex<Box<dyn VgeoReader>>,
         len: u64,
     },
 }
+
+/// A readable, seekable stream over one `.vgeo` file. Any
+/// `Read + Seek + Send` is one (`std::fs::File`, or the reader a virtual file
+/// system opens).
+pub trait VgeoReader: std::io::Read + std::io::Seek + Send {}
+
+impl<T: std::io::Read + std::io::Seek + Send> VgeoReader for T {}
 
 /// A `.vgeo` file, in memory or backed by the file on disk.
 pub struct VgeoBytes {
@@ -77,11 +84,25 @@ impl VgeoBytes {
 
     /// Opens `path` without reading it into memory: only the header is read
     /// now; sections and pages are read when asked for.
+    ///
+    /// Takes a real path; a caller that has a virtual file system opens the
+    /// file through it and calls [`Self::open_reader`].
+    // Helio-layer crate (below Pulsar, so no `engine_fs`): the caller passes a
+    // real path from a tool or an example.
+    #[allow(clippy::disallowed_methods)]
     pub fn open(path: &std::path::Path) -> Result<Self, String> {
-        use std::io::Read;
-        let mut file =
+        let file =
             std::fs::File::open(path).map_err(|e| format!("vgeo: {}: {e}", path.display()))?;
-        let len = file.metadata().map_err(|e| e.to_string())?.len();
+        Self::open_reader(file).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Like [`Self::open`] over a stream the caller opened: only the header
+    /// is read now.
+    pub fn open_reader(reader: impl VgeoReader + 'static) -> Result<Self, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file: Box<dyn VgeoReader> = Box::new(reader);
+        let len = file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+        file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         let hs = std::mem::size_of::<VgeoHeader>();
         let mut head = vec![0u8; hs];
         file.read_exact(&mut head)

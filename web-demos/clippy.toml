@@ -1,0 +1,3 @@
+# Examples are standalone demos that load their sample assets from disk, like
+# tests: Pulsar's `disallowed-methods` rule (file IO through `engine_fs`, the
+# root clippy.toml) does not apply here. Clippy reads the nearest clippy.toml.

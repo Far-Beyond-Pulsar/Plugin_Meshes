@@ -82,7 +82,8 @@ pub fn assign_default_materials(
     if assignments.is_empty() || native_asset.extension().is_none_or(|ext| ext != "mesh") {
         return Ok(());
     }
-    let bytes = std::fs::read(native_asset).map_err(|error| error.to_string())?;
+    let bytes =
+        engine_fs::virtual_fs::read_file(native_asset).map_err(|error| error.to_string())?;
     let (decoded, _) = mesh_cache::decode_asset(&bytes)
         .ok_or_else(|| format!("{} is not a valid .mesh", native_asset.display()))?;
     let mut materials: Vec<String> = decoded

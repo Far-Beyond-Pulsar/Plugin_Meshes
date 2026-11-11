@@ -4,9 +4,6 @@
 //! the angular intensity distribution of real-world luminaires. Produces a
 //! 256×256 `R8Unorm` texture suitable for GPU sampling.
 
-use std::fs;
-use std::path::Path;
-
 #[derive(Debug)]
 pub enum IesError {
     Io(std::io::Error),
@@ -286,11 +283,6 @@ impl IesProfile {
             0.0
         };
         (lo, hi, t)
-    }
-
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, IesError> {
-        let bytes = fs::read(path.as_ref())?;
-        Self::parse(&bytes)
     }
 }
 

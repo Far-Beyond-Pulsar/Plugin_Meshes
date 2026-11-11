@@ -120,6 +120,9 @@ pub fn render_preview<P: AsRef<Path>>(
 /// the conventional `*_BaseColor`, `*_Albedo`, or `*_Diffuse` image beside the
 /// model. Use that map for preview thumbnails when the imported material has
 /// no color texture at all.
+// Helio-layer tool crate (below Pulsar, so no `engine_fs`): the caller passes a
+// real model path, which `helio_asset_compat` opens by real path too.
+#[allow(clippy::disallowed_methods)]
 fn attach_sidecar_base_color(model_path: &Path, scene: &mut helio_asset_compat::ConvertedScene) {
     if scene.materials.is_empty()
         || scene

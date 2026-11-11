@@ -35,3 +35,6 @@ path = "examples/snapshot_test_fbx.rs"
 [[example]]
 name = "batch_benchmark"
 path = "examples/batch_benchmark.rs"
+
+[lints]
+workspace = true

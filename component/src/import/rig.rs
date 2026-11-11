@@ -23,18 +23,18 @@ use skeletal_assets::animation::{
     AnimationClip, BoneTrack, KeyInterpolation, Keyframe, KeyframeTangent,
 };
 use skeletal_assets::assets::{
-    ANIMSEQ_EXTENSION, AnimSeqAsset, SKELETON_EXTENSION, SkeletonAsset, load_animseq_asset,
-    load_skeleton_asset, save_animseq_asset, save_skeleton_asset,
+    load_animseq_asset, load_skeleton_asset, save_animseq_asset, save_skeleton_asset, AnimSeqAsset,
+    SkeletonAsset, ANIMSEQ_EXTENSION, SKELETON_EXTENSION,
 };
 use skeletal_assets::ids::{AnimSequenceId, SkeletalMeshId, SkeletonId};
 use skeletal_assets::math::{Transform, Vec3};
 use skeletal_assets::skeleton::{Bone, Skeleton};
 use skeletal_assets::skmesh::{
-    Joint, MaterialSlot, MeshLod, MeshSection, SKMESH_EXTENSION, SkeletalMeshAsset, SkinnedVertex,
-    load_skmesh_asset, save_skmesh_asset, validate_mesh,
+    load_skmesh_asset, save_skmesh_asset, validate_mesh, Joint, MaterialSlot, MeshLod, MeshSection,
+    SkeletalMeshAsset, SkinnedVertex, SKMESH_EXTENSION,
 };
 
-use asset_import::db::{ImportOutput, relative_key};
+use asset_import::db::{relative_key, ImportOutput};
 use asset_import::{Imported, ImportedPart, Previous};
 
 /// [`ImportOutput::kind`] of the skeleton.
@@ -689,7 +689,7 @@ fn previous_output_path(
             find_by_id(previous.project_root, extension, id)
         }
         // Kinds without an id are the file at the recorded path, if any.
-        None if !recorded.is_file() => None,
+        None if !engine_fs::virtual_fs::is_file(&recorded) => None,
         _ => Some(recorded.clone()),
     }
 }
@@ -706,7 +706,7 @@ fn free_path(dir: &Path, base: &str, extension: &str, taken: &mut HashSet<PathBu
             };
             dir.join(format!("{name}.{extension}"))
         })
-        .find(|p| !p.exists() && !taken.contains(p))
+        .find(|p| !engine_fs::virtual_fs::exists(p).unwrap_or(false) && !taken.contains(p))
         .expect("an unbounded range always yields a free name");
     taken.insert(path.clone());
     path

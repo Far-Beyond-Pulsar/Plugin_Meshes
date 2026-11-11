@@ -375,7 +375,7 @@ fn path_for_ref<K: AssetKind>(reference: &AssetRef<K>) -> Option<PathBuf> {
         return None;
     };
     let full_path = root.join(&path);
-    Some(std::fs::canonicalize(&full_path).unwrap_or(full_path))
+    Some(engine_fs::virtual_fs::canonicalize(&full_path).unwrap_or(full_path))
 }
 
 fn asset_id_for_ref<K: AssetKind>(reference: Option<&AssetRef<K>>) -> AssetId {
@@ -539,12 +539,10 @@ mod authority_tests {
         );
         assert_eq!(saved["mesh"], MESH);
         // and a fresh component never writes one either
-        assert!(
-            serde_json::to_value(SkeletalMeshComponent::default())
-                .unwrap()
-                .get("skeleton")
-                .is_none()
-        );
+        assert!(serde_json::to_value(SkeletalMeshComponent::default())
+            .unwrap()
+            .get("skeleton")
+            .is_none());
     }
 
     #[test]

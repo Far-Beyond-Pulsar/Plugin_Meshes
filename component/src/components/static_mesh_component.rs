@@ -343,7 +343,7 @@ pub fn mesh_source(project_root: &str, path: &str) -> String {
 
 /// The source string of the mesh file at `abs`.
 pub fn mesh_source_for_file(abs: &std::path::Path) -> String {
-    std::fs::canonicalize(abs)
+    engine_fs::virtual_fs::canonicalize(abs)
         .unwrap_or_else(|_| abs.to_path_buf())
         .to_string_lossy()
         .into_owned()
@@ -649,7 +649,7 @@ impl gpui::Render for MeshAssetEditor {
     ) -> impl gpui::IntoElement {
         use gpui::prelude::*;
         use ui::button::{Button, ButtonVariants as _};
-        use ui::{ActiveTheme, Sizable, h_flex, popover::Popover};
+        use ui::{h_flex, popover::Popover, ActiveTheme, Sizable};
 
         let display = if self.path.is_empty() {
             "No mesh selected".to_string()
@@ -884,7 +884,7 @@ impl StaticMeshMaterialSlotsEditor {
             .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
             .collect();
         let directory = project_root.join("materials");
-        if let Err(error) = std::fs::create_dir_all(&directory) {
+        if let Err(error) = engine_fs::virtual_fs::create_dir_all(&directory) {
             tracing::warn!(%error, path = %directory.display(), "could not create materials directory");
             return;
         }
@@ -902,13 +902,13 @@ impl StaticMeshMaterialSlotsEditor {
                 };
                 (directory.join(&file_name), format!("materials/{file_name}"))
             })
-            .find(|(path, _)| !path.exists())
+            .find(|(path, _)| !engine_fs::virtual_fs::exists(path).unwrap_or(false))
             .expect("unbounded unique material filename search");
         let material = helio_mats::asset::SurfaceMaterialDocument::from(slot.imported_surface);
         let Ok(bytes) = serde_json::to_vec_pretty(&material) else {
             return;
         };
-        if let Err(error) = std::fs::write(&path, bytes) {
+        if let Err(error) = engine_fs::virtual_fs::write_file(&path, &bytes) {
             tracing::warn!(%error, path = %path.display(), "could not write surface material asset");
             return;
         }
@@ -965,7 +965,7 @@ impl gpui::Render for StaticMeshMaterialSlotsEditor {
     ) -> impl gpui::IntoElement {
         use gpui::prelude::*;
         use ui::button::{Button, ButtonVariants as _};
-        use ui::{ActiveTheme, Sizable, h_flex, popover::Popover, v_flex};
+        use ui::{h_flex, popover::Popover, v_flex, ActiveTheme, Sizable};
 
         let mut rows = v_flex().w_full().gap_1().child(
             gpui::div()
