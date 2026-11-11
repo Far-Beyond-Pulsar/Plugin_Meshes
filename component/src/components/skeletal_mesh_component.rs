@@ -532,10 +532,12 @@ mod authority_tests {
         );
         assert_eq!(saved["mesh"], MESH);
         // and a fresh component never writes one either
-        assert!(serde_json::to_value(SkeletalMeshComponent::default())
-            .unwrap()
-            .get("skeleton")
-            .is_none());
+        assert!(
+            serde_json::to_value(SkeletalMeshComponent::default())
+                .unwrap()
+                .get("skeleton")
+                .is_none()
+        );
     }
 
     #[test]
