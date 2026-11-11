@@ -58,8 +58,28 @@ pub fn render_features() -> helio_feature_api::FeatureSet {
 /// The meshes' features read no project settings through the renderer
 /// config: virtual geometry's come in with its runtime ([`host_part`]),
 /// shadows' with the lights' `ShadowSettings`.
-pub fn configure_renderer(config: helio::RendererConfig) -> helio::RendererConfig {
+///
+/// The one setting it adds is for the render graph pin probe: the virtual
+/// geometry node builds its chain only for a runtime, so a config that has
+/// none (the probe's, made from the plugins' settings alone) gets an idle
+/// placeholder runtime, and the node's pins are those of the chain. A
+/// renderer's config has the host part's runtime before this runs
+/// ([`host_part::MeshesHostPart`] configures first), and a setting already
+/// there is left alone.
+pub fn configure_renderer(mut config: helio::RendererConfig) -> helio::RendererConfig {
+    if config.features.get::<helio_vg_stream::VgSettings>().is_none() {
+        config.features.insert(helio_vg_stream::VgSettings::for_runtime(
+            probe_runtime(),
+        ));
+    }
     config
+}
+
+/// The idle runtime a config without one gets ([`configure_renderer`]). The
+/// runtimes are found by id while one is alive, so one is kept.
+fn probe_runtime() -> &'static helio_vg_stream::VgRuntime {
+    static RUNTIME: std::sync::OnceLock<helio_vg_stream::VgRuntime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(helio_vg_stream::VgRuntime::default)
 }
 
 // ── The scene join ──────────────────────────────────────────────────────────

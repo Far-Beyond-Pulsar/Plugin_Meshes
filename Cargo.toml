@@ -61,5 +61,11 @@ engine_fs = { workspace = true }
 pulsar_scene_model = { workspace = true }
 pulsar_reflection = { workspace = true, features = ["prims-gpui"] }
 
+# The render graph node test (`tests/graph_node.rs`).
+helio-graph-asset = { workspace = true }
+helio-presets = { workspace = true }
+helio-feature-api = { workspace = true }
+pulsar_scenedb = { workspace = true }
+
 [lints]
 workspace = true
