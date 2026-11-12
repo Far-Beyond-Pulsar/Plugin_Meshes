@@ -61,7 +61,6 @@ pulsar-config = { workspace = true }
 plugin_editor_api = { workspace = true }
 engine_fs = { workspace = true }
 engine_state = { workspace = true }
-engine_subsystems = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
