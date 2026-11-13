@@ -11,21 +11,45 @@ use std::sync::{Arc, Mutex};
 
 use engine_backend::subsystems::render::helio_renderer::{pipelines, render_features};
 use helio::{DebugDrawState, PassBuildContext, RendererConfig};
-use helio_graph_asset::{validate, GraphAsset, NodeInstance, NodeRegistry, PinKind};
+use helio_graph_asset::{GraphAsset, NodeInstance, NodeRegistry, PinKind, validate};
 use pulsar_scenedb::gpu::{EngineGpuContext, GpuMirrorHandle, SceneGpuConfig, SceneGpuStore};
 
 /// Every mesh node: kind, the feature that registers it, the pass type its
 /// build adds (`None`: built only with another plugin's settings or feature).
 const NODES: &[(&str, &str, Option<&str>)] = &[
-    ("helio.pass.object_batch", "helio.mesh.batch", Some("ObjectBatchPass")),
-    ("helio.pass.indirect_dispatch", "helio.mesh.cull", Some("IndirectDispatchPass")),
-    ("helio.pass.occlusion_cull", "helio.mesh.cull", Some("OcclusionCullPass")),
+    (
+        "helio.pass.object_batch",
+        "helio.mesh.batch",
+        Some("ObjectBatchPass"),
+    ),
+    (
+        "helio.pass.indirect_dispatch",
+        "helio.mesh.cull",
+        Some("IndirectDispatchPass"),
+    ),
+    (
+        "helio.pass.occlusion_cull",
+        "helio.mesh.cull",
+        Some("OcclusionCullPass"),
+    ),
     ("helio.pass.shadow_dirty", "helio.mesh.shadow", None),
     ("helio.pass.shadow", "helio.mesh.shadow", None),
-    ("helio.pass.gbuffer", "helio.mesh.gbuffer", Some("GBufferPass")),
+    (
+        "helio.pass.gbuffer",
+        "helio.mesh.gbuffer",
+        Some("GBufferPass"),
+    ),
     ("helio.pass.forward_lit", "helio.mesh.forward", None),
-    ("helio.pass.transparent", "helio.mesh.transparent", Some("TransparentPass")),
-    ("helio.pass.virtual_geometry", "helio.vg", Some("VgStreamBeginPass")),
+    (
+        "helio.pass.transparent",
+        "helio.mesh.transparent",
+        Some("TransparentPass"),
+    ),
+    (
+        "helio.pass.virtual_geometry",
+        "helio.vg",
+        Some("VgStreamBeginPass"),
+    ),
 ];
 
 /// The plugin gate is process-wide state and a wgpu device is one at a time
@@ -66,7 +90,11 @@ fn buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
 
 fn configured() -> RendererConfig {
     // The renderer config with the plugins' settings, as a host makes it.
-    render_features::configure(RendererConfig::new(320, 180, wgpu::TextureFormat::Rgba8Unorm))
+    render_features::configure(RendererConfig::new(
+        320,
+        180,
+        wgpu::TextureFormat::Rgba8Unorm,
+    ))
 }
 
 fn registry() -> NodeRegistry {
@@ -76,7 +104,7 @@ fn registry() -> NodeRegistry {
 /// The default deferred graph with its sections expanded: every node in
 /// execution order.
 fn asset_of(registry: &NodeRegistry) -> GraphAsset {
-    let sectioned = helio_presets::graphs::deferred_graph_asset_for(registry, &configured());
+    let sectioned = helio_presets::graphs::deferred_graph_asset(registry);
     helio_graph_asset::sections::expand(&sectioned).asset
 }
 
@@ -126,10 +154,16 @@ fn every_mesh_pass_is_a_registered_node() {
             .get(kind)
             .unwrap_or_else(|| panic!("{kind} is not registered"));
         assert_eq!(registry.feature_of(kind), Some(*feature), "{kind}");
-        assert!(node.generated, "{kind}: pins come from what the pass declares");
+        assert!(
+            node.generated,
+            "{kind}: pins come from what the pass declares"
+        );
         assert!(node.params.iter().any(|p| p.key == "enabled"), "{kind}");
         assert!(node.placement.is_some(), "{kind}: the preset places it");
-        assert!(node.title.contains(": "), "{kind}: title reads `Group: Action`");
+        assert!(
+            node.title.contains(": "),
+            "{kind}: title reads `Group: Action`"
+        );
     }
 }
 
@@ -156,13 +190,25 @@ fn the_default_graph_keeps_the_pass_order() {
             _ => panic!("{a} and {b} are both in the default graph: {order:?}"),
         }
     };
-    assert!(before("helio.pass.object_batch", "helio.pass.indirect_dispatch"));
-    assert!(before("helio.pass.indirect_dispatch", "helio.pass.occlusion_cull"));
-    assert!(before("helio.pass.occlusion_cull", "helio.pass.shadow_dirty"));
+    assert!(before(
+        "helio.pass.object_batch",
+        "helio.pass.indirect_dispatch"
+    ));
+    assert!(before(
+        "helio.pass.indirect_dispatch",
+        "helio.pass.occlusion_cull"
+    ));
+    assert!(before(
+        "helio.pass.occlusion_cull",
+        "helio.pass.shadow_dirty"
+    ));
     assert!(before("helio.pass.shadow_dirty", "helio.pass.shadow"));
     assert!(before("helio.pass.shadow", "helio.pass.gbuffer"));
     assert!(before("helio.pass.gbuffer", "helio.pass.virtual_geometry"));
-    assert!(before("helio.pass.virtual_geometry", "helio.pass.transparent"));
+    assert!(before(
+        "helio.pass.virtual_geometry",
+        "helio.pass.transparent"
+    ));
 }
 
 #[test]
@@ -204,7 +250,10 @@ fn the_probe_gives_the_nodes_the_pins_their_passes_declare() {
     pulsar_plugins::deactivate();
     let registry = pipelines::graph_node_registry();
     if pipelines::graph_pin_probe().is_none() {
-        eprintln!("GPU_VALIDATION_SKIPPED_NO_ADAPTER: mesh node pins: {:?}", pipelines::graph_pin_probe_error());
+        eprintln!(
+            "GPU_VALIDATION_SKIPPED_NO_ADAPTER: mesh node pins: {:?}",
+            pipelines::graph_pin_probe_error()
+        );
         return;
     }
     for (kind, _, pass) in NODES {
@@ -217,8 +266,14 @@ fn the_probe_gives_the_nodes_the_pins_their_passes_declare() {
         if pass.is_none() || *kind == "helio.pass.virtual_geometry" {
             continue;
         }
-        assert!(pins.inputs.iter().any(|p| p.ty.kind == PinKind::Flow), "{kind}: {pins:?}");
-        assert!(pins.outputs.iter().any(|p| p.ty.kind == PinKind::Flow), "{kind}: {pins:?}");
+        assert!(
+            pins.inputs.iter().any(|p| p.ty.kind == PinKind::Flow),
+            "{kind}: {pins:?}"
+        );
+        assert!(
+            pins.outputs.iter().any(|p| p.ty.kind == PinKind::Flow),
+            "{kind}: {pins:?}"
+        );
     }
     let gbuffer = registry
         .get("helio.pass.gbuffer")
@@ -272,5 +327,9 @@ fn a_disabled_plugin_has_no_nodes_and_a_graph_naming_one_says_so() {
         "{messages:?}"
     );
     // Enabled again, the registry follows.
-    assert!(pipelines::graph_node_registry().get("helio.pass.object_batch").is_some());
+    assert!(
+        pipelines::graph_node_registry()
+            .get("helio.pass.object_batch")
+            .is_some()
+    );
 }
