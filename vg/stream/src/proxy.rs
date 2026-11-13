@@ -656,18 +656,13 @@ impl ProxyCache {
             let cancel = self.cancel.clone();
             self.in_flight += 1;
             self.stats.jobs_started += 1;
-            let spawned = std::thread::Builder::new()
-                .name("vg-proxy-build".into())
-                .spawn(move || {
+            helio_tasks::submit(
+                helio_tasks::JobSpec::new("Build a virtual geometry proxy").owner("meshes"),
+                move |_| {
                     let r = build_proxy(source.as_ref(), &opts, Some(&cancel));
                     let _ = tx.send((key, r));
-                });
-            if spawned.is_err() {
-                self.in_flight -= 1;
-                if let Some(e) = self.entries.get_mut(&key) {
-                    e.state = ProxyState::Failed("could not spawn a proxy build thread".into());
-                }
-            }
+                },
+            );
         }
         loop {
             let received = self.rx.lock().unwrap_or_else(|p| p.into_inner()).try_recv();

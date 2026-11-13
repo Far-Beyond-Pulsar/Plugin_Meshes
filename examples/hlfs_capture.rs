@@ -269,12 +269,6 @@ pub fn run_scene_animated(
         if has_architectural_textures {
             architectural_materials::configure_sampler(&mut renderer);
         }
-        if std::env::var_os("HLFS_NO_TRANSPARENCY_REACTIVITY").is_some() {
-            renderer
-                .find_pass_mut::<helio_pass_tsr::TsrPass>()
-                .expect("HLFS_NO_TRANSPARENCY_REACTIVITY requires TSR")
-                .set_transparency_reactivity(false);
-        }
         if let Some(value) = tsr_reactivity {
             renderer
                 .find_pass_mut::<helio_pass_tsr::TsrPass>()
@@ -604,8 +598,9 @@ pub fn run_scene_animated(
                 let ssr = std::env::var_os("HLFS_SSR").is_some();
                 let ray_traced_shadows =
                     ray_traced && std::env::var_os("HLFS_UNSHADOWED").is_none();
-                let transparency_reactivity = aa == "tsr_native"
-                    && std::env::var_os("HLFS_NO_TRANSPARENCY_REACTIVITY").is_none();
+                // The light-field model leaves transparency to TSR: its
+                // transparent drawers write the reactive mask every frame.
+                let transparency_reactivity = aa == "tsr_native";
                 let lighting_setup = if name.starts_with("cathedral") && ray_traced {
                     if std::env::var_os("HLFS_LEGACY_CATHEDRAL_LIGHTS").is_some() {
                         "window_emitters"

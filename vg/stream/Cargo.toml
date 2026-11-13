@@ -11,6 +11,8 @@ wgpu = { workspace = true }
 pulsar_scenedb = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 log = { workspace = true }
+# Proxy builds run as jobs on the host's task system.
+helio-tasks = { workspace = true }
 
 [dev-dependencies]
 helio-core = { workspace = true }
