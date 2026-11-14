@@ -37,7 +37,7 @@ impl Feature for MeshCulling {
                 |build| {
                     let pass = IndirectDispatchPass::new(
                         build.env.device,
-                        build.env.cull_stats_buffer.clone(),
+                        build.env.stats,
                     );
                     build.graph.add_pass(Box::new(pass));
                     Ok(())
@@ -64,7 +64,7 @@ impl Feature for MeshCulling {
                         sampler,
                         iw,
                         ih,
-                        build.env.cull_stats_buffer.clone(),
+                        build.env.stats,
                     );
                     build.graph.add_pass(Box::new(pass));
                     Ok(())

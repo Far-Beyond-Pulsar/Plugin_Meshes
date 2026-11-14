@@ -306,7 +306,8 @@ pub struct OcclusionCullPass {
     segments: SegmentTable,
     cull_params_buf: wgpu::Buffer,
     hiz_sampler: Arc<wgpu::Sampler>,
-    cull_stats_buf: wgpu::Buffer,
+    /// The frame stats' counters (`FrameStats::buffer`) its shader adds to.
+    stats_buf: wgpu::Buffer,
     /// This pass's own output -- no longer a central `GpuScene` field (see
     /// `CulledBatchFrameData`'s doc, now in this crate): final (frustum +
     /// occlusion) surviving instance slots, one `u32` per live instance
@@ -352,7 +353,7 @@ pub struct OcclusionCullPass {
     /// A single-phase temporal query is valid only against unchanged inputs.
     /// Moving views need current-depth recovery before history may reject them.
     history_inputs: Option<(u64, u64, u64, u32, u32)>,
-    /// ([camera, instances, draw_calls, indirect, pvs_buf, cull_stats_buf,
+    /// ([camera, instances, draw_calls, indirect, pvs_buf, stats_buf,
     /// compacted_indices, compacted_indices_2, coordinate_spaces], hiz_view)
     bind_group_key: Option<([wgpu::Buffer; 9], wgpu::TextureView)>,
     screen_width: u32,
@@ -369,7 +370,7 @@ impl OcclusionCullPass {
         hiz_sampler: Arc<wgpu::Sampler>,
         screen_width: u32,
         screen_height: u32,
-        cull_stats_buf: wgpu::Buffer,
+        stats: &helio_core::FrameStats,
     ) -> Self {
         let shader = helio_core::shader::module(
             device,
@@ -474,7 +475,7 @@ impl OcclusionCullPass {
                     },
                     count: None,
                 },
-                // 9: Culling stats (read_write, atomic counters)
+                // 9: the frame stats (read_write, atomic counters)
                 wgpu::BindGroupLayoutEntry {
                     binding: 9,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -527,6 +528,15 @@ impl OcclusionCullPass {
             immediate_size: 0,
         });
 
+        use helio_core::stats::{DRAW_CALLS, INSTANCES, VERTICES};
+        use helio_mesh_api::stats as mesh;
+        let constants = stats.slot_constants(&[
+            ("STAT_BATCHES_OCCLUDED", mesh::BATCHES_OCCLUDED),
+            ("STAT_DRAWS", mesh::DRAWS),
+            ("STAT_DRAW_CALLS", DRAW_CALLS),
+            ("STAT_VERTICES", VERTICES),
+            ("STAT_INSTANCES", INSTANCES),
+        ]);
         let pipeline = helio_core::shader::create_compute_pipeline(
             &device,
             wgpu::ComputePipelineDescriptor {
@@ -534,7 +544,10 @@ impl OcclusionCullPass {
                 layout: Some(&pl),
                 module: &shader,
                 entry_point: Some("main"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &constants,
+                    ..Default::default()
+                },
                 cache: None,
             },
         );
@@ -605,7 +618,7 @@ impl OcclusionCullPass {
             segments: SegmentTable::new(device),
             cull_params_buf,
             hiz_sampler,
-            cull_stats_buf,
+            stats_buf: stats.buffer().clone(),
             compacted_indices_2_buf,
             compacted_indirect_buf,
             instance_capacity: MIN_CAPACITY,
@@ -1042,7 +1055,7 @@ impl RenderPass for OcclusionCullPass {
                 batch.draw_calls.clone(),
                 indirect_dispatch.indirect.clone(),
                 self.pvs_buf.clone(),
-                self.cull_stats_buf.clone(),
+                self.stats_buf.clone(),
                 indirect_dispatch.compacted_indices.clone(),
                 self.compacted_indices_2_buf.clone(),
                 coord_data.coordinate_spaces.clone(),
@@ -1088,7 +1101,7 @@ impl RenderPass for OcclusionCullPass {
                     },
                     wgpu::BindGroupEntry {
                         binding: 9,
-                        resource: self.cull_stats_buf.as_entire_binding(),
+                        resource: self.stats_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 10,

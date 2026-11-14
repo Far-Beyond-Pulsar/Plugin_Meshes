@@ -415,14 +415,9 @@ fn front_object_survives_behind_object_culled_always_visible_overrides() {
 
         let hiz_pass = HiZBuildPass::new(&device, &queue, WIDTH, HEIGHT);
         let hiz_sampler = Arc::clone(&hiz_pass.hiz_sampler);
-        let cull_stats_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Test Cull Stats"),
-            size: 32,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
+        let stats = helio_core::FrameStats::new(&device);
         let occlusion_pass =
-            OcclusionCullPass::new(&device, hiz_sampler, WIDTH, HEIGHT, cull_stats_buf);
+            OcclusionCullPass::new(&device, hiz_sampler, WIDTH, HEIGHT, &stats);
 
         let mut graph = RenderGraph::new(&device, &queue);
         graph.add_pass(Box::new(injector));

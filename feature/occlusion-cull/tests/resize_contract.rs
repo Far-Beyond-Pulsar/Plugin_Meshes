@@ -37,12 +37,7 @@ fn screen_size_tracks_graph_resolution_across_resize() {
             label: Some("Resize Contract HiZ Sampler"),
             ..Default::default()
         }));
-        let cull_stats_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Resize Contract Cull Stats"),
-            size: 32,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
+        let stats = helio_core::FrameStats::new(&device);
 
         // Constructed at the same resolution `graph.lock` uses below --
         // matches production (`helio-presets::add_common_early_passes`
@@ -54,7 +49,7 @@ fn screen_size_tracks_graph_resolution_across_resize() {
         // `[(false, ..), (true, ..), (false, ..)]` sequence). What actually
         // matters, and what was broken, is whether a LATER live resize gets
         // picked up.
-        let pass = OcclusionCullPass::new(&device, hiz_sampler, 64, 48, cull_stats_buf);
+        let pass = OcclusionCullPass::new(&device, hiz_sampler, 64, 48, &stats);
 
         let mut graph = RenderGraph::new(&device, &queue);
         graph.add_pass(Box::new(pass));

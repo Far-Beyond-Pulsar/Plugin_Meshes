@@ -64,7 +64,18 @@ struct DrawIndexedIndirect {
 @group(0) @binding(3) var<storage, read>      draw_calls: array<GpuDrawCall>;
 @group(0) @binding(4) var<storage, read>      aabbs:     array<GpuAabb>;
 @group(0) @binding(5) var<storage, read_write> indirect:  array<DrawIndexedIndirect>;
+// The frame's named stats (`helio_core::stats::FrameStats::buffer`), each
+// counter's slot compiled in (`FrameStats::slot_constants`).
 @group(0) @binding(6) var<storage, read_write> stats:   array<atomic<u32>>;
+override STAT_BATCHES: u32;
+override STAT_BATCHES_FRUSTUM_CULLED: u32;
+override STAT_BATCHES_SUBPIXEL: u32;
+override STAT_DRAWS: u32;
+override STAT_SHADOW_BATCHES: u32;
+override STAT_SHADOW_DRAWS: u32;
+override STAT_DRAW_CALLS: u32;
+override STAT_VERTICES: u32;
+override STAT_INSTANCES: u32;
 // Per-group compacted list of original instance slots that survive frustum
 // culling, packed starting at each group's `first_instance` offset. Consumers
 // that draw through `indirect` must index `instances` through this buffer.
@@ -260,7 +271,7 @@ fn main(
     let batch_has_shadow_caster = atomicLoad(&wg_shadow_caster) != 0u;
 
     if batch_has_shadow_caster {
-        atomicAdd(&stats[5u], 1u);
+        atomicAdd(&stats[STAT_SHADOW_BATCHES], 1u);
     }
 
     if any_visible && !subpixel_only {
@@ -271,9 +282,12 @@ fn main(
             dc.vertex_offset,
             dc.first_instance,
         );
-        atomicAdd(&stats[3u], 1u);
+        atomicAdd(&stats[STAT_DRAWS], 1u);
+        atomicAdd(&stats[STAT_DRAW_CALLS], 1u);
+        atomicAdd(&stats[STAT_VERTICES], dc.index_count * visible_count);
+        atomicAdd(&stats[STAT_INSTANCES], visible_count);
         if batch_has_shadow_caster {
-            atomicAdd(&stats[6u], 1u);
+            atomicAdd(&stats[STAT_SHADOW_DRAWS], 1u);
         }
     } else {
         indirect[idx] = DrawIndexedIndirect(
@@ -284,10 +298,10 @@ fn main(
             dc.first_instance,
         );
         if !any_visible {
-            atomicAdd(&stats[1u], 1u);
+            atomicAdd(&stats[STAT_BATCHES_FRUSTUM_CULLED], 1u);
         } else {
-            atomicAdd(&stats[2u], 1u);
+            atomicAdd(&stats[STAT_BATCHES_SUBPIXEL], 1u);
         }
     }
-    atomicAdd(&stats[0u], 1u);
+    atomicAdd(&stats[STAT_BATCHES], 1u);
 }

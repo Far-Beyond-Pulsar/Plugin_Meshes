@@ -122,7 +122,7 @@ fn pass_types(asset: &GraphAsset) -> Option<Vec<String>> {
     );
     let camera = buffer(&device, 512);
     let debug_camera = buffer(&device, 64);
-    let cull_stats = buffer(&device, 64);
+    let stats = helio::FrameStats::new(&device);
     let mut env = helio_graph_asset::build_env(&PassBuildContext {
         device: &device,
         queue: &queue,
@@ -130,7 +130,7 @@ fn pass_types(asset: &GraphAsset) -> Option<Vec<String>> {
         debug_state: Arc::new(Mutex::new(DebugDrawState::default())),
         camera_buffer: &camera,
         debug_camera_buffer: &debug_camera,
-        cull_stats_buffer: &cull_stats,
+        stats: &stats,
         owns_device: false,
         scene_db: GpuMirrorHandle::new(Arc::new(store), Arc::clone(&queue)),
     });

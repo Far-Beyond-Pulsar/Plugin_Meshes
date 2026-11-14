@@ -93,7 +93,14 @@ struct GpuDrawCall {
 //   [i*5 + 3] base_vertex     (i32 reinterpreted as u32 for array access)
 //   [i*5 + 4] first_instance
 @group(0) @binding(6) var<storage, read_write> indirect: array<u32>;
+// The frame's named stats (`helio_core::stats::FrameStats::buffer`), each
+// counter's slot compiled in (`FrameStats::slot_constants`).
 @group(0) @binding(9) var<storage, read_write> stats:   array<atomic<u32>>;
+override STAT_BATCHES_OCCLUDED: u32;
+override STAT_DRAWS: u32;
+override STAT_DRAW_CALLS: u32;
+override STAT_VERTICES: u32;
+override STAT_INSTANCES: u32;
 
 // Per-group compacted original instance slots surviving frustum culling
 // (written by IndirectDispatchPass) and, after this pass, surviving BOTH
@@ -307,8 +314,15 @@ fn main(
     if lid.x == 0u && active_draw && visible_count > 0u {
         let final_count = atomicLoad(&wg_counter);
         indirect[idx * 5u + 1u] = final_count;
+        // Indirect dispatch counted this draw's `visible_count` instances;
+        // what the Hi-Z test removed comes off, so the totals are what draws.
+        let removed = visible_count - final_count;
+        atomicSub(&stats[STAT_INSTANCES], removed);
+        atomicSub(&stats[STAT_VERTICES], indirect[idx * 5u] * removed);
         if final_count == 0u {
-            atomicAdd(&stats[4u], 1u);
+            atomicAdd(&stats[STAT_BATCHES_OCCLUDED], 1u);
+            atomicSub(&stats[STAT_DRAWS], 1u);
+            atomicSub(&stats[STAT_DRAW_CALLS], 1u);
         }
     }
 }
