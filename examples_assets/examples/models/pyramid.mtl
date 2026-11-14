@@ -1,0 +1,11 @@
+# Materials for pyramid.obj. Kd is the diffuse (base) colour, Ns the shininess,
+# d the opacity. They import as the mesh's material slots.
+newmtl Base
+Kd 0.35 0.35 0.38
+Ns 10
+d 1
+
+newmtl Sides
+Kd 0.85 0.62 0.25
+Ns 40
+d 1

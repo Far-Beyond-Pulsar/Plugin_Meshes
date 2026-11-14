@@ -31,6 +31,8 @@ pulsar_world_registry = { workspace = true }
 pulsar_settings = { workspace = true }
 pulsar_class = { workspace = true }
 asset_import = { workspace = true }
+# The `examples/` folder it provides (`engine_fs::FileProvider`).
+engine_fs = { workspace = true }
 # The editor's extension points.
 ui_level_editor = { workspace = true, optional = true }
 ui_common = { workspace = true, optional = true }

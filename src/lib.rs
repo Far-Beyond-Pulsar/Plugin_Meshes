@@ -34,6 +34,8 @@ pulsar_plugins::installed!("pulsar-plugin.toml", build);
 /// Everything the plugin registers (runtime always, editor with the `editor`
 /// feature).
 pub fn build(p: &mut pulsar_plugins::PluginBuilder) {
+    // The plugin's `examples/` folder, read-only (`examples`).
+    p.add(examples::provider(p.origin()));
     runtime::build(p);
     #[cfg(feature = "editor")]
     editor::build(p);
@@ -44,6 +46,7 @@ pub use meshes_component;
 #[cfg(feature = "editor")]
 pub use meshes_editor;
 
+mod examples;
 pub mod runtime;
 
 #[cfg(feature = "editor")]
