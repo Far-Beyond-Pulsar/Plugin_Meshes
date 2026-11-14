@@ -40,19 +40,14 @@ async fn create_pass() -> Option<OcclusionCullPass> {
         mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         ..Default::default()
     }));
-    let cull_stats = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Occlusion Cull Portability Test Stats"),
-        size: 5 * std::mem::size_of::<u32>() as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
+    let stats = helio_core::FrameStats::new(&device);
 
     Some(OcclusionCullPass::new(
         &device,
         hiz_sampler,
         1280,
         720,
-        cull_stats,
+        &stats,
     ))
 }
 

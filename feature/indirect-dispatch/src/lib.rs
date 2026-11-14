@@ -40,7 +40,8 @@ pub struct IndirectDispatchPass {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buf: wgpu::Buffer,
-    cull_stats_buf: wgpu::Buffer,
+    /// The frame stats' counters (`FrameStats::buffer`) its shader adds to.
+    stats_buf: wgpu::Buffer,
     /// This pass's own output -- no longer a central `GpuScene` field (see
     /// `IndirectDispatchFrameData`'s doc, now in this crate): frustum-culled
     /// indirect draw args, one `DrawIndexedIndirect` (20 bytes) per
@@ -59,7 +60,7 @@ pub struct IndirectDispatchPass {
 }
 
 impl IndirectDispatchPass {
-    pub fn new(device: &wgpu::Device, cull_stats_buf: wgpu::Buffer) -> Self {
+    pub fn new(device: &wgpu::Device, stats: &helio_core::FrameStats) -> Self {
         let shader = helio_core::shader::module(
             device,
             "IndirectDispatch Shader",
@@ -142,7 +143,7 @@ impl IndirectDispatchPass {
                     },
                     count: None,
                 },
-                // binding 6: culling stats (read_write, atomic counters)
+                // binding 6: the frame stats (read_write, atomic counters)
                 wgpu::BindGroupLayoutEntry {
                     binding: 6,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -184,6 +185,19 @@ impl IndirectDispatchPass {
             immediate_size: 0,
         });
 
+        use helio_core::stats::{DRAW_CALLS, INSTANCES, VERTICES};
+        use helio_mesh_api::stats as mesh;
+        let constants = stats.slot_constants(&[
+            ("STAT_BATCHES", mesh::BATCHES),
+            ("STAT_BATCHES_FRUSTUM_CULLED", mesh::BATCHES_FRUSTUM_CULLED),
+            ("STAT_BATCHES_SUBPIXEL", mesh::BATCHES_SUBPIXEL),
+            ("STAT_DRAWS", mesh::DRAWS),
+            ("STAT_SHADOW_BATCHES", mesh::SHADOW_BATCHES),
+            ("STAT_SHADOW_DRAWS", mesh::SHADOW_DRAWS),
+            ("STAT_DRAW_CALLS", DRAW_CALLS),
+            ("STAT_VERTICES", VERTICES),
+            ("STAT_INSTANCES", INSTANCES),
+        ]);
         let pipeline = helio_core::shader::create_compute_pipeline(
             &device,
             wgpu::ComputePipelineDescriptor {
@@ -191,7 +205,10 @@ impl IndirectDispatchPass {
                 layout: Some(&pipeline_layout),
                 module: &shader,
                 entry_point: Some("main"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &constants,
+                    ..Default::default()
+                },
                 cache: None,
             },
         );
@@ -203,7 +220,7 @@ impl IndirectDispatchPass {
             pipeline,
             bind_group_layout,
             uniform_buf,
-            cull_stats_buf: cull_stats_buf.clone(),
+            stats_buf: stats.buffer().clone(),
             indirect_buf,
             compacted_indices_buf,
             draw_capacity: MIN_CAPACITY,
@@ -358,7 +375,7 @@ impl RenderPass for IndirectDispatchPass {
             batch.draw_calls.clone(),
             batch.aabbs.clone(),
             self.indirect_buf.clone(),
-            self.cull_stats_buf.clone(),
+            self.stats_buf.clone(),
             self.compacted_indices_buf.clone(),
             coord_data.coordinate_spaces.clone(),
         ];
@@ -393,7 +410,7 @@ impl RenderPass for IndirectDispatchPass {
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
-                        resource: self.cull_stats_buf.as_entire_binding(),
+                        resource: self.stats_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 7,

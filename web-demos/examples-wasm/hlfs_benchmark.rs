@@ -103,7 +103,7 @@ impl HelioWasmApp for Demo {
             debug_state: renderer.debug_state(),
             camera_buffer: renderer.camera_buf(),
             debug_camera_buffer: renderer.debug_camera_buf(),
-            cull_stats_buffer: renderer.cull_stats_buf(),
+            stats: renderer.frame_stats(),
             owns_device: true,
             scene_db: renderer.scene_db(),
         });
