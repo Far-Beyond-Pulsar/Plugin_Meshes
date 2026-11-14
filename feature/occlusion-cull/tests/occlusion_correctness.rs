@@ -200,7 +200,7 @@ fn make_instance(center_z: f32, flags: u32) -> GpuInstanceData {
         mesh_id: 0,
         material_id: 0,
         flags,
-        lightmap_index: 0xFFFF_FFFF,
+        object_row: 0,
         skin_vertex_offset: 0,
         bone_palette_offset: 0,
         bone_palette_count: 0,

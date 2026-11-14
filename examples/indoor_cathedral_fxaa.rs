@@ -205,7 +205,11 @@ impl ApplicationHandler for App {
         let mut scene_db = new_scene_db_with_gpu_mirror(&device, &queue);
         let mut renderer = RendererBuilder::new(config, scene_db_handle(&scene_db))
             .with_editor_mode(true)
-            .with_pass_build_context(Box::new(helio_mesh_host::presets::deferred_fxaa))
+            .with_graph(helio_mesh_host::presets::with(
+                helio_presets::Preset::DeferredFxaa,
+                // Baked lighting: adds its nodes once the cathedral is baked.
+                &helio_bake_host::features(),
+            ))
             .build_with_graphics_context(&mut graphics)
             .expect("Helio renderer");
         let surface = graphics.surface;
@@ -526,12 +530,15 @@ impl ApplicationHandler for App {
         });
         renderer.set_clear_color([0.0, 0.0, 0.0, 1.0]);
 
-        // The renderer never walks the scene: hand it SceneDB's projection
-        // first, or there is nothing to bake (Helio#256).
-        helio_components::bake(
+        // Bake the cathedral's indirect light (lights stay dynamic) and
+        // install it: the graph rebuilds with the bake's nodes. The renderer
+        // never walks the scene: the bake reads SceneDB's projection
+        // (Helio#256).
+        helio_bake_host::bake(
             &mut renderer,
-            helio_mesh_host::bake_scene_from_world(&scene_db.world),
-            BakeConfig::fast("indoor_cathedral"),
+            helio_bake_host::bake_scene_from_world(&scene_db.world),
+            BakeConfig::fast("indoor_cathedral")
+                .with_store(helio_bake_host::disk_store("bake_cache")),
         )
         .expect("bake the cathedral");
 

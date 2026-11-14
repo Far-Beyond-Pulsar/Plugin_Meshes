@@ -17,7 +17,7 @@ fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
 }
 
 struct DepthOut {
-    @location(0) lightmap_uv: vec2<f32>,
+    @location(0) surface_tag: vec2<f32>,
     @builtin(frag_depth) depth: f32,
 }
 

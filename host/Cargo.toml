@@ -17,7 +17,6 @@ bytemuck = { workspace = true, features = ["derive"] }
 glam = { workspace = true }
 helio = { workspace = true }
 helio-asset-compat = { workspace = true }
-helio-bake = { workspace = true }
 helio-components = { workspace = true }
 helio-core = { workspace = true }
 helio-feature-api = { workspace = true }

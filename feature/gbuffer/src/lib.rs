@@ -1,7 +1,7 @@
 //! G-Buffer pass.
 //!
 //! Renders opaque geometry to 8 render targets (albedo, normal, ORM, emissive,
-//! lightmap_uv, sss, extra, velocity) + depth.
+//! surface, sss, extra, velocity) + depth.
 //! O(1) CPU: single `multi_draw_indexed_indirect` call regardless of scene size.
 //!
 //! # Render Targets (owned by this pass)
@@ -51,7 +51,7 @@ use helio_mesh_api::{
 
 /// Debug mode id of the wireframe view (needs `POLYGON_MODE_LINE`).
 const WIREFRAME_DEBUG_MODE: u32 = 40;
-use helio_core::graph::{ResourceBuilder, ResourceFormat, ResourceSize};
+use helio_core::graph::{ResourceBuilder, ResourceSize};
 use helio_core::{
     DebugViewDescriptor, PassContext, PrepareContext, RenderPass, Result as HelioResult,
 };
@@ -115,7 +115,7 @@ pub struct GBufferPass {
     uv_grid_full: bool,
     /// Group 0: camera + globals + instance_data. Rebuilt when buffer pointers change.
     bind_group_0: Option<wgpu::BindGroup>,
-    bind_group_0_key: Option<[wgpu::Buffer; 7]>,
+    bind_group_0_key: Option<[wgpu::Buffer; 8]>,
     /// Group 1: materials + material_textures + bindless texture arrays.
     bind_group_1: Option<wgpu::BindGroup>,
     bind_group_1_version: Option<(u64, u64)>,
@@ -127,8 +127,12 @@ pub struct GBufferPass {
     pub csm_splits: [f32; 4],
     /// Debug visualisation mode forwarded to the GBuffer shader (0 = off).
     pub debug_mode: u32,
-    /// Lightmap atlas regions buffer (empty until bake data is loaded)
-    lightmap_atlas_regions_buf: wgpu::Buffer,
+    /// Bound for baked lighting's lightmap regions while no bake publishes
+    /// them (one region with no lightmap).
+    no_lightmap_regions: wgpu::Buffer,
+    /// Whether the graph requested baked lighting's lightmap UV as the
+    /// G-buffer's surface payload (`LIGHTMAP_PAYLOAD` in gbuffer.wgsl).
+    lightmap_payload: bool,
     /// Portal/sublevel-local transforms, indexed by an instance's `space_id`.
     /// Pass-owned (not `Renderer`-owned): every consumer of `"coordinate_
     /// spaces"` (`OcclusionCullPass`, `IndirectDispatchPass`, `ShadowPass`,
@@ -162,9 +166,10 @@ pub struct GBufferPass {
 pub const GBUFFER_PROGRAM: &str = include_str!("../shaders/gbuffer.wgsl");
 /// The snippets [`GBUFFER_PROGRAM`] composes with: the meshes' draw rows and
 /// the frame's G-buffer output.
-pub const GBUFFER_PROGRAM_SNIPPETS: [helio_core::shader::ShaderSnippet; 2] = [
+pub const GBUFFER_PROGRAM_SNIPPETS: [helio_core::shader::ShaderSnippet; 3] = [
     helio_mesh_api::DRAW_ROWS_SNIPPET,
     helio_frame_api::gbuffer::OUTPUT_SNIPPET,
+    helio_bake_api::LIGHTMAP_REGIONS_SNIPPET,
 ];
 
 /// Coordinate-space slots backed by GPU storage (slot 0 is the identity). An
@@ -248,7 +253,7 @@ impl GBufferPass {
                         },
                         count: None,
                     },
-                    // binding 3: lightmap_atlas_regions (storage read, VERTEX)
+                    // binding 3: baked lighting's lightmap regions (storage read, VERTEX)
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::VERTEX,
@@ -338,12 +343,11 @@ impl GBufferPass {
             immediate_size: 0,
         });
 
-        // Create empty lightmap atlas regions buffer (populated when bake data is loaded).
-        // Each region is 32 bytes: uv_offset(8) + uv_scale(8) + uv_clamp_min(8) + uv_clamp_max(8).
-        let lightmap_atlas_regions_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Lightmap Atlas Regions"),
-            size: 32, // One empty region sentinel; recreated when real data loads.
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        // Zeroed: one region with no lightmap.
+        let no_lightmap_regions = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("No lightmap regions"),
+            size: std::mem::size_of::<helio_bake_api::LightmapRegion>() as u64,
+            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
@@ -396,7 +400,8 @@ impl GBufferPass {
             // Default CSM splits — single source of truth is helio_light_api::CSM_SPLITS.
             csm_splits: helio_light_api::CSM_SPLITS,
             debug_mode: 0,
-            lightmap_atlas_regions_buf,
+            no_lightmap_regions,
+            lightmap_payload: false,
             coordinate_spaces,
             coordinate_spaces_prev,
             fallback_skeletal_storage,
@@ -513,8 +518,8 @@ impl RenderPass for GBufferPass {
         // The remaining 4 G-buffer targets are each read independently
         // downstream (no bundling) — plain single-view declarations.
         builder.write_color_raw(
-            helio_frame_api::gbuffer::LIGHTMAP_UV,
-            helio_frame_api::gbuffer::LIGHTMAP_UV_FORMAT.to_wgpu(),
+            helio_frame_api::gbuffer::SURFACE,
+            helio_frame_api::gbuffer::SURFACE_FORMAT.to_wgpu(),
             ResourceSize::MatchSurface,
         );
         builder.write_color_raw(
@@ -524,7 +529,7 @@ impl RenderPass for GBufferPass {
         );
         // `gbuffer_sss`, `gbuffer_extra` and `gbuffer_velocity` are also written
         // by storage texture when virtual geometry shades its pixels
-        // (`helio-pass-vg-shade`). Not `gbuffer_lightmap_uv`: Rg16Float is not a
+        // (`helio-pass-vg-shade`). Not `gbuffer_surface`: Rg16Float is not a
         // storage format (the VG depth pass writes it as an attachment).
         builder.with_extra_usage(wgpu::TextureUsages::STORAGE_BINDING);
         builder.write_color_raw(
@@ -579,8 +584,8 @@ impl RenderPass for GBufferPass {
             helio_core::ResourceKey::new(helio_frame_api::gbuffer::GROUP),
             "GBuffer",
         )?;
-        let lightmap_uv = resources.read(
-            helio_core::ResourceKey::new(helio_frame_api::gbuffer::LIGHTMAP_UV),
+        let surface = resources.read(
+            helio_core::ResourceKey::new(helio_frame_api::gbuffer::SURFACE),
             "GBuffer",
         )?;
         let sss_target = resources.read(
@@ -634,11 +639,11 @@ impl RenderPass for GBufferPass {
                     },
                 }),
                 Some(wgpu::RenderPassColorAttachment {
-                    view: lightmap_uv,
+                    view: surface,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: wgpu::LoadOp::Clear(helio_frame_api::gbuffer::SURFACE_CLEAR),
                         store: wgpu::StoreOp::Store,
                     },
                 }),
@@ -848,9 +853,15 @@ impl RenderPass for GBufferPass {
         let palette_buf = palette_handle
             .map(|handle| &handle.buffer)
             .unwrap_or(&self.fallback_skeletal_storage);
+        // Baked lighting's lightmap regions, while a bake publishes them.
+        let lightmap_regions = ctx
+            .registry
+            .buffer_binding(helio_bake_api::LIGHTMAP_REGIONS)
+            .unwrap_or(&self.no_lightmap_regions);
         let key = [
             ctx.camera.clone(),
             batch.instances.clone(),
+            lightmap_regions.clone(),
             culled.compacted_indices.clone(),
             coordinate_spaces_buf.clone(),
             coordinate_spaces_prev_buf.clone(),
@@ -877,7 +888,7 @@ impl RenderPass for GBufferPass {
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: self.lightmap_atlas_regions_buf.as_entire_binding(),
+                        resource: lightmap_regions.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
@@ -1057,54 +1068,11 @@ impl RenderPass for GBufferPass {
 }
 
 impl GBufferPass {
-    /// Populate the lightmap atlas regions buffer from baked data.
-    ///
-    /// Called by the renderer after a successful bake to upload per-mesh UV atlas regions.
-    /// Each region maps a mesh_id to its atlas location with precomputed clamp bounds that
-    /// prevent bilinear filtering from bleeding across adjacent atlas region boundaries.
-    ///
-    /// # Arguments
-    /// * `queue`   - GPU queue for buffer uploads
-    /// * `regions` - `[uv_offset.x, uv_offset.y, uv_scale.x, uv_scale.y,
-    ///                uv_clamp_min.x, uv_clamp_min.y, uv_clamp_max.x, uv_clamp_max.y]`
-    ///              per mesh (32 bytes each, matching `LightmapAtlasRegion` in gbuffer.wgsl)
-    pub fn upload_lightmap_atlas_regions(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        regions: &[[f32; 8]],
-    ) {
-        if regions.is_empty() {
-            return;
-        }
-
-        // Each region is 32 bytes: uv_offset(8) + uv_scale(8) + uv_clamp_min(8) + uv_clamp_max(8).
-        let buf_size = (regions.len() * 32) as u64;
-
-        // Recreate buffer if size changed
-        if self.lightmap_atlas_regions_buf.size() < buf_size {
-            self.lightmap_atlas_regions_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Lightmap Atlas Regions"),
-                size: buf_size.max(32),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            // Invalidate bind group since buffer changed
-            self.bind_group_0_key = None;
-        }
-
-        queue.write_buffer(
-            &self.lightmap_atlas_regions_buf,
-            0,
-            bytemuck::cast_slice(regions),
-        );
-
-        log::info!(
-            "[GBufferPass] Uploaded {} lightmap atlas regions ({} bytes)",
-            regions.len(),
-            buf_size
-        );
+    /// Write baked lighting's lightmap UV into the G-buffer's surface payload
+    /// (the graph requested `helio_bake_api::LIGHTMAP_UV`).
+    pub fn with_lightmap_payload(mut self, on: bool) -> Self {
+        self.lightmap_payload = on;
+        self
     }
 
     /// Get or create a render pipeline for the given key.
@@ -1118,6 +1086,7 @@ impl GBufferPass {
     ) -> &wgpu::RenderPipeline {
         if !self.pipelines.contains_key(&key) {
             let wireframe = self.wireframe_supported && self.debug_mode == WIREFRAME_DEBUG_MODE;
+            let lightmap_payload = self.lightmap_payload;
             let registered_graph;
             let graph_wgsl = if graph_wgsl.is_empty() && key.graph_hash != 0 {
                 registered_graph = helio_mats::graph_source(key.graph_hash);
@@ -1179,7 +1148,13 @@ impl GBufferPass {
                     vertex: wgpu::VertexState {
                         module,
                         entry_point: Some("vs_main"),
-                        compilation_options: Default::default(),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants: &[(
+                                "LIGHTMAP_PAYLOAD",
+                                if lightmap_payload { 1.0 } else { 0.0 },
+                            )],
+                            ..Default::default()
+                        },
                         // Full vertex layout (stride = 40 bytes, matching shared mesh buffer).
                         //   offset  0 — position       Float32x3  location 0
                         //   offset 12 — bitangent_sign Float32    location 1

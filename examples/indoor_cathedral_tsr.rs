@@ -209,7 +209,11 @@ impl ApplicationHandler for App {
         let graph_scene_db = scene_db_handle(&scene_db);
         let mut renderer = RendererBuilder::new(config, graph_scene_db.clone())
             .with_editor_mode(true)
-            .with_pass_build_context(Box::new(helio_mesh_host::presets::deferred))
+            .with_graph(helio_mesh_host::presets::with(
+                helio_presets::Preset::Deferred,
+                // Baked lighting: adds its nodes once the cathedral is baked.
+                &helio_bake_host::features(),
+            ))
             .build_with_graphics_context(&mut graphics)
             .expect("Helio renderer");
         let surface = graphics.surface;
@@ -530,15 +534,15 @@ impl ApplicationHandler for App {
         });
         renderer.set_clear_color([0.0, 0.0, 0.0, 1.0]);
 
-        // Bake static/stationary lights so they're excluded from the real-time
-        // deferred-light loop. Without this, all 9 glass window lights + environment
-        // run full tiled PCF every frame even though they're fixed.
-        // The renderer never walks the scene: hand it SceneDB's projection
-        // first, or there is nothing to bake (Helio#256).
-        helio_components::bake(
+        // Bake the cathedral's indirect light (lights stay dynamic) and
+        // install it: the graph rebuilds with the bake's nodes. The renderer
+        // never walks the scene: the bake reads SceneDB's projection
+        // (Helio#256).
+        helio_bake_host::bake(
             &mut renderer,
-            helio_mesh_host::bake_scene_from_world(&scene_db.world),
-            BakeConfig::fast("indoor_cathedral"),
+            helio_bake_host::bake_scene_from_world(&scene_db.world),
+            BakeConfig::fast("indoor_cathedral")
+                .with_store(helio_bake_host::disk_store("bake_cache")),
         )
         .expect("bake the cathedral");
 

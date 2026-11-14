@@ -116,7 +116,7 @@ pub const fn coordinate_space(flags: u32) -> u32 {
 ///     mesh_id:      u32,          //  4 bytes
 ///     material_id:  u32,          //  4 bytes
 ///     flags:        u32,          //  4 bytes
-///     lightmap_index: u32,        //  4 bytes — index into lightmap atlas regions buffer
+///     object_row:   u32,          //  4 bytes — the object's `static_objects` row
 /// }
 /// ```
 #[repr(C)]
@@ -137,8 +137,10 @@ pub struct GpuInstanceData {
     /// Flags (bit 0 = casts_shadow, bit 1 = receives_shadow, bit 2 = always_visible,
     /// bits 8-15 = coordinate-space id, see [`set_coordinate_space`]/[`coordinate_space`])
     pub flags: u32,
-    /// Index into the lightmap atlas regions buffer (0xFFFFFFFF = no lightmap)
-    pub lightmap_index: u32,
+    /// The object's `static_objects` row (its entity's index): what per-object
+    /// data other kinds publish is indexed by (baked lighting's lightmap
+    /// regions, `helio_bake_api::LIGHTMAP_REGIONS`).
+    pub object_row: u32,
     /// Base vertex in the skeletal four-influence stream (zero for rigid meshes).
     pub skin_vertex_offset: u32,
     /// Base matrix in the shared skeletal palette pool.

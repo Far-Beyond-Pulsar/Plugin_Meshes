@@ -329,7 +329,9 @@ fn merge_sections<'a>(
     parts: Vec<(PartGeometry<'a>, PartMeta)>,
 ) -> Result<Vec<(PartGeometry<'a>, PartMeta)>, Vec<(PartGeometry<'a>, PartMeta)>> {
     if parts.len() < 2
-        || parts.iter().any(|(_, m)| m.content.is_none() || m.transform != parts[0].1.transform)
+        || parts
+            .iter()
+            .any(|(_, m)| m.content.is_none() || m.transform != parts[0].1.transform)
     {
         return Err(parts);
     }

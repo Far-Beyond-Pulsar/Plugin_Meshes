@@ -272,7 +272,7 @@ pub struct VgShadeTargets<'a> {
     pub normal: &'a wgpu::TextureView,      // Rgba16Float
     pub orm: &'a wgpu::TextureView,         // Rgba8Unorm
     pub emissive: &'a wgpu::TextureView,    // Rgba16Float
-    pub lightmap_uv: &'a wgpu::TextureView, // Rg16Float, RENDER_ATTACHMENT only (written by the depth pass)
+    pub surface_tag: &'a wgpu::TextureView, // Rg16Float, RENDER_ATTACHMENT only (written by the depth pass)
     pub sss: &'a wgpu::TextureView,         // Rgba16Float
     pub extra: &'a wgpu::TextureView,       // Rgba16Float
     pub velocity: &'a wgpu::TextureView,    // Rgba16Float
@@ -551,7 +551,7 @@ impl VgShade {
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: helio_frame_api::gbuffer::LIGHTMAP_UV_FORMAT.to_wgpu(),
+                    format: helio_frame_api::gbuffer::SURFACE_FORMAT.to_wgpu(),
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1234,7 +1234,7 @@ impl VgShade {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("VgShade depth"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: targets.lightmap_uv,
+                view: targets.surface_tag,
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
