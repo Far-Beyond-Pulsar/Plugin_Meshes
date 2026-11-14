@@ -116,9 +116,7 @@ impl Mat {
                 v.extend((0..tree.slots.len()).map(|si| Mat::Tree(ti as u8, si as u8)));
                 if forest {
                     for si in 0..tree.slots.len() {
-                        v.extend(
-                            (0..TINT_BUCKETS).map(|b| Mat::TreeTint(ti as u8, si as u8, b)),
-                        );
+                        v.extend((0..TINT_BUCKETS).map(|b| Mat::TreeTint(ti as u8, si as u8, b)));
                     }
                 }
             }
@@ -237,7 +235,9 @@ impl Mat {
                 let (_, slot) = self.tree_part().unwrap();
                 let rgb = match self {
                     // A glTF slot's texture carries the colour; the tint scales it.
-                    Mat::TreeTint(_, _, b) => tint(b, slot.masked || slot.fallback[1] > slot.fallback[0]),
+                    Mat::TreeTint(_, _, b) => {
+                        tint(b, slot.masked || slot.fallback[1] > slot.fallback[0])
+                    }
                     _ => [1.0; 3],
                 };
                 s(

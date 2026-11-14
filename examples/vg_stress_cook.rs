@@ -380,13 +380,20 @@ fn read_vgeo_with(cache: &Path, content: u128, force: bool) -> Option<Arc<VgeoBy
 /// Content id of a sectioned mesh: [`stable_content_id`] when there is one
 /// section (`tri_material` empty, so single-material caches keep their id),
 /// else that id mixed with the per-triangle section of every triangle.
-pub fn sectioned_content_id(vertices: &[PackedVertex], indices: &[u32], tri_material: &[u32]) -> u128 {
+pub fn sectioned_content_id(
+    vertices: &[PackedVertex],
+    indices: &[u32],
+    tri_material: &[u32],
+) -> u128 {
     let base = stable_content_id(vertices, indices);
     if tri_material.is_empty() {
         return base;
     }
     let (mut low, mut high) = (base as u64, (base >> 64) as u64);
-    for byte in bytemuck::cast_slice::<u32, u8>(tri_material).iter().copied() {
+    for byte in bytemuck::cast_slice::<u32, u8>(tri_material)
+        .iter()
+        .copied()
+    {
         low = (low ^ u64::from(byte)).wrapping_mul(0x100000001b3);
         high = (high ^ u64::from(byte).rotate_left(1)).wrapping_mul(0x9e3779b185ebca87);
     }

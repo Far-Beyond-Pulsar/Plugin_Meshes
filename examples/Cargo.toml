@@ -193,9 +193,9 @@ helio-light-api = { workspace = true }
 helio-mesh-host = { workspace = true }
 helio-pass-vg = { workspace = true }
 helio-mesh-api = { workspace = true }
-helio-components = { workspace = true, features = ["bake"] }
 helio = { workspace = true }
 helio-bake = { workspace = true }
+helio-bake-host = { workspace = true }
 helio-core = { workspace = true }
 helio-vg-build = { workspace = true }
 helio-vg-format = { workspace = true }

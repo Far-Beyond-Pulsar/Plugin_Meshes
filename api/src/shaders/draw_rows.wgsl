@@ -17,7 +17,8 @@ struct GpuInstanceData {
     // `INSTANCE_FLAG_*` bits and the coordinate space
     // (`instance_coordinate_space`).
     flags:          u32,
-    lightmap_index: u32,
+    // The object's `static_objects` row (`GpuInstanceData::object_row`).
+    object_row: u32,
     skin_vertex_offset: u32,
     bone_palette_offset: u32,
     bone_palette_count: u32,

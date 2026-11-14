@@ -192,7 +192,7 @@ impl RenderPass for VgShadePass {
     fn reads(&self) -> &'static [&'static str] {
         &[
             helio_frame_api::gbuffer::GROUP,
-            helio_frame_api::gbuffer::LIGHTMAP_UV,
+            helio_frame_api::gbuffer::SURFACE,
             helio_frame_api::gbuffer::SSS,
             helio_frame_api::gbuffer::EXTRA,
             helio_frame_api::gbuffer::VELOCITY,
@@ -313,8 +313,8 @@ impl RenderPass for VgShadePass {
             return Ok(());
         };
         let reg = ctx.registry;
-        let (Some(lightmap_uv), Some(sss), Some(extra), Some(velocity)) = (
-            reg.texture_view(ResourceKey::new(helio_frame_api::gbuffer::LIGHTMAP_UV)),
+        let (Some(surface_tag), Some(sss), Some(extra), Some(velocity)) = (
+            reg.texture_view(ResourceKey::new(helio_frame_api::gbuffer::SURFACE)),
             reg.texture_view(ResourceKey::new(helio_frame_api::gbuffer::SSS)),
             reg.texture_view(ResourceKey::new(helio_frame_api::gbuffer::EXTRA)),
             reg.texture_view(ResourceKey::new(helio_frame_api::gbuffer::VELOCITY)),
@@ -362,7 +362,7 @@ impl RenderPass for VgShadePass {
             normal: gbuffer.views[1],
             orm: gbuffer.views[2],
             emissive: gbuffer.views[3],
-            lightmap_uv,
+            surface_tag,
             sss,
             extra,
             velocity,

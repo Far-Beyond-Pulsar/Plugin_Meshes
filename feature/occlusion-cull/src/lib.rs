@@ -741,9 +741,11 @@ impl OcclusionCullPass {
     /// Follow the `baked_pvs` frame input: upload its bitfield when a bake
     /// arrives or changes, drop it when it goes away.
     fn sync_pvs(&mut self, ctx: &PrepareContext) {
-        let baked = ctx
-            .registry
-            .get::<helio_bake_types::BakedPvsRef<'_>>(helio_core::ResourceKey::new("baked_pvs"));
+        let baked =
+            ctx.registry
+                .get::<helio_bake_api::BakedPvsRef<'_>>(helio_core::ResourceKey::new(
+                    helio_bake_api::BAKED_PVS,
+                ));
         let Some(pvs) = baked
             .filter(|pvs| pvs.cell_size > 0.0 && pvs.words_per_cell > 0 && !pvs.bits.is_empty())
         else {

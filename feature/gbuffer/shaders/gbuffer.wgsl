@@ -6,6 +6,7 @@ enable wgpu_binding_array;
 //!use material_row
 //!use material_surface
 //!use mesh_draw_rows
+//!use lightmap_regions
 
 //! The meshes' G-buffer program (GPU-driven): the meshes' vertex layout and
 //! instance rows, shaded by the material's template. A material class's
@@ -46,21 +47,17 @@ struct SkinVertex {
     weights: vec4<f32>,
 }
 
-/// Lightmap atlas region for a mesh (32 bytes).
-///
-/// uv_clamp_min/max are precomputed half-texel-inset bounds that prevent bilinear
-/// filtering from bleeding across neighbouring atlas region boundaries at runtime.
-struct LightmapAtlasRegion {
-    uv_offset:    vec2<f32>,  // Top-left corner in atlas [0,1] space
-    uv_scale:     vec2<f32>,  // Extent in atlas [0,1] space
-    uv_clamp_min: vec2<f32>,  // uv_offset + 0.5/atlas_size  (half-texel inner inset)
-    uv_clamp_max: vec2<f32>,  // uv_offset + uv_scale - 0.5/atlas_size
-}
+// Whether the graph requested baked lighting's lightmap UV as the G-buffer's
+// surface payload (`helio_frame_api::gbuffer::payload`): the drawer then
+// writes each lightmapped object's atlas UV there.
+override LIGHTMAP_PAYLOAD: bool = false;
 
 @group(0) @binding(0) var<storage, read> cameras: array<Camera, 2>;
 @group(0) @binding(1) var<uniform>          globals:                Globals;
 @group(0) @binding(2) var<storage, read>    instance_data:          array<GpuInstanceData>;
-@group(0) @binding(3) var<storage, read>    lightmap_atlas_regions: array<LightmapAtlasRegion>;
+// Baked lighting's per-object regions (`helio_bake_api::LIGHTMAP_REGIONS`),
+// by `static_objects` row; a one-region stand-in without a bake.
+@group(0) @binding(3) var<storage, read>    lightmap_regions:       array<LightmapRegion>;
 // Per-draw-call-group compacted original instance slots, surviving both
 // frustum culling (IndirectDispatchPass) and Hi-Z occlusion culling
 // (OcclusionCullPass). The draw slot (`@location(15)`) ranges over the
@@ -214,41 +211,20 @@ fn vs_main(v: Vertex, @location(15) slot: u32, @builtin(vertex_index) vertex_ind
         || any(space_prev[2] != space[2]) || any(space_prev[3] != space[3]);
     out.moving = select(0u, 1u, moved || inst.bone_palette_count > 0u);
     
-    // Compute lightmap UV from atlas region.
+    // The object's lightmap atlas UV, as the surface payload, when the graph
+    // requested it (baked lighting's `LIGHTMAP_UV`); otherwise the plain tag.
     //
-    // UV CHANNEL SELECTION STRATEGY
-    // ──────────────────────────────
-    // If the mesh has a dedicated lightmap UV channel (UV1, non-zero), use it.
-    // UV1 is artist-authored or tool-generated to be non-overlapping and in [0,1],
-    // exactly what offline bakers need. Nebula receives UV1 explicitly via
-    // `lightmap_uvs: Some(...)` in mesh_upload_to_bake when UV1 is non-trivial.
-    //
-    // If UV1 is all-zero (mesh has only one UV channel), fall back to UV0
-    // clamped to [0,1].  UV0 is what Nebula baked with in that case
-    // (mesh_upload_to_bake passes UV0 as lightmap_uvs when UV1 is absent).
-    // Clamping prevents tiled UV0 values (e.g. 2.3) from mapping outside
-    // the atlas region and hitting neighbouring meshes' texels (the original
-    // "random dim slivers" bug).
-    //
-    // The computed atlas UV is then half-texel-inset clamped to [uv_clamp_min,
-    // uv_clamp_max] to prevent bilinear filtering from bleeding across atlas
-    // region boundaries regardless of which UV channel was chosen.
-    let lightmap_idx = inst.lightmap_index;
-    if lightmap_idx != 0xFFFFFFFFu {
-        let region = lightmap_atlas_regions[lightmap_idx];
-        // Use UV1 if any component is clearly non-zero; otherwise fall back to UV0.
-        let use_uv1 = any(abs(v.lightmap_uv) > vec2<f32>(0.001));
-        let lm_input = select(
-            clamp(v.tex_coords, vec2<f32>(0.0), vec2<f32>(1.0)),  // UV0 path: clamp to [0,1]
-            v.lightmap_uv,                                           // UV1 path: already in [0,1]
-            use_uv1,
-        );
-        let raw_uv = region.uv_offset + lm_input * region.uv_scale;
-        out.lightmap_uv = clamp(raw_uv, region.uv_clamp_min, region.uv_clamp_max);
-    } else {
-        // The frame's "no lightmap" tag (not (0, 0): a valid atlas region can
-        // start there).
-        out.lightmap_uv = GBUFFER_TAG_UNLIGHTMAPPED;
+    // The lightmap UV is the mesh's UV1 channel: a unique, non-overlapping
+    // [0,1] layout (tiled UV0 is not one), which the bake used too. Only a
+    // mesh baked with UV1 has a region; every other object reads a zero
+    // region and keeps the plain tag. The region's half-texel clamp keeps
+    // bilinear filtering inside it.
+    out.lightmap_uv = GBUFFER_TAG_PLAIN;
+    if LIGHTMAP_PAYLOAD && inst.object_row < arrayLength(&lightmap_regions) {
+        let atlas = lightmap_atlas_uv(lightmap_regions[inst.object_row], v.lightmap_uv);
+        if atlas.x >= 0.0 {
+            out.lightmap_uv = atlas;
+        }
     }
     return out;
 }
@@ -364,7 +340,7 @@ fn fs_main(vertex: VertexOutput, @builtin(front_facing) front: bool) -> GBufferO
     out.normal = vec4<f32>(surface.normal, surface.specular_f0.r);
     out.orm = vec4<f32>(surface.ao, surface.roughness, surface.metallic, surface.specular_f0.g);
     out.emissive = vec4<f32>(surface.emissive, surface.specular_f0.b);
-    out.lightmap_uv = input.lightmap_uv;
+    out.surface = input.lightmap_uv;
     out.sss = vec4<f32>(surface.subsurface_color, surface.subsurface_radius);
     out.extra = vec4<f32>(surface.roughness_aniso_x, surface.roughness_aniso_y,
                           surface.aniso_rotation, f32(surface.flags));

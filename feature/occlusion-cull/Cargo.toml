@@ -10,7 +10,7 @@ helio-frame-api = { workspace = true }
 helio-pass-hiz = { workspace = true }
 helio-core = { workspace = true }
 helio-pass-indirect-dispatch = { workspace = true }
-helio-bake-types = { workspace = true }
+helio-bake-api = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 

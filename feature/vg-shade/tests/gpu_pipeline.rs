@@ -551,7 +551,7 @@ fn resolve_bin_shade_and_final_depth() {
     let normal = target("normal", F::Rgba16Float);
     let orm = target("orm", F::Rgba8Unorm);
     let emissive = target("emissive", F::Rgba16Float);
-    let lightmap_uv = texture(
+    let surface_tag = texture(
         device,
         "lightmap uv",
         F::Rg16Float,
@@ -561,12 +561,12 @@ fn resolve_bin_shade_and_final_depth() {
     let extra = target("extra", F::Rgba16Float);
     let velocity = target("velocity", F::Rgba16Float);
     let v = |t: &wgpu::Texture| t.create_view(&Default::default());
-    let (albedo_v, normal_v, orm_v, emissive_v, lm_v, sss_v, extra_v, velocity_v) = (
+    let (albedo_v, normal_v, orm_v, emissive_v, surface_v, sss_v, extra_v, velocity_v) = (
         v(&albedo),
         v(&normal),
         v(&orm),
         v(&emissive),
-        v(&lightmap_uv),
+        v(&surface_tag),
         v(&sss),
         v(&extra),
         v(&velocity),
@@ -627,7 +627,7 @@ fn resolve_bin_shade_and_final_depth() {
             normal: &normal_v,
             orm: &orm_v,
             emissive: &emissive_v,
-            lightmap_uv: &lm_v,
+            surface_tag: &surface_v,
             sss: &sss_v,
             extra: &extra_v,
             velocity: &velocity_v,
@@ -745,7 +745,7 @@ fn resolve_bin_shade_and_final_depth() {
     let albedo_px = read_texture(&gpu, &albedo, 4, wgpu::TextureAspect::All);
     let normal_px = read_texture(&gpu, &normal, 8, wgpu::TextureAspect::All);
     let orm_px = read_texture(&gpu, &orm, 4, wgpu::TextureAspect::All);
-    let lm_px = read_texture(&gpu, &lightmap_uv, 4, wgpu::TextureAspect::All);
+    let lm_px = read_texture(&gpu, &surface_tag, 4, wgpu::TextureAspect::All);
     let velocity_px = read_texture(&gpu, &velocity, 8, wgpu::TextureAspect::All);
     let near = |a: f32, b: f32, tol: f32, what: &str, i: usize| {
         assert!((a - b).abs() <= tol, "pixel {i} {what}: {a} vs {b}");
@@ -839,7 +839,7 @@ fn resolve_bin_shade_and_final_depth() {
         normal: &normal_v,
         orm: &orm_v,
         emissive: &emissive_v,
-        lightmap_uv: &lm_v,
+        surface_tag: &surface_v,
         sss: &sss_v,
         extra: &extra_v,
         velocity: &velocity_v,

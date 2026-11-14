@@ -29,7 +29,12 @@ impl Feature for GBufferDrawers {
                 "Passes: Geometry",
                 "Opaque meshes into the GBuffer and the scene depth; opens the G-buffer phase.",
                 |build| {
-                    let mut pass = GBufferPass::new(build.env.device);
+                    // Baked lighting asked for each object's lightmap UV as the
+                    // G-buffer's surface payload.
+                    let lightmap = helio_frame_api::gbuffer::payload(build.env)
+                        == Some(helio_bake_api::LIGHTMAP_UV);
+                    let mut pass =
+                        GBufferPass::new(build.env.device).with_lightmap_payload(lightmap);
                     if let Some(templates) = build.env.setting::<helio_mats::MaterialTemplates>() {
                         pass = pass.with_template_registry(templates.opaque.clone());
                     }

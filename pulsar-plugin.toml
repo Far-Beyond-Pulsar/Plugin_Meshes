@@ -17,6 +17,7 @@ requires = [
     { id = "pulsar.materials.table", optional = true },
     { id = "pulsar.materials.api", optional = true },
     { id = "pulsar.animation.api", optional = true },
+    { id = "pulsar.bake.api", optional = true },
 ]
 
 # The plugin's root crate (the package in this directory): the one place it

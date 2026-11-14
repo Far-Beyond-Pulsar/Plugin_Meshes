@@ -463,10 +463,9 @@ fn prepare() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let config = vg_stress_prep::catalog::Config::from_env_and_args();
     let layout = match config.scene {
-        vg_stress_prep::catalog::Scene::Museum => vg_stress_data::layout::museum_layout_with(
-            &vg_stress_data::dims::Dims::load(),
-            &config,
-        ),
+        vg_stress_prep::catalog::Scene::Museum => {
+            vg_stress_data::layout::museum_layout_with(&vg_stress_data::dims::Dims::load(), &config)
+        }
         vg_stress_prep::catalog::Scene::Forest => vg_stress_data::layout::MuseumLayout {
             placements: vg_stress_data::forest::build(&config).placements,
             ..Default::default()
@@ -631,11 +630,12 @@ impl ApplicationHandler for App {
             graphics.surface_config.format
         };
 
-        let mut scene_db = v3_demo_common::new_scene_db_with_gpu_mirror_and(&device, &queue, |store| {
-            helio_pass_sky::host_rows::AtmosphereComponent::register_gpu_columns_growable(
-                store, 4, &device,
-            );
-        });
+        let mut scene_db =
+            v3_demo_common::new_scene_db_with_gpu_mirror_and(&device, &queue, |store| {
+                helio_pass_sky::host_rows::AtmosphereComponent::register_gpu_columns_growable(
+                    store, 4, &device,
+                );
+            });
         let runtime = VgRuntime::default();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let tau = parse_tau(std::env::var("VG_STRESS_TAU").ok().as_deref());
@@ -860,9 +860,11 @@ impl ApplicationHandler for App {
             surface_format: format,
             renderer,
             last_frame: std::time::Instant::now(),
-            cam_pos: forest.as_ref().map_or(glam::Vec3::new(0.0, 3.0, 34.0), |f| {
-                vg_stress_data::forest::vantage(&f.terrain)
-            }),
+            cam_pos: forest
+                .as_ref()
+                .map_or(glam::Vec3::new(0.0, 3.0, 34.0), |f| {
+                    vg_stress_data::forest::vantage(&f.terrain)
+                }),
             cam_yaw: if forest.is_some() { 0.6 } else { 0.0 },
             cam_pitch: if forest.is_some() { -0.05 } else { 0.04 },
             keys: HashSet::new(),

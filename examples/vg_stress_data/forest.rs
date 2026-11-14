@@ -152,7 +152,11 @@ impl Terrain {
                 let crests = ridged(s ^ 4, px * 0.55, pz * 0.55, 5);
                 // A valley around the middle, mountains to every side.
                 let r = (u * u + v * v).sqrt() * 2.0;
-                let mountain = smoothstep(0.22, 0.85, r + (fbm(s ^ 5, x / 614.4, z / 614.4, 3) - 0.5) * 0.35);
+                let mountain = smoothstep(
+                    0.22,
+                    0.85,
+                    r + (fbm(s ^ 5, x / 614.4, z / 614.4, 3) - 0.5) * 0.35,
+                );
                 let rim = smoothstep(0.85, 1.05, r);
                 let h = rolling * 0.16 + mountain * (0.10 + crests * 0.70) + rim * 0.25;
                 heights[j * n + i] = h * params.relief_m;
@@ -320,7 +324,11 @@ fn tile_mesh(
 ) -> Option<MeshUpload> {
     let cell = terrain.params.cell_m;
     let tile_m = TILE_CELLS as f32 * cell;
-    let centre = [origin[0] + tile_m * 0.5, origin[1], origin[2] + tile_m * 0.5];
+    let centre = [
+        origin[0] + tile_m * 0.5,
+        origin[1],
+        origin[2] + tile_m * 0.5,
+    ];
     let rock_cos = ROCK_SLOPE_DEG.to_radians().cos();
     let mut remap: std::collections::HashMap<(usize, usize), u32> = Default::default();
     let mut vertices: Vec<PackedVertex> = Vec::new();
@@ -363,7 +371,9 @@ fn tile_mesh(
                 let p = |(di, dj, hh): (usize, usize, f32)| {
                     glam::Vec3::new(di as f32 * cell, hh, dj as f32 * cell)
                 };
-                let n = (p(tri[1]) - p(tri[0])).cross(p(tri[2]) - p(tri[0])).normalize();
+                let n = (p(tri[1]) - p(tri[0]))
+                    .cross(p(tri[2]) - p(tri[0]))
+                    .normalize();
                 let is_rock = n.y < rock_cos;
                 if is_rock != (surface == 1) {
                     continue;
@@ -402,7 +412,12 @@ fn tree_weight(terrain: &Terrain, seed: u64, x: f32, z: f32) -> f32 {
     let h = terrain.height_at(x, z);
     let alt = altitude_fraction(terrain, h);
     let slope = terrain.slope_deg_at(x, z);
-    let treeline = 1.0 - smoothstep(0.50, 0.64, alt + (fbm(seed ^ 11, x * 0.004, z * 0.004, 3) - 0.5) * 0.12);
+    let treeline = 1.0
+        - smoothstep(
+            0.50,
+            0.64,
+            alt + (fbm(seed ^ 11, x * 0.004, z * 0.004, 3) - 0.5) * 0.12,
+        );
     let slope_w = 1.0 - smoothstep(TREE_FULL_SLOPE_DEG, TREE_MAX_SLOPE_DEG, slope);
     // Glades: a low-frequency mask removes whole patches.
     let glade = smoothstep(0.30, 0.46, fbm(seed ^ 12, x * 0.006, z * 0.006, 4));
@@ -441,7 +456,10 @@ pub fn scatter(terrain: &Terrain, config: &Config, seed: u64, count: usize) -> S
         .map(|(i, _)| i)
         .collect();
     if trees.is_empty() || count == 0 {
-        return Scatter { spots: Vec::new(), cell_m: 0.0 };
+        return Scatter {
+            spots: Vec::new(),
+            cell_m: 0.0,
+        };
     }
     let half = terrain.half() - 24.0;
     // Candidates on a jittered grid, fine enough that `count` heavy ones exist.
@@ -529,7 +547,8 @@ fn pick(
         // Age: most trees middle-aged, a few giants; smaller near the treeline.
         let age = rng.unit() * rng.unit().max(0.35);
         let (lo, hi) = def.forest_scale;
-        let size = (lo + (hi - lo) * (0.35 + 0.65 * age)) * (1.0 - 0.4 * smoothstep(0.42, 0.62, alt));
+        let size =
+            (lo + (hi - lo) * (0.35 + 0.65 * age)) * (1.0 - 0.4 * smoothstep(0.42, 0.62, alt));
         let squash = rng.range(0.94, 1.06);
         // Tint in stands (low-frequency noise picks the bucket), with some per-tree scatter.
         let stand = fbm(seed ^ 31, c.x * 0.01, c.z * 0.01, 2);
@@ -548,7 +567,10 @@ fn pick(
             tint,
         });
     }
-    Scatter { spots, cell_m: cell }
+    Scatter {
+        spots,
+        cell_m: cell,
+    }
 }
 
 // ── layout ──────────────────────────────────────────────────────────────────
@@ -634,7 +656,11 @@ mod tests {
             for i in 0..t.n - 1 {
                 let h = t.heights[j * t.n + i];
                 for other in [t.heights[j * t.n + i + 1], t.heights[(j + 1) * t.n + i]] {
-                    assert!((h - other).abs() <= limit, "step {} > {limit}", (h - other).abs());
+                    assert!(
+                        (h - other).abs() <= limit,
+                        "step {} > {limit}",
+                        (h - other).abs()
+                    );
                 }
             }
         }
@@ -656,7 +682,10 @@ mod tests {
                     .max(((c * c + dx * dx).sqrt() / c).max((c * c + dz * dz).sqrt() / c));
             }
         }
-        assert!(max_stretch <= worst * 1.1, "stretch {max_stretch} > {worst}");
+        assert!(
+            max_stretch <= worst * 1.1,
+            "stretch {max_stretch} > {worst}"
+        );
     }
 
     #[test]
@@ -687,7 +716,9 @@ mod tests {
         for tile in tiles(&t) {
             for tri in tile.mesh.indices.chunks(3) {
                 let p = |i: u32| glam::Vec3::from_array(tile.mesh.vertices[i as usize].position);
-                let n = (p(tri[1]) - p(tri[0])).cross(p(tri[2]) - p(tri[0])).normalize();
+                let n = (p(tri[1]) - p(tri[0]))
+                    .cross(p(tri[2]) - p(tri[0]))
+                    .normalize();
                 assert_eq!(n.y < rock_cos, tile.surface == 1);
             }
         }
@@ -706,7 +737,10 @@ mod tests {
         assert_eq!(a.spots.len(), 800);
         for (x, y) in a.spots.iter().zip(&b.spots) {
             assert_eq!(x.position, y.position);
-            assert_eq!((x.species, x.variant, x.tint), (y.species, y.variant, y.tint));
+            assert_eq!(
+                (x.species, x.variant, x.tint),
+                (y.species, y.variant, y.tint)
+            );
         }
         let treeline = t.min_height() + 0.66 * (t.max_height() - t.min_height());
         for s in &a.spots {
@@ -773,26 +807,55 @@ mod tests {
         let config = all_trees();
         let forest = build(&config);
         let t = &forest.terrain;
-        println!("terrain {:.1}..{:.1} m, {} trees", t.min_height(), t.max_height(), forest.spots.len());
+        println!(
+            "terrain {:.1}..{:.1} m, {} trees",
+            t.min_height(),
+            t.max_height(),
+            forest.spots.len()
+        );
         println!("valley centre {:?}", vantage(t));
         let mut by_height: Vec<&TreeSpot> = forest.spots.iter().collect();
         by_height.sort_by(|a, b| b.position[1].total_cmp(&a.position[1]));
         println!("highest tree {:?}", by_height[0].position);
         let mut per_species = std::collections::BTreeMap::new();
         for s in &forest.spots {
-            *per_species.entry(catalog::TREES[s.species].id).or_insert(0usize) += 1;
+            *per_species
+                .entry(catalog::TREES[s.species].id)
+                .or_insert(0usize) += 1;
         }
         println!("species {per_species:?}");
         // Densest 100 m cell.
         let mut grid = std::collections::HashMap::new();
         for s in &forest.spots {
-            *grid.entry(((s.position[0] / 100.0) as i32, (s.position[2] / 100.0) as i32)).or_insert(0usize) += 1;
+            *grid
+                .entry((
+                    (s.position[0] / 100.0) as i32,
+                    (s.position[2] / 100.0) as i32,
+                ))
+                .or_insert(0usize) += 1;
         }
         let best = grid.iter().max_by_key(|(_, n)| **n).unwrap();
-        let (cx, cz) = ((best.0 .0 as f32 + 0.5) * 100.0, (best.0 .1 as f32 + 0.5) * 100.0);
-        println!("densest cell centre ({cx}, {cz}) h {:.1} with {} trees", t.height_at(cx, cz), best.1);
-        for (x, z) in [(0.0f32, 0.0f32), (300.0, 300.0), (-500.0, 200.0), (700.0, -600.0), (-900.0, -900.0)] {
-            println!("height at ({x}, {z}) = {:.1}, slope {:.1}", t.height_at(x, z), t.slope_deg_at(x, z));
+        let (cx, cz) = (
+            (best.0 .0 as f32 + 0.5) * 100.0,
+            (best.0 .1 as f32 + 0.5) * 100.0,
+        );
+        println!(
+            "densest cell centre ({cx}, {cz}) h {:.1} with {} trees",
+            t.height_at(cx, cz),
+            best.1
+        );
+        for (x, z) in [
+            (0.0f32, 0.0f32),
+            (300.0, 300.0),
+            (-500.0, 200.0),
+            (700.0, -600.0),
+            (-900.0, -900.0),
+        ] {
+            println!(
+                "height at ({x}, {z}) = {:.1}, slope {:.1}",
+                t.height_at(x, z),
+                t.slope_deg_at(x, z)
+            );
         }
     }
 }

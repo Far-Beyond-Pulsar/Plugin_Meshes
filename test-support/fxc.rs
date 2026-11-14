@@ -11,7 +11,11 @@ use std::process::Command;
 
 pub fn find_fxc() -> Option<std::path::PathBuf> {
     let root = std::path::Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
-    let mut versions: Vec<_> = std::fs::read_dir(root).ok()?.flatten().map(|e| e.path()).collect();
+    let mut versions: Vec<_> = std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
     versions.sort();
     versions.reverse();
     for v in versions {
@@ -56,7 +60,11 @@ pub fn fxc_failures(fxc: &std::path::Path, name: &str, src: &str) -> Vec<String>
     let path = dir.join(format!("{name}.hlsl"));
     std::fs::write(&path, &hlsl).unwrap();
     let mut failures = Vec::new();
-    for ep in m.entry_points.iter().filter(|e| e.stage == naga::ShaderStage::Compute) {
+    for ep in m
+        .entry_points
+        .iter()
+        .filter(|e| e.stage == naga::ShaderStage::Compute)
+    {
         let out = Command::new(fxc)
             .args(["/nologo", "/T", "cs_5_1", "/E", &ep.name, "/Fo"])
             .arg(dir.join("out.bin"))
@@ -65,7 +73,11 @@ pub fn fxc_failures(fxc: &std::path::Path, name: &str, src: &str) -> Vec<String>
             .unwrap();
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
-            let errors: Vec<_> = err.lines().filter(|l| l.contains("error")).take(8).collect();
+            let errors: Vec<_> = err
+                .lines()
+                .filter(|l| l.contains("error"))
+                .take(8)
+                .collect();
             failures.push(format!("{name}::{}:\n{}", ep.name, errors.join("\n")));
         }
     }
