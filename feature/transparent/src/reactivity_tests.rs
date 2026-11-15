@@ -6,9 +6,8 @@ fn graph_routed_coverage_is_attached_and_cleared_without_draws() {
         let instance = wgpu::Instance::new(helio_core::wgpu_instance_descriptor().with_env());
         let adapter = instance.request_adapter(&Default::default()).await.unwrap();
         let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
-        let pass = TransparentPass::new(&device, wgpu::TextureFormat::Rgba16Float)
-            .with_pre_aa_target()
-            .with_reactive_mask();
+        let pass =
+            TransparentPass::new(&device, wgpu::TextureFormat::Rgba16Float).with_reactive_mask();
         for width in [32, 64] {
             let extent = wgpu::Extent3d {
                 width,
@@ -27,8 +26,12 @@ fn graph_routed_coverage_is_attached_and_cleared_without_draws() {
                     view_formats: &[],
                 })
             };
-            let color = texture(
+            let accumulation = texture(
                 wgpu::TextureFormat::Rgba16Float,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            );
+            let revealage = texture(
+                wgpu::TextureFormat::R16Float,
                 wgpu::TextureUsages::RENDER_ATTACHMENT,
             );
             let depth = texture(
@@ -41,7 +44,8 @@ fn graph_routed_coverage_is_attached_and_cleared_without_draws() {
                     | wgpu::TextureUsages::COPY_SRC
                     | wgpu::TextureUsages::COPY_DST,
             );
-            let color_view = color.create_view(&Default::default());
+            let accumulation_view = accumulation.create_view(&Default::default());
+            let revealage_view = revealage.create_view(&Default::default());
             let depth_view = depth.create_view(&Default::default());
             let coverage_view = coverage.create_view(&Default::default());
             queue.write_texture(
@@ -61,23 +65,20 @@ fn graph_routed_coverage_is_attached_and_cleared_without_draws() {
                 &coverage_view,
                 "test",
             );
-            resources.write_texture_view(
-                helio_core::ResourceKey::new(helio_frame_api::color::SCENE_COLOR),
-                &color_view,
-                "test",
-            );
+            resources.write_texture_binding(OIT_ACCUMULATION, &accumulation_view, "test");
+            resources.write_texture_binding(OIT_REVEALAGE, &revealage_view, "test");
             let mut storage = helio_core::RenderFrameStorage::new();
             let descriptor = pass
                 .render_pass_descriptor_with_storage(
-                    &color_view,
+                    &accumulation_view,
                     &depth_view,
                     &resources,
                     &mut storage,
                 )
                 .expect("graph-owned coverage must not suppress the transparent pass");
-            assert_eq!(descriptor.color_attachments.len(), 2);
+            assert_eq!(descriptor.color_attachments.len(), 3);
             assert_eq!(
-                descriptor.color_attachments[1].as_ref().unwrap().view,
+                descriptor.color_attachments[2].as_ref().unwrap().view,
                 &coverage_view
             );
             let read = device.create_buffer(&wgpu::BufferDescriptor {

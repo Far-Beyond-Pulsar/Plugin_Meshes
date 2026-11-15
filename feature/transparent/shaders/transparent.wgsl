@@ -2,8 +2,11 @@
 //!use pbr_eval
 //!use light_list
 //!use light_forward
+//!use specular_aa
 //!use material_row
+//!use material_surface
 //!use mesh_draw_rows
+enable wgpu_binding_array;
 
 // The meshes' transparent program: the vertex layout and instance rows,
 // shaded by the material's transparent template (`radiant_eval_transparent`,
@@ -62,6 +65,9 @@ struct Transform {
 @group(1) @binding(4) var<storage, read> transforms: array<Transform>;
 
 @group(1) @binding(5) var<storage, read> materials: array<GpuMaterial>;
+@group(1) @binding(6) var<storage, read> material_textures: array<MaterialTextureData>;
+@group(1) @binding(7) var scene_sampler: sampler;
+@group(1) @binding(8) var scene_textures: binding_array<texture_2d<f32>, 256>;
 
 struct Vertex {
     @location(0) position:       vec3<f32>,
@@ -76,7 +82,9 @@ struct VertexOutput {
     @location(0) world_position: vec3<f32>,
     @location(1) world_normal:   vec3<f32>,
     @location(2) tex_coords:     vec2<f32>,
-    @location(3) @interpolate(flat) material_id: u32,
+    @location(3) world_tangent: vec3<f32>,
+    @location(4) @interpolate(flat) bitangent_sign: f32,
+    @location(5) @interpolate(flat) material_id: u32,
 }
 
 fn decode_snorm8x4(packed: u32) -> vec3<f32> {
@@ -90,6 +98,7 @@ fn vs_main(vertex: Vertex, @location(15) slot: u32, @builtin(vertex_index) verte
     let inst      = instance_data[slot];
     var local_position = vertex.position;
     var local_normal = decode_snorm8x4(vertex.normal);
+    var local_tangent = decode_snorm8x4(vertex.tangent);
     if inst.bone_palette_count > 0u {
         let skin = skin_vertices[vertex_index + inst.skin_vertex_offset];
         var blended = mat4x4<f32>(vec4f(0.0), vec4f(0.0), vec4f(0.0), vec4f(0.0));
@@ -104,6 +113,7 @@ fn vs_main(vertex: Vertex, @location(15) slot: u32, @builtin(vertex_index) verte
             blended = blended * (1.0 / total);
             local_position = (blended * vec4f(vertex.position, 1.0)).xyz;
             local_normal = normalize(mat3x3<f32>(blended[0].xyz, blended[1].xyz, blended[2].xyz) * local_normal);
+            local_tangent = normalize(mat3x3<f32>(blended[0].xyz, blended[1].xyz, blended[2].xyz) * local_tangent);
         }
     }
     let world_pos = inst.transform * vec4<f32>(local_position, 1.0);
@@ -116,45 +126,59 @@ fn vs_main(vertex: Vertex, @location(15) slot: u32, @builtin(vertex_index) verte
     out.clip_position  = cameras[0].proj * (cameras[0].view * world_pos);
     out.world_position = world_pos.xyz;
     out.world_normal   = normalize(normal_mat * local_normal);
+    out.world_tangent  = normalize(normal_mat * local_tangent);
     out.tex_coords     = vertex.tex_coords;
+    out.bitangent_sign = vertex.bitangent_sign;
     out.material_id    = inst.material_id;
     return out;
 }
 
-// HELIO_TRANSPARENT_REACTIVITY: location 1 carries composited alpha coverage.
+// HELIO_TRANSPARENT_REACTIVITY: location 2 carries alpha coverage for TAA.
 struct TransparentOutput {
-    @location(0) color: vec4<f32>,
-    @location(1) reactivity: vec4<f32>,
+    @location(0) accumulation: vec4<f32>,
+    @location(1) revealage: f32,
+    @location(2) reactivity: vec4<f32>,
 }
 @fragment
 fn fs_main(input: VertexOutput) -> TransparentOutput {
     // RADIANT_OVERRIDE_TRANSPARENT
     // RADIANT_OVERRIDE_END
 
-    let material = materials[input.material_id];
+    let material = material_at(input.material_id);
+    let material_tex = material_texture_data(material, input.material_id);
     let V = normalize(cameras[0].position_near.xyz - input.world_position);
-    // The transparent drawer's vertices carry no tangent frame: the
-    // template sees the geometric normal and no tangent.
-    var surface = radiant_eval_transparent(material, MaterialInput(
+    let material_input = MaterialInput(
         input.clip_position, input.world_position, input.world_normal,
-        vec3<f32>(0.0), 1.0, input.tex_coords,
+        input.world_tangent, input.bitangent_sign, input.tex_coords,
         cameras[0].position_near.xyz, globals.frame,
-    ), globals.ambient_color.rgb * globals.ambient_intensity);
-
-    let normal = normalize(input.world_normal);
-    let N = select(-normal, normal, dot(normal, V) >= 0.0);
-    let albedo = material.base_color.rgb;
-    let roughness = clamp(material.roughness_metallic.x, 0.04, 1.0);
-    let metallic = clamp(material.roughness_metallic.y, 0.0, 1.0);
-    let F0 = mix(vec3<f32>(0.04), albedo, metallic);
-
-    // The lights of the pixel's tile (the lights' forward function).
-    let Lo = light_forward(
-        input.clip_position.xy, globals.num_tiles_x, input.world_position,
-        N, V, F0, albedo, roughness, metallic,
+    );
+    var surface = radiant_eval_transparent(
+        material, material_tex, material_input,
+        globals.ambient_color.rgb * globals.ambient_intensity,
     );
 
-    surface = vec4<f32>(surface.rgb + Lo, surface.a);
+    let pbr = default_pbr_surface(material, material_tex, material_input);
+    let N = select(-pbr.normal, pbr.normal, dot(pbr.normal, V) >= 0.0);
+
+    let Lo = light_forward(
+        input.clip_position.xy, globals.num_tiles_x, input.world_position,
+        N, V, pbr.specular_f0, pbr.albedo.rgb,
+        pbr.roughness, pbr.metallic,
+    );
+
+    surface = vec4<f32>(surface.rgb + Lo, clamp(surface.a * pbr.alpha, 0.0, 1.0));
     // HELIO_VIEW_SURFACE_EFFECT
-    return TransparentOutput(surface, vec4<f32>(clamp(surface.a, 0.0, 1.0)));
+    let alpha = clamp(surface.a, 0.0, 1.0);
+    if alpha <= 0.001 { discard; }
+    let depth = clamp(input.clip_position.z, 0.0, 1.0);
+    let weight = clamp(
+        (alpha * 8.0 + 0.01) * pow(max(0.01, 1.0 - depth * 0.9), 3.0),
+        0.01,
+        8.0,
+    );
+    return TransparentOutput(
+        vec4<f32>(surface.rgb * alpha * weight, alpha * weight),
+        alpha,
+        vec4<f32>(alpha),
+    );
 }
