@@ -4,6 +4,10 @@
 Pulsar-Native vendors this repository at `plugins/vendor/meshes`; it builds only
 inside a Pulsar-Native checkout (see `README.md`).
 
+`meshes_component` keeps mesh serialization, rendering and asset loading in its default
+runtime feature set. Its GPUI property editors and asset-picker widgets are enabled only
+through `meshes_plugin/editor`, so generated game targets do not link the editor framework.
+
 ## Required for every agent
 
 Before reading, designing, editing, reviewing or briefing any change here,

@@ -545,6 +545,7 @@ fn deserialize_mesh_asset_path_json(
 // ── MeshAssetPath property editor ─────────────────────────────────────────────
 
 /// Engine primitives that are always offered, even in an empty project.
+#[cfg(feature = "editor")]
 const BUILTIN_MESHES: &[&str] = &[
     "meshes/primitives/SM_Cube.fbx",
     "meshes/primitives/SM_Sphere.fbx",
@@ -557,6 +558,7 @@ const BUILTIN_MESHES: &[&str] = &[
 ///
 /// Owns its [`AssetPicker`](ui_common::asset_picker::AssetPicker) child
 /// entity and the subscription that turns a pick into a write-back.
+#[cfg(feature = "editor")]
 pub struct MeshAssetEditor {
     label: String,
     id_prefix: String,
@@ -567,6 +569,7 @@ pub struct MeshAssetEditor {
     _subs: Vec<gpui::Subscription>,
 }
 
+#[cfg(feature = "editor")]
 impl MeshAssetEditor {
     fn new(
         args: &pulsar_reflection::PropertyEditorArgs<'_>,
@@ -641,6 +644,7 @@ impl MeshAssetEditor {
     }
 }
 
+#[cfg(feature = "editor")]
 impl gpui::Render for MeshAssetEditor {
     fn render(
         &mut self,
@@ -696,6 +700,7 @@ impl gpui::Render for MeshAssetEditor {
     }
 }
 
+#[cfg(feature = "editor")]
 fn mesh_asset_editor(
     args: &pulsar_reflection::PropertyEditorArgs<'_>,
     window: &mut gpui::Window,
@@ -717,11 +722,15 @@ fn mesh_asset_editor(
 /// `structure = String` makes `type_info.is_string()` return `true`, so the
 /// type round-trips through the JSON codec as a plain string; the mesh-browser
 /// UI comes from the `editor` registration above.
-#[pulsar_reflection::pulsar_type(
+#[cfg_attr(feature = "editor", pulsar_reflection::pulsar_type(
     serialize_json_with = serialize_mesh_asset_path_json,
     deserialize_json_with = deserialize_mesh_asset_path_json,
     editor = mesh_asset_editor
-)]
+))]
+#[cfg_attr(not(feature = "editor"), pulsar_reflection::pulsar_type(
+    serialize_json_with = serialize_mesh_asset_path_json,
+    deserialize_json_with = deserialize_mesh_asset_path_json
+))]
 #[allow(dead_code)]
 type RegisteredMeshAssetPath = MeshAssetPath;
 
@@ -739,6 +748,7 @@ fn deserialize_material_slots_json(
         .map_err(|error| ReflectError::DeserializationFailed(error.to_string()))
 }
 
+#[cfg(feature = "editor")]
 struct MaterialSlotPickerRow {
     key: (Option<u32>, usize),
     name: String,
@@ -748,6 +758,7 @@ struct MaterialSlotPickerRow {
     picker: gpui::Entity<ui_common::asset_picker::AssetPicker>,
 }
 
+#[cfg(feature = "editor")]
 struct StaticMeshMaterialSlotsEditor {
     label: String,
     id_prefix: String,
@@ -758,6 +769,7 @@ struct StaticMeshMaterialSlotsEditor {
     subscriptions: Vec<gpui::Subscription>,
 }
 
+#[cfg(feature = "editor")]
 impl StaticMeshMaterialSlotsEditor {
     fn new(
         args: &pulsar_reflection::PropertyEditorArgs<'_>,
@@ -957,6 +969,7 @@ impl StaticMeshMaterialSlotsEditor {
     }
 }
 
+#[cfg(feature = "editor")]
 impl gpui::Render for StaticMeshMaterialSlotsEditor {
     fn render(
         &mut self,
@@ -1042,6 +1055,7 @@ impl gpui::Render for StaticMeshMaterialSlotsEditor {
     }
 }
 
+#[cfg(feature = "editor")]
 fn material_slots_editor(
     args: &pulsar_reflection::PropertyEditorArgs<'_>,
     window: &mut gpui::Window,
@@ -1058,11 +1072,15 @@ fn material_slots_editor(
     )
 }
 
-#[pulsar_reflection::pulsar_type(
+#[cfg_attr(feature = "editor", pulsar_reflection::pulsar_type(
     serialize_json_with = serialize_material_slots_json,
     deserialize_json_with = deserialize_material_slots_json,
     editor = material_slots_editor
-)]
+))]
+#[cfg_attr(not(feature = "editor"), pulsar_reflection::pulsar_type(
+    serialize_json_with = serialize_material_slots_json,
+    deserialize_json_with = deserialize_material_slots_json
+))]
 #[allow(dead_code)]
 type RegisteredStaticMeshMaterialSlots = StaticMeshMaterialSlots;
 

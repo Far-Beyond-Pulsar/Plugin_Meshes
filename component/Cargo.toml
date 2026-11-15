@@ -15,6 +15,8 @@ name = "meshes_component"
 # this crate needs its own feature of exactly this name. On by default.
 default = ["gpu"]
 gpu = []
+# Scene editing widgets are needed only when the editor links this component.
+editor = ["dep:gpui-ce", "dep:ui", "dep:ui_common", "pulsar_reflection/prims-gpui", "plugin_editor_api/editor"]
 
 [dependencies]
 # The game's slim feature set (as pulsar_game): linking the plugin must not
@@ -45,7 +47,7 @@ helio-vg-build = { workspace = true }
 # drives (the animation plugin's crate; see the plan doc's step 1 audit).
 skeletal_assets = { workspace = true }
 engine_class_derive = { workspace = true }
-pulsar_reflection = { workspace = true, features = ["prims-gpui"] }
+pulsar_reflection = { workspace = true }
 pulsar_scenedb = { workspace = true }
 pulsar_scenedb_derive = { workspace = true }
 pulsar_world_registry = { workspace = true }
@@ -68,9 +70,9 @@ glam = { workspace = true, features = ["serde"] }
 image = { workspace = true }
 thiserror = { workspace = true }
 wgpu = { workspace = true }
-gpui-ce = { workspace = true }
-ui = { workspace = true }
-ui_common = { workspace = true }
+gpui-ce = { workspace = true, optional = true }
+ui = { workspace = true, optional = true }
+ui_common = { workspace = true, optional = true }
 bytemuck = { workspace = true, features = ["derive"] }
 # Content-addressed asset identity (Pulsar-Native#632): xxh3-128 over decoded
 # mesh bytes for PMSH v1 backfill / non-native source paths, and as the
