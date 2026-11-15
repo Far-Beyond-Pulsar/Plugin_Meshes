@@ -75,7 +75,7 @@ impl DepthMaterialBindings {
             &mut entries,
             2,
             textures.texture_views,
-            textures.samplers,
+            textures.sampler,
         );
         self.group = Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Depth material bindings"),

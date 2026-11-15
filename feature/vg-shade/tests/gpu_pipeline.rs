@@ -465,7 +465,6 @@ fn resolve_bin_shade_and_final_depth() {
     let white_view = white.create_view(&Default::default());
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
     let views: Vec<&wgpu::TextureView> = (0..binding.max_textures).map(|_| &white_view).collect();
-    let samplers: Vec<&wgpu::Sampler> = (0..binding.max_textures).map(|_| &sampler).collect();
 
     // ── raster results, simulated on the CPU ──
     struct Expect {
@@ -593,7 +592,7 @@ fn resolve_bin_shade_and_final_depth() {
                 material_textures: helio_mats::MaterialTextureBindings {
                     material_textures: &material_textures,
                     texture_views: &views,
-                    samplers: &samplers,
+                    sampler: &sampler,
                     version: 1,
                 },
                 visible: &visible,

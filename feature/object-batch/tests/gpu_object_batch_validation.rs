@@ -793,6 +793,71 @@ fn readback_grows_past_initial_range_capacity_without_truncating() {
     });
 }
 
+/// A scene that stops changing after one batch run (a level once it has
+/// loaded) still gets its material keys read back when they outgrow the
+/// readback's staging: the truncated copy is taken again on the frames that
+/// follow, though the batch never runs again. Before, the tables stayed
+/// those of the last copy that fit (or none), so the draw segments missed
+/// the newest keys and every draw of them was skipped without a word.
+#[test]
+fn outgrown_readback_is_copied_again_when_the_batch_stops_running() {
+    pollster::block_on(async {
+        let instance = wgpu::Instance::new(helio_core::wgpu_instance_descriptor());
+        let Ok(adapter) = instance.request_adapter(&Default::default()).await else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(),
+                ..Default::default()
+            })
+            .await
+            .expect("adapter must create a device");
+        device.on_uncaptured_error(std::sync::Arc::new(|error| {
+            panic!("object batch GPU validation error: {error:?}");
+        }));
+
+        // More pipelines than the initial staging holds (64).
+        const PIPELINES: u32 = 200;
+        let materials: Vec<TestMaterial> = (0..PIPELINES).map(|_| TestMaterial::zeroed()).collect();
+        let rows: Vec<StaticObjectComponent> = (0..PIPELINES)
+            .map(|i| {
+                let mut row = make_row(&mut Rng(i as u64 + 1), 1, 1, &[(0, i as u64 + 1)]);
+                row.material_slot = i;
+                row
+            })
+            .collect();
+
+        use wgpu::util::DeviceExt;
+        let static_objects = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Test StaticObjects"),
+            contents: bytemuck::cast_slice(&rows),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let materials_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Test Materials"),
+            contents: bytemuck::cast_slice(&materials),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let mut pass = ObjectBatchPass::new(&device);
+        // One run, as a level's load ends with; then only idle frames.
+        pass.run_once_for_testing(&device, &queue, &static_objects, &materials_buf, PIPELINES);
+        pass.poll_readback_for_testing(&device, &queue);
+        for _ in 0..8 {
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            pass.poll_idle_readback_for_testing(&device, &queue);
+        }
+        assert_eq!(
+            pass.opaque_ranges().len() as u32,
+            PIPELINES,
+            "an idle scene never read back the ranges that outgrew the staging"
+        );
+        assert_eq!(pass.instance_count(), PIPELINES);
+    });
+}
+
 /// Motion vectors come from the previous frame's transform, not from the
 /// row's authored `prev_transform`: an object that stops moving must report
 /// zero motion on the next frame even though its authored `prev_transform`

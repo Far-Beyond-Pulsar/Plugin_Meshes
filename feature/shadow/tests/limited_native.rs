@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use glam::Vec3;
 use helio::{required_wgpu_limits, Camera, RendererBuilder, RendererConfig};
-use helio_mats::{
-    MaterialBindingConfig, MaterialBindingMode, BINDLESS_MATERIAL_FEATURES, MAX_MATERIAL_TEXTURES,
-};
+use helio_mats::{MaterialBindingConfig, MaterialBindingMode, BINDLESS_MATERIAL_FEATURES};
 
 const PORTABLE_SAMPLED_TEXTURE_LIMIT: u32 = 16;
 
@@ -57,9 +55,22 @@ fn default_graph_retains_the_bindless_material_tier_when_supported() {
             return;
         }
         let limits = required_wgpu_limits(adapter.limits());
-        let expected_max = MAX_MATERIAL_TEXTURES
-            .min(limits.max_sampled_textures_per_shader_stage as usize)
-            .min(limits.max_samplers_per_shader_stage as usize);
+        let expected_max =
+            MaterialBindingConfig::from_capabilities(required_features, limits.clone())
+                .max_textures;
+        // The table is read through one sampler, so only the binding-array
+        // element limit bounds it, never the sampler heap (D3D12's 2048).
+        eprintln!(
+            "bindless material table on {:?}: {expected_max} textures (binding-array elements {}, samplers {})",
+            adapter.get_info().backend,
+            limits.max_binding_array_elements_per_shader_stage,
+            limits.max_binding_array_sampler_elements_per_shader_stage,
+        );
+        if limits.max_binding_array_elements_per_shader_stage as usize
+            >= helio_core::TEXTURE_TABLE_LIMIT
+        {
+            assert_eq!(expected_max, helio_core::TEXTURE_TABLE_LIMIT);
+        }
         run_default_graph(
             adapter,
             required_features,
@@ -81,9 +92,8 @@ fn budgeted_shadows_render_hundreds_of_requests_across_frames() {
             .expect("GPU required for shadow integration");
         let features = wgpu::Features::INDIRECT_FIRST_INSTANCE | BINDLESS_MATERIAL_FEATURES;
         let limits = required_wgpu_limits(adapter.limits());
-        let expected = MAX_MATERIAL_TEXTURES
-            .min(limits.max_sampled_textures_per_shader_stage as usize)
-            .min(limits.max_samplers_per_shader_stage as usize);
+        let expected =
+            MaterialBindingConfig::from_capabilities(features, limits.clone()).max_textures;
         run_default_graph(
             adapter,
             features,

@@ -30,11 +30,19 @@
 //! `aabbs` (the only per-object-sized buffers) never touch the CPU.
 //!
 //! The staging copies are sized to the number of ranges actually observed
-//! (one per distinct `(material_class, graph_hash)` pipeline), not to the
-//! object capacity, so the per-frame copy and map cost does not grow with
-//! scene size. A harvested generation whose range count exceeds its staging
-//! capacity is discarded (the previous tables stay current) and the staging
-//! grows before the next copy; a truncated table is never published.
+//! (at least one per distinct `(material_class, graph_hash)` pipeline; the
+//! sort can split a key into several ranges), not to the object capacity, so
+//! the per-frame copy and map cost does not grow with scene size. A harvested
+//! generation whose range count exceeds its staging capacity is discarded
+//! (the previous tables stay current), the staging grows, and the copy is
+//! *owed*: taken again on the next call whether or not the batch runs again.
+//! A copy lost any other way (a failed map, staging rebuilt under a map in
+//! flight) is owed the same way. A truncated table is never published, and a
+//! copy older than the published one never replaces it.
+//!
+//! The draw segments are built from these tables, and the GPU skips the
+//! draws of a key that has no segment, so tables that stop catching up hide
+//! materials. That is logged as an error ([`STALE_TABLES_ERROR_CALLS`]).
 //!
 //! # Ordering (why this is correct, not racy)
 //!
@@ -79,6 +87,8 @@ struct Generation {
 }
 
 struct PendingMaps {
+    /// Which copy this is ([`RangeReadback::copies`] when it was taken).
+    copy: u64,
     counts_slot: MapSlot,
     opaque_slot: MapSlot,
     transparent_slot: MapSlot,
@@ -129,12 +139,34 @@ const GENERATIONS: usize = 2;
 /// Initial per-table staging size in ranges. Real scenes have a few distinct
 /// pipelines; staging grows to the next power of two when exceeded.
 const MIN_RANGE_CAPACITY: u32 = 64;
+/// Calls (frames) the published tables may trail a newer copy before that is
+/// reported as an error. The CPU's view normally trails by two or three
+/// frames; while it trails, draws of a material key it has not seen yet are
+/// skipped (`helio_mesh_api::DrawSegments`), so a readback that stops
+/// catching up would make materials vanish without a word.
+const STALE_TABLES_ERROR_CALLS: u64 = 120;
 
 pub struct RangeReadback {
     gens: Vec<Generation>,
     next: usize,
     /// Ranges per table each staging generation can hold.
     range_capacity: u32,
+    /// Copies taken so far; each pending generation knows which it holds.
+    copies: u64,
+    /// The copy the published tables came from: an older copy resolving
+    /// later never replaces them.
+    published: u64,
+    /// A copy was dropped before it was published (its tables did not fit
+    /// the staging, its map failed, or its staging was rebuilt), so the
+    /// published tables may be older than what the GPU holds. The next call
+    /// copies again even when the batch did not run: its tables are still
+    /// in the scratch buffers, and nothing else would ever copy them.
+    owed: bool,
+    /// Calls so far, and the call that last published tables.
+    calls: u64,
+    last_publish: u64,
+    /// Whether the current stretch of stale tables was reported.
+    stale_reported: bool,
 
     opaque: Vec<RangeTuple>,
     transparent: Vec<RangeTuple>,
@@ -158,6 +190,12 @@ impl RangeReadback {
             gens: Vec::new(),
             next: 0,
             range_capacity: MIN_RANGE_CAPACITY,
+            copies: 0,
+            published: 0,
+            owed: false,
+            calls: 0,
+            last_publish: 0,
+            stale_reported: false,
             opaque: Vec::new(),
             transparent: Vec::new(),
             forward: Vec::new(),
@@ -207,77 +245,74 @@ impl RangeReadback {
         kick_off_copy: bool,
         poll_device: bool,
     ) -> bool {
+        self.calls += 1;
         // A shared device is maintained by every `Queue::submit` (see
         // `PrepareContext::owns_device`), which delivers the map callbacks.
         if poll_device {
             device.poll(wgpu::PollType::Poll).ok();
         }
 
-        if self.gens.len() < GENERATIONS
-            || self
-                .gens
-                .iter()
-                .any(|gen| gen.range_capacity() != self.range_capacity)
-        {
-            // (Re)build generations sized to the current range capacity.
-            // Any maps in flight against the old (about to be dropped)
-            // buffers simply never get read -- harmless: the public arrays
-            // just keep whatever they last held until a new generation's
-            // map resolves.
-            self.gens = (0..GENERATIONS)
-                .map(|_| Generation::new(device, self.range_capacity))
-                .collect();
-            self.next = 0;
-        }
-
-        // 1. Advance every generation's pending maps; harvest the first one
-        // that's fully resolved this call.
-        for gen in self.gens.iter_mut() {
+        // 1. Advance every generation's pending maps and harvest the ones
+        // fully resolved, oldest copy first.
+        let mut order: Vec<usize> = (0..self.gens.len()).collect();
+        order.sort_by_key(|&index| self.gens[index].pending.as_ref().map_or(0, |p| p.copy));
+        for index in order {
+            let gen = &mut self.gens[index];
             let Some(pending) = gen.pending.as_mut() else {
                 continue;
             };
-            if !pending.counts_ready {
-                if let Some(r) = try_recv(&pending.counts_slot) {
-                    pending.counts_ready = r.is_ok();
-                    if r.is_err() {
-                        gen.pending = None;
-                        continue;
+            let mut failed = false;
+            for (ready, slot) in [
+                (&mut pending.counts_ready, &pending.counts_slot),
+                (&mut pending.opaque_ready, &pending.opaque_slot),
+                (&mut pending.transparent_ready, &pending.transparent_slot),
+                (&mut pending.forward_ready, &pending.forward_slot),
+            ] {
+                if !*ready {
+                    match try_recv(slot) {
+                        Some(Ok(())) => *ready = true,
+                        Some(Err(error)) => {
+                            log::warn!(
+                                "object batch: mapping the material range readback failed \
+                                 ({error}); copying the tables again"
+                            );
+                            failed = true;
+                        }
+                        None => {}
                     }
                 }
             }
-            let Some(pending) = gen.pending.as_mut() else {
+            if failed {
+                // Some of its buffers may be mapped and some not: a fresh
+                // generation instead of unmapping piecemeal.
+                *gen = Generation::new(device, self.range_capacity);
+                self.owed = true;
                 continue;
-            };
-            if !pending.opaque_ready {
-                if let Some(r) = try_recv(&pending.opaque_slot) {
-                    pending.opaque_ready = r.is_ok();
-                }
             }
-            if !pending.transparent_ready {
-                if let Some(r) = try_recv(&pending.transparent_slot) {
-                    pending.transparent_ready = r.is_ok();
-                }
+            if !pending.all_ready() {
+                continue;
             }
-            if !pending.forward_ready {
-                if let Some(r) = try_recv(&pending.forward_slot) {
-                    pending.forward_ready = r.is_ok();
-                }
-            }
-            if pending.all_ready() {
-                let needed = required_range_capacity(gen);
-                if needed > gen.range_capacity() {
-                    // Truncated tables: keep the previous ones and grow the
-                    // staging before the next copy.
-                    self.range_capacity = self
-                        .range_capacity
-                        .max(needed.checked_next_power_of_two().unwrap_or(needed));
-                    gen.counts_staging.unmap();
-                    gen.opaque_staging.unmap();
-                    gen.transparent_staging.unmap();
-                    gen.forward_staging.unmap();
-                    gen.pending = None;
-                    continue;
-                }
+            let copy = pending.copy;
+            let needed = required_range_capacity(gen);
+            if std::env::var("PROBE_SEGMENTS").is_ok() { eprintln!("PROBE harvest copy={copy} needed={needed} cap={} published={}", gen.range_capacity(), self.published); }
+            if needed > gen.range_capacity() {
+                // Truncated tables: keep the previous ones, grow the staging
+                // and copy again, whether or not the batch runs again (a
+                // scene that stopped changing would otherwise keep tables
+                // that lack its newest material keys, and their draws).
+                self.range_capacity = self
+                    .range_capacity
+                    .max(needed.checked_next_power_of_two().unwrap_or(needed));
+                log::debug!(
+                    "object batch: {needed} material ranges outgrew the readback's \
+                     {} slots; growing to {} and copying again",
+                    gen.range_capacity(),
+                    self.range_capacity
+                );
+                self.owed = true;
+            } else if copy > self.published {
+                self.published = copy;
+                self.last_publish = self.calls;
                 let prev_shadow_membership = self.shadow_membership_fingerprint;
                 read_generation_into(
                     gen,
@@ -294,28 +329,56 @@ impl RangeReadback {
                 if self.shadow_membership_fingerprint != prev_shadow_membership {
                     self.shadow_static_generation = self.shadow_static_generation.wrapping_add(1);
                 }
-                gen.counts_staging.unmap();
-                gen.opaque_staging.unmap();
-                gen.transparent_staging.unmap();
-                gen.forward_staging.unmap();
-                gen.pending = None;
             }
+            gen.counts_staging.unmap();
+            gen.opaque_staging.unmap();
+            gen.transparent_staging.unmap();
+            gen.forward_staging.unmap();
+            gen.pending = None;
         }
 
-        // 2. Queue a fresh copy+map into the next round-robin slot, unless
-        // it's still waiting on its own previous map (the GPU/CPU would
-        // have to be more than `GENERATIONS` frames behind -- this frame
-        // just skips kicking off a new copy rather than stomping on a
-        // buffer still being read).
-        if !kick_off_copy {
+        let _ = self.report_stale_tables();
+
+        // (Re)build the generations at the current range capacity after
+        // harvesting, so a copy taken below already fits what the last
+        // harvest found. Maps in flight against the old buffers are never
+        // read, so a copy they held is owed again.
+        if self.gens.len() < GENERATIONS
+            || self
+                .gens
+                .iter()
+                .any(|gen| gen.range_capacity() != self.range_capacity)
+        {
+            self.owed |= self.gens.iter().any(|gen| gen.pending.is_some());
+            self.gens = (0..GENERATIONS)
+                .map(|_| Generation::new(device, self.range_capacity))
+                .collect();
+            self.next = 0;
+        }
+
+        // 2. Queue a fresh copy+map into the next free generation, when the
+        // batch produced new tables or a copy is owed. With every generation
+        // still waiting on its map (the GPU/CPU would have to be more than
+        // `GENERATIONS` frames behind) this frame takes no copy rather than
+        // stomping on a buffer still being read; the request stands for the
+        // next call.
+        if !kick_off_copy && !self.owed {
             return false;
         }
 
-        let slot = self.next;
-        self.next = (self.next + 1) % self.gens.len().max(1);
-        if self.gens[slot].pending.is_some() {
+        let count = self.gens.len();
+        let Some(slot) = (0..count)
+            .map(|offset| (self.next + offset) % count)
+            .find(|&index| self.gens[index].pending.is_none())
+        else {
+            self.owed = true;
             return false;
-        }
+        };
+        self.next = (slot + 1) % count;
+        self.owed = false;
+        self.copies += 1;
+        let copy = self.copies;
+        if std::env::var("PROBE_SEGMENTS").is_ok() { eprintln!("PROBE kick copy={copy} requested={kick_off_copy} cap={}", self.range_capacity); }
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("ObjBatch Readback Copy"),
@@ -394,6 +457,7 @@ impl RangeReadback {
         }
 
         gen.pending = Some(PendingMaps {
+            copy,
             counts_slot,
             opaque_slot,
             transparent_slot,
@@ -404,6 +468,79 @@ impl RangeReadback {
             forward_ready: false,
         });
         true
+    }
+}
+
+impl RangeReadback {
+    /// Reports, once per stretch, tables that trail a newer copy (or an
+    /// owed one) for [`STALE_TABLES_ERROR_CALLS`] calls. Returns whether
+    /// it reported this call.
+    fn report_stale_tables(&mut self) -> bool {
+        let stale = self.owed || self.copies > self.published;
+        if !stale {
+            self.last_publish = self.calls;
+            self.stale_reported = false;
+            return false;
+        }
+        let behind = self.calls - self.last_publish;
+        if behind <= STALE_TABLES_ERROR_CALLS || self.stale_reported {
+            return false;
+        }
+        self.stale_reported = true;
+        log::error!(
+            "object batch: the material range readback has not caught up for {behind} \
+             frames (copy {} of {}, copy owed: {}); draws of material keys added since \
+             are skipped until it does",
+            self.published,
+            self.copies,
+            self.owed
+        );
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tables_that_stop_catching_up_are_reported_once() {
+        let mut readback = RangeReadback::new();
+        // A copy taken and never published, call after call.
+        readback.copies = 1;
+        let mut reports = 0;
+        for _ in 0..3 * STALE_TABLES_ERROR_CALLS {
+            readback.calls += 1;
+            reports += usize::from(readback.report_stale_tables());
+        }
+        assert_eq!(reports, 1, "a stretch of stale tables is reported once");
+
+        // Published: caught up, nothing to report; the next stretch reports again.
+        readback.published = 1;
+        readback.calls += 1;
+        assert!(!readback.report_stale_tables());
+        readback.owed = true;
+        let mut reports = 0;
+        for _ in 0..2 * STALE_TABLES_ERROR_CALLS {
+            readback.calls += 1;
+            reports += usize::from(readback.report_stale_tables());
+        }
+        assert_eq!(reports, 1);
+    }
+
+    #[test]
+    fn the_usual_readback_latency_is_not_reported() {
+        let mut readback = RangeReadback::new();
+        // A batch running every frame: each copy published three calls later.
+        for call in 1..=10 * STALE_TABLES_ERROR_CALLS {
+            readback.calls = call;
+            readback.copies = call;
+            if call > 3 {
+                readback.published = call - 3;
+                readback.last_publish = call;
+            }
+            assert!(!readback.report_stale_tables());
+        }
     }
 }
 

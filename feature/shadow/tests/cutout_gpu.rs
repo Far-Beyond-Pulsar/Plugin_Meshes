@@ -115,24 +115,9 @@ fn leaf_opacity_casts_identical_cutout_shadows_from_both_sides() {
         );
         let view = texture.create_view(&Default::default());
         let sampler = device.create_sampler(&Default::default());
-        // Baseline binding layout reserves five sampled slots; this test's
-        // default device has sixteen sampled slots, leaving eleven materials.
-        let count = (device.limits().max_sampled_textures_per_shader_stage as usize)
-            .saturating_sub(5)
-            .min(device.limits().max_samplers_per_shader_stage as usize)
-            .min((device.limits().max_bindings_per_bind_group as usize).saturating_sub(2) / 2)
-            .min(
-                if cfg!(any(
-                    target_arch = "wasm32",
-                    target_os = "macos",
-                    target_os = "ios",
-                    target_os = "android"
-                )) {
-                    16
-                } else {
-                    256
-                },
-            );
+        // The device's material table, as the depth-material bindings size it.
+        let binding = helio_mats::MaterialBindingConfig::for_device(&device);
+        let views = vec![&view; binding.max_textures];
         let mut entries = vec![
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -143,18 +128,7 @@ fn leaf_opacity_casts_identical_cutout_shadows_from_both_sides() {
                 resource: metadata_buffer.as_entire_binding(),
             },
         ];
-        for i in 0..count {
-            entries.push(wgpu::BindGroupEntry {
-                binding: 2 + i as u32,
-                resource: wgpu::BindingResource::TextureView(&view),
-            });
-        }
-        for i in 0..count {
-            entries.push(wgpu::BindGroupEntry {
-                binding: 2 + count as u32 + i as u32,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            });
-        }
+        binding.append_bind_group_entries(&mut entries, 2, &views, &sampler);
         let group1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &bindings.layout,

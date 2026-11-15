@@ -1502,6 +1502,13 @@ impl ObjectBatchPass {
         self.readback
             .poll_and_kick_off(device, queue, &self.scratch, true, true);
     }
+
+    /// The readback step of a frame on which the batch did not run (nothing
+    /// it reads changed): it copies only what an earlier copy still owes.
+    pub fn poll_idle_readback_for_testing(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.readback
+            .poll_and_kick_off(device, queue, &self.scratch, false, true);
+    }
 }
 
 impl RenderPass for ObjectBatchPass {

@@ -44,8 +44,8 @@ struct SkinVertex { joints: vec4<u32>, weights: vec4<f32> }
 
 @group(1) @binding(0) var<storage, read>    materials:         array<GpuMaterial>;
 @group(1) @binding(1) var<storage, read>    material_textures: array<MaterialTextureData>;
-@group(1) @binding(2) var                   scene_textures:    binding_array<texture_2d<f32>, 256>;
-@group(1) @binding(3) var                   scene_samplers:    binding_array<sampler, 256>;
+@group(1) @binding(2) var                   scene_sampler:     sampler;
+@group(1) @binding(3) var                   scene_textures:    binding_array<texture_2d<f32>, 256>;
 
 struct Vertex {
     @location(0) position:       vec3<f32>,

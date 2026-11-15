@@ -257,16 +257,12 @@ fn run(s: &Setup, double_sided: bool, flip_front: bool, with_tables: bool) -> Ve
             }
         })
         .collect();
-    let samplers: Vec<wgpu::Sampler> = (0..binding.max_textures)
-        .map(|_| {
-            device.create_sampler(&wgpu::SamplerDescriptor {
-                mag_filter: wgpu::FilterMode::Nearest,
-                min_filter: wgpu::FilterMode::Nearest,
-                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-                ..Default::default()
-            })
-        })
-        .collect();
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
     let mut material = [0u32; 24];
     for w in material.iter_mut().take(4) {
         *w = 1.0f32.to_bits();
@@ -289,7 +285,6 @@ fn run(s: &Setup, double_sided: bool, flip_front: bool, with_tables: bool) -> Ve
     let material_textures = buf(device, "material textures", cast_slice(&tex_data));
     queue.write_buffer(&material_textures, 0, cast_slice(&tex_data));
     let view_refs: Vec<&wgpu::TextureView> = views.iter().collect();
-    let sampler_refs: Vec<&wgpu::Sampler> = samplers.iter().collect();
 
     let cfg = DenseConfig::default();
     let mut pass = DenseNonRtPass::new(device, cfg).expect("pass");
@@ -299,7 +294,7 @@ fn run(s: &Setup, double_sided: bool, flip_front: bool, with_tables: bool) -> Ve
             MaterialTextureBindings {
                 material_textures: &material_textures,
                 texture_views: &view_refs,
-                samplers: &sampler_refs,
+                sampler: &sampler,
                 version: 0,
             },
         )));

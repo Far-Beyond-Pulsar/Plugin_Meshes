@@ -177,17 +177,15 @@ pub mod shader_source {
             .replace("dpdy(n)", "vg_dn_dy");
         if bindless {
             return src.replace(
-                "textureSample(scene_textures[slot.texture_index], scene_samplers[slot.texture_index], uv)",
-                &format!(
-                    "textureSampleGrad(scene_textures[slot.texture_index], scene_samplers[slot.texture_index], {GRAD})"
-                ),
+                "textureSample(scene_textures[slot.texture_index], scene_sampler, uv)",
+                &format!("textureSampleGrad(scene_textures[slot.texture_index], scene_sampler, {GRAD})"),
             );
         }
         let mut out = src.to_string();
         for i in 0..max_textures {
             out = out.replace(
-                &format!("textureSampleLevel(scene_texture_{i}, scene_sampler_{i}, uv, 0.0)"),
-                &format!("textureSampleGrad(scene_texture_{i}, scene_sampler_{i}, {GRAD})"),
+                &format!("textureSampleLevel(scene_texture_{i}, scene_sampler, uv, 0.0)"),
+                &format!("textureSampleGrad(scene_texture_{i}, scene_sampler, {GRAD})"),
             );
         }
         out
@@ -1150,7 +1148,7 @@ impl VgShade {
             &mut material_entries,
             2,
             mt.texture_views,
-            mt.samplers,
+            mt.sampler,
         );
         let shade1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("VgShade shade 1"),
@@ -1392,6 +1390,9 @@ mod tests {
             },
             max_samplers_per_shader_stage: 256,
             max_bindings_per_bind_group: 1000,
+            // A binding-array table of `max_textures` textures (read
+            // through one sampler, which no binding-array limit counts).
+            max_binding_array_elements_per_shader_stage: max_textures as u32,
             ..wgpu::Limits::default()
         };
         let config = helio_mats::MaterialBindingConfig::from_capabilities(features, limits);

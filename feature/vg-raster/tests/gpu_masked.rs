@@ -174,7 +174,7 @@ struct Alpha {
     materials: wgpu::Buffer,
     material_textures: wgpu::Buffer,
     views: Vec<wgpu::TextureView>,
-    samplers: Vec<wgpu::Sampler>,
+    sampler: wgpu::Sampler,
 }
 
 fn alpha_resources(g: &Gpu, double_sided: bool) -> Alpha {
@@ -239,17 +239,6 @@ fn alpha_resources(g: &Gpu, double_sided: bool) -> Alpha {
         mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         ..Default::default()
     });
-    let samplers: Vec<wgpu::Sampler> = (0..binding.max_textures)
-        .map(|_| {
-            g.device.create_sampler(&wgpu::SamplerDescriptor {
-                mag_filter: wgpu::FilterMode::Nearest,
-                min_filter: wgpu::FilterMode::Nearest,
-                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-                ..Default::default()
-            })
-        })
-        .collect();
-    drop(nearest);
 
     // GpuMaterial row (24 words): base color white, tex_base_color = 0, flags.
     let mut material = [0u32; 24];
@@ -276,7 +265,7 @@ fn alpha_resources(g: &Gpu, double_sided: bool) -> Alpha {
         materials: buffer_init(g, "materials", &material, st),
         material_textures: buffer_init(g, "material textures", &tex_data, st),
         views,
-        samplers,
+        sampler: nearest,
     }
 }
 
@@ -375,7 +364,6 @@ fn run(g: &Gpu, s: &Scene, alpha: &Alpha, software: bool) -> Run {
     let sw_meta_buf = buffer_init(g, "sw meta", &sw_meta, st);
     let sw_dispatch_buf = buffer_init(g, "sw dispatch", &sw_dispatch, wgpu::BufferUsages::INDIRECT);
     let view_refs: Vec<&wgpu::TextureView> = alpha.views.iter().collect();
-    let sampler_refs: Vec<&wgpu::Sampler> = alpha.samplers.iter().collect();
 
     let inputs = VgRasterInputs {
         camera: &camera,
@@ -396,7 +384,7 @@ fn run(g: &Gpu, s: &Scene, alpha: &Alpha, software: bool) -> Run {
             material_textures: MaterialTextureBindings {
                 material_textures: &alpha.material_textures,
                 texture_views: &view_refs,
-                samplers: &sampler_refs,
+                sampler: &alpha.sampler,
                 version: 0,
             },
             hw_indirect_offset: 64,

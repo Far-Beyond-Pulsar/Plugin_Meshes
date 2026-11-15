@@ -944,7 +944,7 @@ impl RenderPass for GBufferPass {
                 &mut entries,
                 2,
                 material_textures.texture_views,
-                material_textures.samplers,
+                material_textures.sampler,
             );
             self.bind_group_1 = Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("GBuffer BG 1"),

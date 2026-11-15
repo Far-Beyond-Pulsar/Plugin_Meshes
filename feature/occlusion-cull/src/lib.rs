@@ -236,6 +236,20 @@ impl SegmentTable {
             return;
         }
         self.generation += 1;
+        if std::env::var("PROBE_SEGMENTS").is_ok() {
+            eprintln!(
+                "PROBE segments gen={} ranges o/t/f={}/{}/{} segs={:?}",
+                self.generation,
+                batch.opaque_ranges.len(),
+                batch.transparent_ranges.len(),
+                batch.forward_ranges.len(),
+                self.keys
+                    .segments
+                    .iter()
+                    .map(|s| (s.material_class, s.graph_hash, s.bucket as u32, s.first, s.capacity))
+                    .collect::<Vec<_>>()
+            );
+        }
 
         let records = self.keys.records();
         if records > self.record_capacity {

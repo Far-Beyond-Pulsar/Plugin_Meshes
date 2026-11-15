@@ -85,7 +85,7 @@ struct MaskedState {
     materials: wgpu::Buffer,
     material_textures: wgpu::Buffer,
     views: Vec<wgpu::TextureView>,
-    samplers: Vec<wgpu::Sampler>,
+    sampler: wgpu::Sampler,
 }
 
 impl DenseNonRtPass {
@@ -187,7 +187,7 @@ impl DenseNonRtPass {
             materials: m.clone(),
             material_textures: t.material_textures.clone(),
             views: t.texture_views.iter().map(|v| (*v).clone()).collect(),
-            samplers: t.samplers.iter().map(|s| (*s).clone()).collect(),
+            sampler: t.sampler.clone(),
         });
     }
 
@@ -530,7 +530,6 @@ impl DenseNonRtPass {
             // Alpha-masked clusters: same tiles, merged by depth into `dense_key`.
             if let (Some(ms), Some(mp)) = (&self.masked, self.masked_pipeline(device)) {
                 let view_refs: Vec<&wgpu::TextureView> = ms.views.iter().collect();
-                let sampler_refs: Vec<&wgpu::Sampler> = ms.samplers.iter().collect();
                 let alpha_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("vg_dense masked alpha"),
                     layout: &mp.bgl1,
@@ -541,7 +540,7 @@ impl DenseNonRtPass {
                         helio_mats::MaterialTextureBindings {
                             material_textures: &ms.material_textures,
                             texture_views: &view_refs,
-                            samplers: &sampler_refs,
+                            sampler: &ms.sampler,
                             version: 0,
                         },
                     ),
