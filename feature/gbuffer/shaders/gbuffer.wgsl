@@ -51,6 +51,10 @@ struct SkinVertex {
 // surface payload (`helio_frame_api::gbuffer::payload`): the drawer then
 // writes each lightmapped object's atlas UV there.
 override LIGHTMAP_PAYLOAD: bool = false;
+// Whether the view the pipeline draws has a clip plane
+// (`helio_frame_api::view::CLIP_CONSTANT`): only then does the fragment
+// stage test it, so the primary view keeps early depth.
+override HELIO_VIEW_CLIP: bool = false;
 
 @group(0) @binding(0) var<storage, read> cameras: array<Camera, 2>;
 @group(0) @binding(1) var<uniform>          globals:                Globals;
@@ -219,8 +223,11 @@ fn vs_main(v: Vertex, @location(15) slot: u32, @builtin(vertex_index) vertex_ind
     // mesh baked with UV1 has a region; every other object reads a zero
     // region and keeps the plain tag. The region's half-texel clamp keeps
     // bilinear filtering inside it.
-    out.lightmap_uv = GBUFFER_TAG_PLAIN;
-    if LIGHTMAP_PAYLOAD && inst.object_row < arrayLength(&lightmap_regions) {
+    // A secondary view's surfaces carry their view in the tag (the payload is
+    // the frame's own view's).
+    out.lightmap_uv = gbuffer_view_tag(cameras[0], GBUFFER_TAG_PLAIN);
+    if LIGHTMAP_PAYLOAD && cameras[0].view_info.x == 0u
+        && inst.object_row < arrayLength(&lightmap_regions) {
         let atlas = lightmap_atlas_uv(lightmap_regions[inst.object_row], v.lightmap_uv);
         if atlas.x >= 0.0 {
             out.lightmap_uv = atlas;
@@ -261,6 +268,7 @@ fn compute_velocity(input: VertexOutput) -> vec4<f32> {
 @fragment
 fn fs_main(vertex: VertexOutput, @builtin(front_facing) front: bool) -> GBufferOutput {
     var input = vertex;
+    if HELIO_VIEW_CLIP && helio_view_clipped(cameras[0], input.world_position) { discard; }
     let material = material_at(input.material_id);
     let material_tex = material_texture_data(material,input.material_id);
     // Reject empty card pixels before normal/ORM/extension texture reads,
@@ -337,7 +345,7 @@ fn fs_main(vertex: VertexOutput, @builtin(front_facing) front: bool) -> GBufferO
 
     var out: GBufferOutput;
     out.albedo = vec4<f32>(surface.albedo.rgb, surface.alpha);
-    out.normal = vec4<f32>(surface.normal, surface.specular_f0.r);
+    out.normal = vec4<f32>(helio_view_normal(cameras[0], surface.normal), surface.specular_f0.r);
     out.orm = vec4<f32>(surface.ao, surface.roughness, surface.metallic, surface.specular_f0.g);
     out.emissive = vec4<f32>(surface.emissive, surface.specular_f0.b);
     out.surface = input.lightmap_uv;

@@ -1,9 +1,9 @@
 //! Pipelines, targets and the per-frame encode of the virtual-geometry raster.
 
 use crate::abi::{self, ClassifyParams, VgRasterParams, TILE_SIZE};
-use helio_pass_vg_cull::VgTileEstimate;
 use crate::shaders;
 use helio_core::CommandRecorder;
+use helio_pass_vg_cull::VgTileEstimate;
 use wgpu::util::DeviceExt;
 
 /// Format of the visibility target: `vis_pack(visible_cluster, tri)` per pixel.
@@ -48,6 +48,10 @@ pub struct VgRasterConfig {
     pub dense_max_tiles: u32,
     /// Use the tiled fallback even when 64-bit atomics are available.
     pub force_tile_fallback: bool,
+    /// The view the raster draws has a clip plane (`helio_core::view`): the
+    /// hardware raster tests it per pixel (the cull sends every cluster
+    /// crossing it there).
+    pub clip: bool,
 }
 
 /// Calibration override (measurement runs only): a `u32` from the environment.
@@ -67,6 +71,7 @@ impl Default for VgRasterConfig {
             dense_latch_frames: env_u32("HELIO_VG_DENSE_LATCH").unwrap_or(8),
             dense_max_tiles: env_u32("HELIO_VG_DENSE_MAX_TILES").unwrap_or(512),
             force_tile_fallback: false,
+            clip: false,
         }
     }
 }
@@ -402,7 +407,9 @@ impl VgRaster {
     /// with [`optional_features`] and `config.force_tile_fallback` is false.
     pub fn new(device: &wgpu::Device, config: VgRasterConfig) -> Self {
         let int64 = supports_int64_atomics(device.features()) && !config.force_tile_fallback;
-        let v = wgpu::ShaderStages::VERTEX;
+        // Tier 1's fragment stage reads the camera too (a clipped view's
+        // plane, `vg_view_clipped`).
+        let v = wgpu::ShaderStages::VERTEX_FRAGMENT;
         let c = wgpu::ShaderStages::COMPUTE;
         let group0 = |vis| {
             let mut e: Vec<_> = (0..6).map(|b| storage_entry(b, vis, true)).collect();
@@ -427,7 +434,13 @@ impl VgRaster {
             fragment: Some(wgpu::FragmentState {
                 module: &hw_mod,
                 entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &[(
+                        helio_frame_api::view::CLIP_CONSTANT,
+                        if config.clip { 1.0 } else { 0.0 },
+                    )],
+                    ..Default::default()
+                },
                 targets: &[Some(wgpu::ColorTargetState {
                     format: VIS_FORMAT,
                     blend: None,
@@ -586,7 +599,13 @@ impl VgRaster {
                 fragment: Some(wgpu::FragmentState {
                     module: &hw_mod,
                     entry_point: Some("fs_masked"),
-                    compilation_options: Default::default(),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &[(
+                            helio_frame_api::view::CLIP_CONSTANT,
+                            if self.config.clip { 1.0 } else { 0.0 },
+                        )],
+                        ..Default::default()
+                    },
                     targets: &[Some(wgpu::ColorTargetState {
                         format: VIS_FORMAT,
                         blend: None,
@@ -705,12 +724,7 @@ impl VgRaster {
         }
 
         if phase == 0 {
-            for b in [
-                &t.sw_keys,
-                &t.tile_counters,
-                &t.stats,
-                &t.dense_args,
-            ] {
+            for b in [&t.sw_keys, &t.tile_counters, &t.stats, &t.dense_args] {
                 rec.clear_buffer(b, 0, None);
             }
         }

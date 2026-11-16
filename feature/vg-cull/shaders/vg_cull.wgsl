@@ -264,9 +264,23 @@ fn frustum_plane(i: u32) -> vec4<f32> {
     return p / length(p.xyz);
 }
 
+// The view's clip plane (`helio_core::view`: a reflection's water, a portal's
+// destination), normalised, and whether the view has one.
+fn view_clip() -> vec4<f32> {
+    let p = cameras[0].clip_plane;
+    return p / max(length(p.xyz), 1e-20);
+}
+fn view_clips() -> bool {
+    return (cameras[0].view_info.y & HELIO_VIEW_CLIPPED) != 0u;
+}
+
 fn sphere_in_frustum(c: vec3<f32>, r: f32) -> bool {
     for (var i = 0u; i < 5u; i++) {
         let p = wg_planes[i];
+        if dot(p.xyz, c) + p.w < -r { return false; }
+    }
+    if view_clips() {
+        let p = view_clip();
         if dot(p.xyz, c) + p.w < -r { return false; }
     }
     return true;
@@ -275,6 +289,11 @@ fn sphere_in_frustum(c: vec3<f32>, r: f32) -> bool {
 fn aabb_in_frustum(mn: vec3<f32>, mx: vec3<f32>) -> bool {
     for (var i = 0u; i < 5u; i++) {
         let p = wg_planes[i];
+        let v = select(mn, mx, p.xyz > vec3<f32>(0.0));
+        if dot(p.xyz, v) + p.w < 0.0 { return false; }
+    }
+    if view_clips() {
+        let p = view_clip();
         let v = select(mn, mx, p.xyz > vec3<f32>(0.0));
         if dot(p.xyz, v) + p.w < 0.0 { return false; }
     }
@@ -732,6 +751,12 @@ fn dense_fully_covered(cw: vec3<f32>, r_px: f32) -> bool {
 fn choose_bin(tris: u32, ic: InstCtx, cw: vec3<f32>, rw: f32, key: u32) -> u32 {
     let hw_bin = tri_class(tris);
     if params.mode == VGC_MODE_FORCE_HW { return hw_bin; }
+    // A cluster crossing the view's clip plane: the hardware raster clips it
+    // per pixel.
+    if view_clips() {
+        let p = view_clip();
+        if abs(dot(p.xyz, cw) + p.w) < rw { return hw_bin; }
+    }
     let d = max(view_depth_of(cw), cameras[0].position_near.w);
     let r_px = rw * cameras[0].proj[1][1] * 0.5 * f32(params.screen_height) / d;
     // Use the sphere's nearest depth for the raster-removal proof. The cheaper

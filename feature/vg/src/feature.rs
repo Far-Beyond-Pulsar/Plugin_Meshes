@@ -39,7 +39,12 @@ impl Feature for VgFeature {
                         .setting::<VgSettings>()
                         .cloned()
                         .unwrap_or_default();
-                    add_virtual_geometry_passes(build.graph, build.env.device, &settings);
+                    add_virtual_geometry_passes(
+                        build.graph,
+                        build.env.device,
+                        &settings,
+                        helio_frame_api::view::view_of(build.env),
+                    );
                     Ok(())
                 },
             )

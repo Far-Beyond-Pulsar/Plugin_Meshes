@@ -364,16 +364,16 @@ fn resolve_bin_shade_and_final_depth() {
     let view = Mat4::IDENTITY;
     let proj = helio_core::depth::perspective(60f32.to_radians(), 1.0, 0.1);
     let vp = proj * view;
-    let cam = helio_core::GpuCameraUniforms {
-        view: view.to_cols_array(),
-        proj: proj.to_cols_array(),
-        view_proj: vp.to_cols_array(),
-        inv_view_proj: vp.inverse().to_cols_array(),
-        position_near: [0.0, 0.0, 0.0, 0.1],
-        forward_far: [0.0, 0.0, -1.0, 100.0],
-        jitter_frame: [0.0; 4],
-        prev_view_proj: vp.to_cols_array(),
-    };
+    let cam = helio_core::GpuCameraUniforms::new(
+        view,
+        proj,
+        glam::Vec3::ZERO,
+        0.1,
+        100.0,
+        0,
+        [0.0; 2],
+        vp,
+    );
     let camera = init("camera", bytemuck::cast_slice(&[cam, cam]), storage);
 
     // ── scene: two triangles in two material sections of one instance ──

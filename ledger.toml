@@ -263,7 +263,7 @@ status = "verified"
 [[buffer]]
 key = "skeletal_bone_palette"
 producers = ["SkeletalMeshComponent"]
-consumers = ["helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-portal-instances", "helio-pass-shadow", "helio-pass-transparent"]
+consumers = ["helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-shadow", "helio-pass-transparent"]
 owner = "helio_component (SkeletalMeshComponent)"
 disposition = "keep: each instance's current and previous joint matrices, in the mesh's own space; passes skin the vertex before the instance's model matrix, so a moved camera origin needs nothing here"
 target_contract = "SceneDB#84; 03-gpu-reflection-and-rendering.md"
@@ -273,7 +273,7 @@ status = "unverified"
 [[buffer]]
 key = "skeletal_skin_vertices"
 producers = ["SkeletalMeshComponent"]
-consumers = ["helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-portal-instances", "helio-pass-shadow", "helio-pass-transparent"]
+consumers = ["helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-shadow", "helio-pass-transparent"]
 owner = "helio_component (SkeletalMeshComponent)"
 disposition = "keep: four joint indices and weights per vertex, parallel to builtin_mesh_vertex so static geometry keeps its vertex layout"
 target_contract = "SceneDB#84; 03-gpu-reflection-and-rendering.md"
@@ -283,7 +283,7 @@ status = "unverified"
 [[buffer]]
 key = "builtin_mesh_index"
 producers = ["MeshComponent", "SkeletalMeshComponent", "StaticMeshComponent"]
-consumers = ["helio-mesh-host", "helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-gi", "helio-pass-portal-instances", "helio-pass-shadow", "helio-pass-transparent", "meshes_component"]
+consumers = ["helio-mesh-host", "helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-gi", "helio-pass-shadow", "helio-pass-transparent", "meshes_component"]
 owner = "helio_component (StaticMeshComponent pools); also declared by gbuffer's MeshComponent"
 disposition = "keep: same as builtin_mesh_vertex"
 target_contract = "Phase 2; 03-gpu-reflection-and-rendering.md"
@@ -293,7 +293,7 @@ status = "verified"
 [[buffer]]
 key = "builtin_mesh_vertex"
 producers = ["MeshComponent", "SkeletalMeshComponent", "StaticMeshComponent"]
-consumers = ["helio-mesh-host", "helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-gi", "helio-pass-portal-instances", "helio-pass-shadow", "helio-pass-transparent", "meshes_component"]
+consumers = ["helio-mesh-host", "helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-gi", "helio-pass-shadow", "helio-pass-transparent", "meshes_component"]
 owner = "helio_component (StaticMeshComponent pools); also declared by gbuffer's MeshComponent"
 disposition = "keep: authored StaticMeshComponent pools are the canonical geometry; retire or merge the second, pass-owned producer"
 target_contract = "Phase 2; 03-gpu-reflection-and-rendering.md"

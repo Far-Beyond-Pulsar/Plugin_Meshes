@@ -120,8 +120,13 @@ fn vs_main(v: Vertex, @location(15) slot: u32, @builtin(vertex_index) vertex_ind
     return out;
 }
 
+// Whether the view the pipeline draws has a clip plane
+// (`helio_frame_api::view::CLIP_CONSTANT`).
+override HELIO_VIEW_CLIP: bool = false;
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    if HELIO_VIEW_CLIP && helio_view_clipped(cameras[0], input.world_position) { discard; }
     let material = material_at(input.material_id);
     let material_tex = material_texture_data(material,input.material_id);
 

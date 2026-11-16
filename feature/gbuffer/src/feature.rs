@@ -33,8 +33,9 @@ impl Feature for GBufferDrawers {
                     // G-buffer's surface payload.
                     let lightmap = helio_frame_api::gbuffer::payload(build.env)
                         == Some(helio_bake_api::LIGHTMAP_UV);
-                    let mut pass =
-                        GBufferPass::new(build.env.device).with_lightmap_payload(lightmap);
+                    let mut pass = GBufferPass::new(build.env.device)
+                        .with_lightmap_payload(lightmap)
+                        .with_view(helio_frame_api::view::view_of(build.env));
                     if let Some(templates) = build.env.setting::<helio_mats::MaterialTemplates>() {
                         pass = pass.with_template_registry(templates.opaque.clone());
                     }
