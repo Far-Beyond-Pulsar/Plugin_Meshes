@@ -24,6 +24,7 @@ pub mod draw_slots;
 pub mod host_rows;
 mod indirect_draw;
 mod object_batch_frame_data;
+mod portal_occurrence_frame_data;
 pub mod rows;
 pub mod stats;
 
@@ -34,6 +35,7 @@ pub use draw_segments::{DrawSegment, DrawSegments, ShadingBucket};
 pub use draw_slots::{DrawSlots, DRAW_SLOT_LAYOUT, DRAW_SLOT_LOCATION};
 pub use indirect_draw::{multi_draw_indexed_indirect, GpuDrawCount, DRAW_INDEXED_INDIRECT_STRIDE};
 pub use object_batch_frame_data::{IndirectDispatchArgs, ObjectBatchFrameData};
+pub use portal_occurrence_frame_data::{PortalOccurrenceFrameData, PORTAL_OCCURRENCES};
 pub use rows::{
     RenderGroupRow, SkinVertex, StaticObjectRow, BONE_PALETTE, CLASSIC_SUPPRESSED, MESH_INDICES,
     MESH_VERTICES, OBJECTS_MOVED, OBJECTS_STRUCTURE, RENDER_GROUPS, SKELETAL_BONE_PALETTE,

@@ -11,6 +11,8 @@ helio-pass-hiz = { workspace = true }
 helio-core = { workspace = true }
 helio-pass-indirect-dispatch = { workspace = true }
 helio-bake-api = { workspace = true }
+# What portal chains show (`PortalOccurrencePass`).
+helio-portal-api = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 

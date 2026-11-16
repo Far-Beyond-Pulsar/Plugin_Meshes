@@ -19,6 +19,8 @@ use std::sync::Arc;
 
 pub mod feature;
 pub use feature::MeshCulling;
+mod portal_occurrences;
+pub use portal_occurrences::PortalOccurrencePass;
 
 use bytemuck::{Pod, Zeroable};
 use helio_core::{PassContext, PrepareContext, RenderPass, Result as HelioResult};
@@ -68,11 +70,123 @@ const SEGMENT_EVICT_FRAMES: u64 = 300;
 /// `compact_ranges.wgsl`'s `RangeCapacity`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct RangeCompactParams {
-    slots: u32,
-    bucket: u32,
-    segment_count: u32,
-    _pad: u32,
+pub(crate) struct RangeCompactParams {
+    pub slots: u32,
+    pub bucket: u32,
+    pub segment_count: u32,
+    pub _pad: u32,
+}
+
+/// The range compaction (`compact_ranges.wgsl`): packs the visible indirect
+/// records of each material range and appends them to their key's draw
+/// segment. The occlusion cull runs it over the culled draws, the portal
+/// occurrences over theirs.
+pub(crate) struct RangeCompaction {
+    pub layout: wgpu::BindGroupLayout,
+    pub pipeline: wgpu::ComputePipeline,
+    /// Three `RangeCompactParams`, one per bucket, 256 bytes apart (bound
+    /// with a dynamic offset).
+    pub params: wgpu::Buffer,
+}
+
+impl RangeCompaction {
+    pub fn new(device: &wgpu::Device, label: &'static str) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(label),
+            entries: &[
+                storage_layout_entry(0, true),
+                storage_layout_entry(1, false),
+                storage_layout_entry(2, true),
+                storage_layout_entry(3, true),
+                storage_layout_entry(4, true),
+                storage_layout_entry(5, true),
+                storage_layout_entry(6, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                storage_layout_entry(8, true),
+                storage_layout_entry(9, false),
+                storage_layout_entry(10, false),
+            ],
+        });
+        let shader = helio_core::shader::module_with(
+            device,
+            "RangeCompaction Shader",
+            helio_core::include_wgsl!("../shaders/compact_ranges.wgsl"),
+            &[],
+        );
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(label),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = helio_core::shader::create_compute_pipeline(
+            device,
+            wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("compact_ranges"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        );
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: 768,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            layout,
+            pipeline,
+            params,
+        }
+    }
+
+    /// The group over `buffers`: the source records, the compacted records,
+    /// the batch's range counts and its three range tables, the per-range
+    /// counts, the segment table, the segments' records and their counts.
+    pub fn bind_group<'g>(
+        &self,
+        device: &wgpu::Device,
+        cache: &'g mut helio_core::CachedBindGroup,
+        buffers: [&wgpu::Buffer; 10],
+    ) -> &'g wgpu::BindGroup {
+        let [source, compacted, range_counts, opaque, transparent, forward, draw_counts, table, segment_indirect, segment_counts] =
+            buffers;
+        cache.get_or_create(
+            device,
+            &wgpu::BindGroupDescriptor {
+                label: Some("RangeCompaction BG"),
+                layout: &self.layout,
+                entries: &[
+                    buffer_entry(0, source),
+                    buffer_entry(1, compacted),
+                    buffer_entry(2, range_counts),
+                    buffer_entry(3, opaque),
+                    buffer_entry(4, transparent),
+                    buffer_entry(5, forward),
+                    buffer_entry(6, draw_counts),
+                    uniform_range_entry(
+                        7,
+                        &self.params,
+                        std::mem::size_of::<RangeCompactParams>() as u64,
+                    ),
+                    buffer_entry(8, table),
+                    buffer_entry(9, segment_indirect),
+                    buffer_entry(10, segment_counts),
+                ],
+            },
+        )
+    }
 }
 
 /// `compact_ranges.wgsl`'s `Segment`.
@@ -312,11 +426,8 @@ fn create_segment_buf(
 pub struct OcclusionCullPass {
     pipeline: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
-    range_compact_pipeline: wgpu::ComputePipeline,
-    range_compact_bgl: wgpu::BindGroupLayout,
-    range_compact_params: wgpu::Buffer,
-    range_compact_bind_group: Option<wgpu::BindGroup>,
-    range_compact_key: Option<[wgpu::Buffer; 10]>,
+    range_compaction: RangeCompaction,
+    range_compact_group: helio_core::CachedBindGroup,
     segments: SegmentTable,
     cull_params_buf: wgpu::Buffer,
     hiz_sampler: Arc<wgpu::Sampler>,
@@ -566,69 +677,14 @@ impl OcclusionCullPass {
             },
         );
 
-        let range_compact_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("OcclusionCull RangeCompaction BGL"),
-            entries: &[
-                storage_layout_entry(0, true),
-                storage_layout_entry(1, false),
-                storage_layout_entry(2, true),
-                storage_layout_entry(3, true),
-                storage_layout_entry(4, true),
-                storage_layout_entry(5, true),
-                storage_layout_entry(6, false),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: true,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                storage_layout_entry(8, true),
-                storage_layout_entry(9, false),
-                storage_layout_entry(10, false),
-            ],
-        });
-        let compact_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("OcclusionCull RangeCompaction Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/compact_ranges.wgsl").into()),
-        });
-        let compact_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("OcclusionCull RangeCompaction PL"),
-            bind_group_layouts: &[Some(&range_compact_bgl)],
-            immediate_size: 0,
-        });
-        let range_compact_pipeline = helio_core::shader::create_compute_pipeline(
-            &device,
-            wgpu::ComputePipelineDescriptor {
-                label: Some("OcclusionCull RangeCompaction Pipeline"),
-                layout: Some(&compact_layout),
-                module: &compact_shader,
-                entry_point: Some("compact_ranges"),
-                compilation_options: Default::default(),
-                cache: None,
-            },
-        );
-        let range_compact_params = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("OcclusionCull RangeCompaction Params"),
-            size: 768,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let compacted_indices_2_buf = create_compacted_indices_2_buf(device, MIN_CAPACITY);
         let compacted_indirect_buf = create_compacted_indirect_buf(device, MIN_CAPACITY);
 
         Self {
             pipeline,
             bgl,
-            range_compact_pipeline,
-            range_compact_bgl,
-            range_compact_params,
-            range_compact_bind_group: None,
-            range_compact_key: None,
+            range_compaction: RangeCompaction::new(device, "OcclusionCull RangeCompaction"),
+            range_compact_group: helio_core::CachedBindGroup::default(),
             segments: SegmentTable::new(device),
             cull_params_buf,
             hiz_sampler,
@@ -681,54 +737,32 @@ impl OcclusionCullPass {
         if slots == 0 {
             return;
         }
-        let key = [
-            source_indirect.clone(),
-            batch.range_counts_gpu.clone(),
-            batch.opaque_ranges_gpu.clone(),
-            batch.transparent_ranges_gpu.clone(),
-            batch.forward_ranges_gpu.clone(),
-            batch.draw_counts_gpu.clone(),
-            self.compacted_indirect_buf.clone(),
-            self.segments.table_buf.clone(),
-            self.segments.indirect_buf.clone(),
-            self.segments.counts_buf.clone(),
-        ];
-        if self.range_compact_key.as_ref() != Some(&key) {
-            self.range_compact_bind_group =
-                Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("OcclusionCull RangeCompaction BG"),
-                    layout: &self.range_compact_bgl,
-                    entries: &[
-                        buffer_entry(0, source_indirect),
-                        buffer_entry(1, &self.compacted_indirect_buf),
-                        buffer_entry(2, batch.range_counts_gpu),
-                        buffer_entry(3, batch.opaque_ranges_gpu),
-                        buffer_entry(4, batch.transparent_ranges_gpu),
-                        buffer_entry(5, batch.forward_ranges_gpu),
-                        buffer_entry(6, batch.draw_counts_gpu),
-                        uniform_range_entry(
-                            7,
-                            &self.range_compact_params,
-                            std::mem::size_of::<RangeCompactParams>() as u64,
-                        ),
-                        buffer_entry(8, &self.segments.table_buf),
-                        buffer_entry(9, &self.segments.indirect_buf),
-                        buffer_entry(10, &self.segments.counts_buf),
-                    ],
-                }));
-            self.range_compact_key = Some(key);
-        }
+        let group = self
+            .range_compaction
+            .bind_group(
+                &ctx.device,
+                &mut self.range_compact_group,
+                [
+                    source_indirect,
+                    &self.compacted_indirect_buf,
+                    batch.range_counts_gpu,
+                    batch.opaque_ranges_gpu,
+                    batch.transparent_ranges_gpu,
+                    batch.forward_ranges_gpu,
+                    batch.draw_counts_gpu,
+                    &self.segments.table_buf,
+                    &self.segments.indirect_buf,
+                    &self.segments.counts_buf,
+                ],
+            )
+            .clone();
         let mut pass = cmds.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("OcclusionCull RangeCompaction"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.range_compact_pipeline);
+        pass.set_pipeline(&self.range_compaction.pipeline);
         for bucket in 0..3u32 {
-            pass.set_bind_group(
-                0,
-                self.range_compact_bind_group.as_ref().unwrap(),
-                &[bucket * 256],
-            );
+            pass.set_bind_group(0, &group, &[bucket * 256]);
             pass.dispatch_workgroups_indirect(batch.range_counts_gpu, 16 + bucket as u64 * 12);
         }
     }
@@ -814,7 +848,7 @@ fn create_compacted_indirect_buf(device: &wgpu::Device, capacity: u32) -> wgpu::
     })
 }
 
-fn storage_layout_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn storage_layout_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -827,7 +861,7 @@ fn storage_layout_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutE
     }
 }
 
-fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+pub(crate) fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
@@ -952,7 +986,7 @@ impl RenderPass for OcclusionCullPass {
                 _pad: 0,
             };
             ctx.write_buffer(
-                &self.range_compact_params,
+                &self.range_compaction.params,
                 bucket as u64 * 256,
                 bytemuck::bytes_of(&params),
             );

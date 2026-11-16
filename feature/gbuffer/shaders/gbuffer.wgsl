@@ -7,6 +7,7 @@ enable wgpu_binding_array;
 //!use material_surface
 //!use mesh_draw_rows
 //!use lightmap_regions
+//!use portal_chain
 
 //! The meshes' G-buffer program (GPU-driven): the meshes' vertex layout and
 //! instance rows, shaded by the material's template. A material class's
@@ -14,6 +15,15 @@ enable wgpu_binding_array;
 //! graph are composed after it (`RadiantTemplate::compose`); the material
 //! row, its texture table and `default_pbr_surface` are the materials'
 //! snippets.
+//!
+//! Two entry pairs, one program: `vs_main`/`fs_main` draw the culled
+//! instances where they are; `vs_occurrence`/`fs_occurrence` draw them again
+//! through the frame's portal chains (`helio_portal_api`): each occurrence
+//! is an instance and a chain, mapped by the chain's composed matrix,
+//! projected once by the camera, clipped to what the chain shows (the
+//! aperture mask, each deeper opening's ray test, the deeper chains' holes)
+//! and tagged with the chain's remap, so the lighting shades it in its own
+//! world.
 //!
 //! Rasterises scene geometry into screen-sized textures:
 //!   target 0 – albedo    (Rgba8Unorm)
@@ -87,6 +97,14 @@ override HELIO_VIEW_CLIP: bool = false;
 @group(2) @binding(0) var uv_reference_texture: texture_2d<f32>;
 @group(2) @binding(1) var uv_reference_sampler: sampler;
 
+// The occurrence pipelines' (`helio_mesh_api::PortalOccurrenceFrameData`):
+// per occurrence its chain (the instance slot is `compacted_indices`), the
+// frame's live chains and their stages and holes, and the aperture mask.
+@group(3) @binding(0) var<storage, read> occurrence_chains: array<u32>;
+@group(3) @binding(1) var<storage, read> portal_chains:     array<GpuPortalChain>;
+@group(3) @binding(2) var<storage, read> portal_stages:     array<GpuPortalStage>;
+@group(3) @binding(3) var portal_mask: texture_2d<u32>;
+
 struct Vertex {
     @location(0) position:       vec3<f32>,
     @location(1) bitangent_sign: f32,
@@ -109,6 +127,10 @@ struct VertexOutput {
     // 1 when the instance moves by itself (its transform, skin or coordinate
     // space changed since last frame), else 0.
     @location(8) @interpolate(flat) moving: u32,
+    // An occurrence's chain (`portal_chains` row), and its point in its own
+    // world (before the chain's map) for the clip. Unused by `vs_main`.
+    @location(9) @interpolate(flat) chain: u32,
+    @location(10) content_position: vec3<f32>,
 }
 
 fn decode_snorm8x4(packed: u32) -> vec3<f32> {
@@ -119,7 +141,40 @@ fn decode_snorm8x4(packed: u32) -> vec3<f32> {
 // indirect draw's `first_instance` (`helio_pass_gbuffer::draw_slots`).
 @vertex
 fn vs_main(v: Vertex, @location(15) slot: u32, @builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-    let inst       = instance_data[compacted_indices[slot]];
+    let identity = mat4x4<f32>(
+        vec4<f32>(1.0, 0.0, 0.0, 0.0), vec4<f32>(0.0, 1.0, 0.0, 0.0),
+        vec4<f32>(0.0, 0.0, 1.0, 0.0), vec4<f32>(0.0, 0.0, 0.0, 1.0));
+    var out = mesh_vertex(v, instance_data[compacted_indices[slot]], vertex_index, identity, identity);
+    return out;
+}
+
+// An occurrence through a portal chain: the instance (`compacted_indices`)
+// mapped by its chain's composed matrix (this frame's and last frame's, for
+// its motion).
+@vertex
+fn vs_occurrence(v: Vertex, @location(15) slot: u32, @builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    let chain_index = occurrence_chains[slot];
+    let chain = portal_chains[chain_index];
+    var out = mesh_vertex(
+        v, instance_data[compacted_indices[slot]], vertex_index,
+        chain.content_to_drawn, chain.prev_content_to_drawn);
+    out.chain = chain_index;
+    out.moving = select(out.moving, 1u, portal_chain_moved(chain));
+    // The surface's tag: drawn through the chain's remap.
+    out.lightmap_uv = gbuffer_remap_tag(chain.remap, GBUFFER_TAG_PLAIN);
+    return out;
+}
+
+/// The meshes' vertex: `inst` in its coordinate space, then through `map`
+/// (identity where it is drawn; a chain's composed matrix through a portal,
+/// `prev_map` last frame's).
+fn mesh_vertex(
+    v: Vertex,
+    inst: GpuInstanceData,
+    vertex_index: u32,
+    map: mat4x4<f32>,
+    prev_map: mat4x4<f32>,
+) -> VertexOutput {
     var local_position = v.position;
     var local_normal = decode_snorm8x4(v.normal);
     var local_tangent = decode_snorm8x4(v.tangent);
@@ -151,9 +206,11 @@ fn vs_main(v: Vertex, @location(15) slot: u32, @builtin(vertex_index) vertex_ind
     let space_id   = instance_coordinate_space(inst.flags);
     let space      = coordinate_spaces[space_id];
     let space_prev = coordinate_spaces_prev[space_id];
-    let space_rot  = mat3x3<f32>(space[0].xyz, space[1].xyz, space[2].xyz);
+    let map_rot    = mat3x3<f32>(map[0].xyz, map[1].xyz, map[2].xyz);
+    let space_rot  = map_rot * mat3x3<f32>(space[0].xyz, space[1].xyz, space[2].xyz);
 
-    let world_pos  = space * (inst.transform * vec4<f32>(local_position, 1.0));
+    let content_pos = space * (inst.transform * vec4<f32>(local_position, 1.0));
+    let world_pos  = map * content_pos;
 
     // Normals transform by the inverse-transpose (stored in normal_mat), then
     // by the coordinate space's rotation. Coordinate spaces are always rigid
@@ -194,7 +251,7 @@ fn vs_main(v: Vertex, @location(15) slot: u32, @builtin(vertex_index) vertex_ind
             prev_local_position = (prev_blended * (1.0 / prev_total_weight) * vec4<f32>(v.position, 1.0)).xyz;
         }
     }
-    let prev_world  = space_prev * (inst.prev_model * vec4<f32>(prev_local_position, 1.0));
+    let prev_world  = prev_map * (space_prev * (inst.prev_model * vec4<f32>(prev_local_position, 1.0)));
     let prev_clip   = cameras[0].prev_view_proj * prev_world;
 
     var out: VertexOutput;
@@ -209,6 +266,8 @@ fn vs_main(v: Vertex, @location(15) slot: u32, @builtin(vertex_index) vertex_ind
     out.tex_coords         = v.tex_coords;
     out.material_id        = inst.material_id;
     out.prev_clip_position = prev_clip;
+    out.chain              = 0u;
+    out.content_position   = content_pos.xyz;
     let moved = any(inst.prev_model[0] != inst.transform[0]) || any(inst.prev_model[1] != inst.transform[1])
         || any(inst.prev_model[2] != inst.transform[2]) || any(inst.prev_model[3] != inst.transform[3])
         || any(space_prev[0] != space[0]) || any(space_prev[1] != space[1])
@@ -223,11 +282,8 @@ fn vs_main(v: Vertex, @location(15) slot: u32, @builtin(vertex_index) vertex_ind
     // mesh baked with UV1 has a region; every other object reads a zero
     // region and keeps the plain tag. The region's half-texel clamp keeps
     // bilinear filtering inside it.
-    // A secondary view's surfaces carry their view in the tag (the payload is
-    // the frame's own view's).
-    out.lightmap_uv = gbuffer_view_tag(cameras[0], GBUFFER_TAG_PLAIN);
-    if LIGHTMAP_PAYLOAD && cameras[0].view_info.x == 0u
-        && inst.object_row < arrayLength(&lightmap_regions) {
+    out.lightmap_uv = GBUFFER_TAG_PLAIN;
+    if LIGHTMAP_PAYLOAD && inst.object_row < arrayLength(&lightmap_regions) {
         let atlas = lightmap_atlas_uv(lightmap_regions[inst.object_row], v.lightmap_uv);
         if atlas.x >= 0.0 {
             out.lightmap_uv = atlas;
@@ -267,8 +323,30 @@ fn compute_velocity(input: VertexOutput) -> vec4<f32> {
 
 @fragment
 fn fs_main(vertex: VertexOutput, @builtin(front_facing) front: bool) -> GBufferOutput {
+    if HELIO_VIEW_CLIP && helio_view_clipped(cameras[0], vertex.world_position) { discard; }
+    return mesh_fragment(vertex, front);
+}
+
+// What a chain shows: beyond its outermost opening where the aperture mask
+// holds it, through each deeper opening, and not behind a deeper chain's
+// opening (that chain draws there).
+@fragment
+fn fs_occurrence(vertex: VertexOutput, @builtin(front_facing) front: bool) -> GBufferOutput {
+    let chain = portal_chains[vertex.chain];
+    let p = vertex.content_position;
+    let mask = textureLoad(portal_mask, vec2<i32>(vertex.clip_position.xy), 0).r;
+    if !portal_outer_shows(chain, portal_stages[chain.first_stage], p, mask) { discard; }
+    for (var s = 1u; s < chain.stage_count; s += 1u) {
+        if !portal_stage_shows(portal_stages[chain.first_stage + s], p) { discard; }
+    }
+    for (var h = 0u; h < chain.hole_count; h += 1u) {
+        if portal_hole_covers(portal_stages[chain.first_hole + h], p) { discard; }
+    }
+    return mesh_fragment(vertex, front);
+}
+
+fn mesh_fragment(vertex: VertexOutput, front: bool) -> GBufferOutput {
     var input = vertex;
-    if HELIO_VIEW_CLIP && helio_view_clipped(cameras[0], input.world_position) { discard; }
     let material = material_at(input.material_id);
     let material_tex = material_texture_data(material,input.material_id);
     // Reject empty card pixels before normal/ORM/extension texture reads,
@@ -345,7 +423,7 @@ fn fs_main(vertex: VertexOutput, @builtin(front_facing) front: bool) -> GBufferO
 
     var out: GBufferOutput;
     out.albedo = vec4<f32>(surface.albedo.rgb, surface.alpha);
-    out.normal = vec4<f32>(helio_view_normal(cameras[0], surface.normal), surface.specular_f0.r);
+    out.normal = vec4<f32>(surface.normal, surface.specular_f0.r);
     out.orm = vec4<f32>(surface.ao, surface.roughness, surface.metallic, surface.specular_f0.g);
     out.emissive = vec4<f32>(surface.emissive, surface.specular_f0.b);
     out.surface = input.lightmap_uv;

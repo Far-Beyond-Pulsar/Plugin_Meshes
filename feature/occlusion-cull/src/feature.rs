@@ -9,7 +9,7 @@ use helio_frame_api::{FrameNode, Slot};
 use helio_pass_hiz::HiZBuildPass;
 use helio_pass_indirect_dispatch::IndirectDispatchPass;
 
-use crate::OcclusionCullPass;
+use crate::{OcclusionCullPass, PortalOccurrencePass};
 
 /// The meshes' culling nodes ([`crate`]).
 pub struct MeshCulling;
@@ -22,6 +22,7 @@ impl Feature for MeshCulling {
     fn register(&self, registrar: &mut FeatureRegistrar<'_>) {
         // What shader hot reload may swap without rebuilding the graph.
         registrar.swappable::<IndirectDispatchPass>();
+        registrar.swappable::<PortalOccurrencePass>();
         registrar.swap_group(&[
             helio_core::graph::type_name_of::<HiZBuildPass>(),
             helio_core::graph::type_name_of::<OcclusionCullPass>(),
@@ -71,6 +72,22 @@ impl Feature for MeshCulling {
                 },
             )
             .in_slot(Slot::Visibility, 10),
+        );
+
+        registrar.node(
+            pass_node(
+                "portal_occurrence_cull",
+                "Culling: Through Portals",
+                CATEGORY,
+                "Which instances each live portal chain shows (helio_portal_api), packed per draw group for the G-buffer's occurrence draw. A member only while the frame has portal chains.",
+                |build| {
+                    build
+                        .graph
+                        .add_pass(Box::new(PortalOccurrencePass::new(build.env.device)));
+                    Ok(())
+                },
+            )
+            .in_slot(Slot::Visibility, 20),
         );
     }
 }

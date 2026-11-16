@@ -29,6 +29,18 @@ fn compute_shaders_compile_under_fxc() {
             &helio_core::shader::resolve(&src),
         ));
     }
+    // The occurrences through portal chains, with the snippets it composes.
+    failures.extend(fxc::fxc_failures(
+        &fxc_exe,
+        "portal_occurrences",
+        &helio_core::shader::resolve_with(
+            include_str!("../shaders/portal_occurrences.wgsl"),
+            &[
+                helio_mesh_api::DRAW_ROWS_SNIPPET,
+                helio_portal_api::PORTAL_CHAIN_SNIPPET,
+            ],
+        ),
+    ));
     assert!(
         failures.is_empty(),
         "FXC rejected:\n{}",

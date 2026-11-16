@@ -178,9 +178,7 @@ pub mod shader_source {
         if bindless {
             return src.replace(
                 "textureSample(scene_textures[slot.texture_index], scene_sampler, uv)",
-                &format!(
-                    "textureSampleGrad(scene_textures[slot.texture_index], scene_sampler, {GRAD})"
-                ),
+                &format!("textureSampleGrad(scene_textures[slot.texture_index], scene_sampler, {GRAD})"),
             );
         }
         let mut out = src.to_string();
@@ -529,13 +527,7 @@ impl VgShade {
         // ── final depth ──
         let depth_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("VgShade depth"),
-            entries: &[
-                texture_entry(0, wgpu::ShaderStages::FRAGMENT, UNFILTERABLE),
-                wgpu::BindGroupLayoutEntry {
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ..storage_entry(1, true)
-                },
-            ],
+            entries: &[texture_entry(0, wgpu::ShaderStages::FRAGMENT, UNFILTERABLE)],
         });
         let depth_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("VgShade depth"),
@@ -1232,16 +1224,10 @@ impl VgShade {
         let depth_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("VgShade depth"),
             layout: &self.depth_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: res(depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: buf(inputs.camera),
-                },
-            ],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: res(depth_view),
+            }],
         });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("VgShade depth"),

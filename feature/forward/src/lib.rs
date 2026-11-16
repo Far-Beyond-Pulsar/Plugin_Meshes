@@ -444,10 +444,7 @@ impl RenderPass for ForwardLitPass {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth,
                 depth_ops: Some(wgpu::Operations {
-                    // An inline view's depth holds its mask: it loads it.
-                    load: if self.render_all_opaque
-                        && self.view.kind != helio_core::ViewKind::Inline
-                    {
+                    load: if self.render_all_opaque {
                         wgpu::LoadOp::Clear(helio_core::depth::CLEAR)
                     } else {
                         wgpu::LoadOp::Load
