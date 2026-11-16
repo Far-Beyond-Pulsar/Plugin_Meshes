@@ -689,6 +689,7 @@ impl SceneDbRayTracing {
             self.casters.push((object_entity, CasterKey::of(object)));
             instances.push(TlasInstanceInput {
                 geometry_id: id,
+                custom_data: instances.len() as u32,
                 transform: tlas_transform(object),
             });
         }

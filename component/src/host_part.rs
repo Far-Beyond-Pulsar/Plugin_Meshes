@@ -24,6 +24,16 @@ pub struct MeshesHostPart {
     virtual_geometry: VirtualGeometryHost,
     /// Replaces the project's virtual-geometry settings (tests, tools).
     settings_override: Option<VirtualGeometrySettings>,
+    /// The ray-traced scene, made on the first frame (the renderer's
+    /// device says whether it has ray queries).
+    ray_scene: RayScene,
+}
+
+enum RayScene {
+    Pending,
+    /// No hardware ray queries on the renderer's device.
+    Unsupported,
+    Ready(Box<crate::ray_scene::WorldRayScene>),
 }
 
 impl MeshesHostPart {
@@ -31,6 +41,16 @@ impl MeshesHostPart {
         Self {
             virtual_geometry: VirtualGeometryHost::new(),
             settings_override: None,
+            ray_scene: RayScene::Pending,
+        }
+    }
+
+    /// How many mesh sections the ray-traced scene holds (`None` before the
+    /// first frame or without hardware ray queries).
+    pub fn ray_traced_sections(&self) -> Option<usize> {
+        match &self.ray_scene {
+            RayScene::Ready(rays) => Some(rays.instance_count()),
+            _ => None,
         }
     }
 
@@ -152,6 +172,33 @@ impl RenderHostPart for MeshesHostPart {
             mirror,
             virtual_geometry_runtime_settings(settings),
         );
+    }
+
+    /// The meshes' ray-traced scene (`crate::ray_scene`), on a device with
+    /// hardware ray queries: what the GI probes' mesh tracer reads.
+    fn publish_frame(&mut self, scene: &SharedScene, renderer: &mut helio::Renderer) {
+        if matches!(self.ray_scene, RayScene::Pending) {
+            self.ray_scene = match crate::ray_scene::WorldRayScene::new(
+                renderer.device().clone(),
+                renderer.queue().clone(),
+                Some(self.virtual_geometry.runtime().clone()),
+            ) {
+                Some(rays) => RayScene::Ready(Box::new(rays)),
+                None => {
+                    tracing::info!(
+                        "Meshes: the renderer's device has no hardware ray queries; rays (GI) see no meshes"
+                    );
+                    RayScene::Unsupported
+                }
+            };
+        }
+        let RayScene::Ready(rays) = &mut self.ray_scene else {
+            return;
+        };
+        rays.prepare(&scene.read().world, renderer.world_origin());
+        if let Some(scene_rays) = rays.scene_rays() {
+            renderer.set_scene_payload(&helio_frame_api::rays::SCENE_RAYS, Arc::new(scene_rays));
+        }
     }
 
     /// Authored meshes: the ground's certified planes say nothing about

@@ -45,7 +45,7 @@ pub struct ProxyRange {
 }
 
 /// What a mesh is to the projection.
-pub(crate) enum Lookup {
+pub enum Lookup {
     /// Not a virtual-geometry asset: traced as its classic mesh.
     Classic,
     /// A VG asset whose proxy is not built (or failed): left out.
@@ -148,7 +148,7 @@ impl VgRayProxies {
     /// Per frame, before the projection builds: follows the runtime's
     /// assets, collects finished proxy builds and uploads them. True when
     /// the projection must rebuild (an asset or a proxy came or went).
-    pub(crate) fn poll(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+    pub fn poll(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
         self.frame += 1;
         let mut changed = false;
         let version = self.runtime.assets_version();
@@ -188,7 +188,7 @@ impl VgRayProxies {
 
     /// What the mesh with interned vertex range `range` is to the
     /// projection; a VG asset met for the first time starts its build.
-    pub(crate) fn lookup(&mut self, range: (u32, u32)) -> Lookup {
+    pub fn lookup(&mut self, range: (u32, u32)) -> Lookup {
         let Some((key, source)) = self.assets.get(&range) else {
             return Lookup::Classic;
         };
@@ -202,7 +202,7 @@ impl VgRayProxies {
     }
 
     /// After a build: the proxies its objects use. The others are dropped.
-    pub(crate) fn retain(&mut self, used: &HashSet<u64>) {
+    pub fn retain(&mut self, used: &HashSet<u64>) {
         self.live = used.iter().copied().collect();
         let unused: Vec<u64> = self
             .proxies

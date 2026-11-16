@@ -691,6 +691,7 @@ impl DenseRtPass {
             .iter()
             .map(|&(ri, l, _)| TlasInstanceInput {
                 geometry_id: proxy_mesh_id(requests[ri].asset_key, l),
+                custom_data: 0,
                 transform: requests[ri].transform,
             })
             .collect();
