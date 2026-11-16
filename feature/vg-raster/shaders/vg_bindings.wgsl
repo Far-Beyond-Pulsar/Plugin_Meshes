@@ -56,9 +56,19 @@ fn vg_object_transform(vis: VgVisibleCluster) -> mat4x4<f32> {
     );
 }
 
-// Winding flips under a negative-determinant (mirrored) transform.
+// Winding flips under a negative-determinant (mirrored) transform, and in a
+// mirrored view (a planar reflection, `helio_core::view`); both flip it back.
 fn vg_is_mirrored(m: mat4x4<f32>) -> bool {
-    return dot(cross(m[0].xyz, m[1].xyz), m[2].xyz) < 0.0;
+    let view_mirrored = (vg_cameras[vg_params.view_index].view_info.y & HELIO_VIEW_MIRRORED) != 0u;
+    return (dot(cross(m[0].xyz, m[1].xyz), m[2].xyz) < 0.0) != view_mirrored;
+}
+
+// Whether the view clips `world_pos` (frame space) at its plane. Only the
+// hardware raster tests it per pixel (in pipelines built for a clipped view):
+// the cull sends every cluster crossing the plane there and drops the ones
+// wholly behind it.
+fn vg_view_clipped(world_pos: vec3<f32>) -> bool {
+    return helio_view_clipped(vg_cameras[vg_params.view_index], world_pos);
 }
 
 // Asset-space position -> clip space.

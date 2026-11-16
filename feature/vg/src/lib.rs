@@ -189,7 +189,8 @@ impl RenderPass for VgInputsPass {
         };
         self.raster
             .ensure_targets(ctx.device, ctx.width, ctx.height);
-        self.raster.set_dense_sensitivity(settings.dense_sensitivity);
+        self.raster
+            .set_dense_sensitivity(settings.dense_sensitivity);
         let (dense_mask, dense_tiles) = match self.raster.dense_mask_last_frame() {
             Some((mask, tiles))
                 if self.dense_enabled && settings.tier3 && self.runtime.tier3_stats().engaged =>
@@ -306,11 +307,18 @@ fn cull_settings(runtime: &VgRuntime) -> VgCullDynamic {
 }
 
 /// Adds the virtual-geometry chain to `graph` if `settings` name a runtime
-/// and the device supports it. Returns whether it was added.
+/// and the device supports it, for `view` (`helio_core::view`). Returns
+/// whether it was added.
+///
+/// Streaming is the frame's: a secondary view (a reflection, a portal's)
+/// culls, rasterizes and shades the clusters the frame's own view streamed,
+/// and adds no stream begin or end of its own (two would service the store
+/// and read back feedback twice a frame).
 pub fn add_virtual_geometry_passes(
     graph: &mut RenderGraph,
     device: &Arc<wgpu::Device>,
     settings: &helio_vg_stream::VgSettings,
+    view: helio_core::ViewDescription,
 ) -> bool {
     let Some(id) = settings.runtime else {
         return false;
@@ -328,7 +336,13 @@ pub fn add_virtual_geometry_passes(
         return false;
     }
 
-    let raster = VgRasterPasses::new(device, VgRasterConfig::default());
+    let raster = VgRasterPasses::new(
+        device,
+        VgRasterConfig {
+            clip: view.clipped,
+            ..VgRasterConfig::default()
+        },
+    );
     let raster_shared = raster.shared.clone();
     let tile_fallback = raster.shared.uses_tile_fallback();
     runtime.update_tier3_stats(|s| s.tier2_tile_fallback = tile_fallback);
@@ -367,9 +381,12 @@ pub fn add_virtual_geometry_passes(
         }
     };
 
-    graph.add_pass(Box::new(VgStreamBeginPass {
-        runtime: runtime.clone(),
-    }));
+    let streams = view.is_primary();
+    if streams {
+        graph.add_pass(Box::new(VgStreamBeginPass {
+            runtime: runtime.clone(),
+        }));
+    }
     graph.add_pass(Box::new(VgBvhPass::new(device)));
     graph.add_pass(Box::new(VgInputsPass {
         runtime: runtime.clone(),
@@ -383,7 +400,9 @@ pub fn add_virtual_geometry_passes(
     graph.add_pass(Box::new(cull_late));
     graph.add_pass(Box::new(raster.late));
     let tau_runtime = runtime.clone();
-    graph.add_pass(Box::new(VgStreamEndPass { runtime }));
+    if streams {
+        graph.add_pass(Box::new(VgStreamEndPass { runtime }));
+    }
     let has_dense = dense.is_some();
     if let Some(dense) = dense {
         graph.add_pass(Box::new(dense));

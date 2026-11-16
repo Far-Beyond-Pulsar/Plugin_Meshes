@@ -57,6 +57,7 @@ impl Feature for ShadowDrawers {
                     Ok(())
                 },
             )
+            .once_per_frame()
             .before_phase(Phase::ShadowCasters, 0),
         );
 
@@ -100,6 +101,7 @@ impl Feature for ShadowDrawers {
                     Ok(())
                 },
             )
+            .once_per_frame()
             .opens(Phase::ShadowCasters, 0),
         );
     }

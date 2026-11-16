@@ -2,13 +2,16 @@
 // depth-tests (reversed-Z, >=) against the classic G-buffer depth so VG and
 // classic geometry composite in either order; non-VG pixels are discarded.
 //
-// `fs_main` also writes the "no lightmap" sentinel (-1, -1) to the
-// lightmap-uv target for the pixels it keeps: that target is Rg16Float, which
+// `fs_main` also writes the view's plain tag (`gbuffer_view_tag`) to the
+// surface target for the pixels it keeps: that target is Rg16Float, which
 // cannot be a storage texture without an extra device feature, so it is
 // written by this render pass instead of by the shade compute.
 // `fs_depth_only` is the same without the colour output.
 
+//!use helio_prelude
 @group(0) @binding(0) var resolved_depth: texture_2d<f32>;
+// The view the pass draws: its pixels carry it in the surface tag.
+@group(0) @binding(1) var<storage, read> cameras: array<Camera, 2>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -31,7 +34,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> DepthOut {
     if d <= 0.0 {
         discard;
     }
-    return DepthOut(vec2<f32>(-1.0, -1.0), d);
+    return DepthOut(gbuffer_view_tag(cameras[0], GBUFFER_TAG_PLAIN), d);
 }
 
 @fragment

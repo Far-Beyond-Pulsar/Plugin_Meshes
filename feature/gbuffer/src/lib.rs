@@ -87,9 +87,9 @@ pub struct GBufferPass {
     pipelines: HashMap<RadiantShaderKey, wgpu::RenderPipeline>,
     /// Device supports `POLYGON_MODE_LINE`, so the wireframe debug view is offered.
     wireframe_supported: bool,
-    /// The reflected camera reverses handedness; flip front-face winding while
-    /// preserving ordinary back-face culling for the capture.
-    mirrored_view: bool,
+    /// The view the pass draws (`helio_core::view`): its winding, its clip,
+    /// and whether the G-buffer is already open (an inline view loads it).
+    view: helio_core::ViewDescription,
     shader_cache: RadiantShaderCache,
     /// The materials' opaque templates (`helio_mats::MaterialTemplates`),
     /// shared, never deep-cloned (see `SharedTemplateRegistry`). `None`: the
@@ -188,10 +188,12 @@ fn coordinate_space_words(spaces: &[glam::Mat4]) -> Vec<f32> {
 }
 
 impl GBufferPass {
-    /// Configure front-face winding for a reflected camera before the first
-    /// frame builds material pipelines.
-    pub fn set_mirrored_view(&mut self, mirrored: bool) {
-        self.mirrored_view = mirrored;
+    /// Draws `view` (`helio_frame_api::view::view_of`): a mirrored view's
+    /// winding, a clipped view's plane, and an inline view's G-buffer loaded
+    /// rather than cleared.
+    pub fn with_view(mut self, view: helio_core::ViewDescription) -> Self {
+        self.view = view;
+        self
     }
 
     /// Create the GBuffer pass.
@@ -378,7 +380,7 @@ impl GBufferPass {
             wireframe_supported: device
                 .features()
                 .contains(wgpu::Features::POLYGON_MODE_LINE),
-            mirrored_view: false,
+            view: helio_core::ViewDescription::PRIMARY,
             shader_cache: RadiantShaderCache::new(),
             template_registry: None,
             last_template_keys: Vec::new(),
@@ -600,6 +602,16 @@ impl RenderPass for GBufferPass {
             helio_core::ResourceKey::new(helio_frame_api::gbuffer::VELOCITY),
             "GBuffer",
         )?;
+        // An inline view draws into its requester's G-buffer (and its own
+        // masked depth): it loads what the phase's opener would clear.
+        let inline = self.view.kind == helio_core::ViewKind::Inline;
+        let open = |clear: wgpu::Color| {
+            if inline {
+                wgpu::LoadOp::Load
+            } else {
+                wgpu::LoadOp::Clear(clear)
+            }
+        };
         let color_attachments: &'a [Option<wgpu::RenderPassColorAttachment<'a>>] = storage
             .retain_boxed_slice(Box::new([
                 Some(wgpu::RenderPassColorAttachment {
@@ -607,7 +619,7 @@ impl RenderPass for GBufferPass {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: open(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 }),
@@ -616,7 +628,7 @@ impl RenderPass for GBufferPass {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: open(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 }),
@@ -625,7 +637,7 @@ impl RenderPass for GBufferPass {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: open(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 }),
@@ -634,7 +646,7 @@ impl RenderPass for GBufferPass {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: open(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 }),
@@ -643,7 +655,7 @@ impl RenderPass for GBufferPass {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(helio_frame_api::gbuffer::SURFACE_CLEAR),
+                        load: open(helio_frame_api::gbuffer::SURFACE_CLEAR),
                         store: wgpu::StoreOp::Store,
                     },
                 }),
@@ -652,7 +664,7 @@ impl RenderPass for GBufferPass {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: open(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 }),
@@ -661,7 +673,7 @@ impl RenderPass for GBufferPass {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: open(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 }),
@@ -670,7 +682,7 @@ impl RenderPass for GBufferPass {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: open(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 }),
@@ -681,7 +693,11 @@ impl RenderPass for GBufferPass {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(helio_core::depth::CLEAR),
+                    load: if inline {
+                        wgpu::LoadOp::Load
+                    } else {
+                        wgpu::LoadOp::Clear(helio_core::depth::CLEAR)
+                    },
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -1205,16 +1221,18 @@ impl GBufferPass {
                     fragment: Some(wgpu::FragmentState {
                         module,
                         entry_point: Some("fs_main"),
-                        compilation_options: Default::default(),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants: &[(
+                                helio_frame_api::view::CLIP_CONSTANT,
+                                if self.view.clipped { 1.0 } else { 0.0 },
+                            )],
+                            ..Default::default()
+                        },
                         targets: &helio_frame_api::gbuffer::color_targets(),
                     }),
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleList,
-                        front_face: if self.mirrored_view {
-                            wgpu::FrontFace::Cw
-                        } else {
-                            wgpu::FrontFace::Ccw
-                        },
+                        front_face: self.view.front_face(),
                         cull_mode: if wireframe
                             || key.feature_flags & helio_mats::FLAG_DOUBLE_SIDED != 0
                         {

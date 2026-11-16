@@ -77,6 +77,8 @@ pub struct ForwardLitPass {
     /// When true, renders the opaque draw segments (all opaque draws)
     /// instead of the forward ones (only FLAG_FORWARD_SHADING).
     pub render_all_opaque: bool,
+    /// The view the pass draws (`helio_core::view`): its winding and clip.
+    pub view: helio_core::ViewDescription,
 }
 
 impl ForwardLitPass {
@@ -218,6 +220,7 @@ impl ForwardLitPass {
             }),
             surface_format,
             render_all_opaque: false,
+            view: helio_core::ViewDescription::PRIMARY,
         }
     }
 
@@ -319,7 +322,13 @@ impl ForwardLitPass {
                     fragment: Some(wgpu::FragmentState {
                         module,
                         entry_point: Some("fs_main"),
-                        compilation_options: Default::default(),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants: &[(
+                                helio_frame_api::view::CLIP_CONSTANT,
+                                if self.view.clipped { 1.0 } else { 0.0 },
+                            )],
+                            ..Default::default()
+                        },
                         targets: &[Some(wgpu::ColorTargetState {
                             format: self.surface_format,
                             blend: if write_depth {
@@ -339,6 +348,7 @@ impl ForwardLitPass {
                     }),
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleList,
+                        front_face: self.view.front_face(),
                         cull_mode: if key.feature_flags & helio_mats::FLAG_DOUBLE_SIDED != 0 {
                             None
                         } else {
@@ -434,7 +444,10 @@ impl RenderPass for ForwardLitPass {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth,
                 depth_ops: Some(wgpu::Operations {
-                    load: if self.render_all_opaque {
+                    // An inline view's depth holds its mask: it loads it.
+                    load: if self.render_all_opaque
+                        && self.view.kind != helio_core::ViewKind::Inline
+                    {
                         wgpu::LoadOp::Clear(helio_core::depth::CLEAR)
                     } else {
                         wgpu::LoadOp::Load

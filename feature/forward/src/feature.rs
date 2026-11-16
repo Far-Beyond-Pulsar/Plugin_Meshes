@@ -35,6 +35,7 @@ impl Feature for ForwardDrawers {
                     }
                     let mut pass = ForwardLitPass::new(build.env.device, build.env.scene_format());
                     pass.render_all_opaque = true;
+                    pass.view = helio_frame_api::view::view_of(build.env);
                     build.graph.add_pass(Box::new(pass));
                     Ok(())
                 },

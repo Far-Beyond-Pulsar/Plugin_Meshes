@@ -194,7 +194,7 @@ fn vg_shade(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_inde
     // Debug views (cluster/triangle ids included) are written by `vg_debug.wgsl`
     // after this pass, only while one is selected.
     textureStore(out_albedo, px, vec4<f32>(surface.albedo.rgb, surface.alpha));
-    textureStore(out_normal, px, vec4<f32>(surface.normal, surface.specular_f0.r));
+    textureStore(out_normal, px, vec4<f32>(helio_view_normal(cameras[0], surface.normal), surface.specular_f0.r));
     textureStore(out_orm, px, vec4<f32>(surface.ao, surface.roughness, surface.metallic, surface.specular_f0.g));
     textureStore(out_emissive, px, vec4<f32>(surface.emissive, surface.specular_f0.b));
     textureStore(out_sss, px, vec4<f32>(surface.subsurface_color, surface.subsurface_radius));

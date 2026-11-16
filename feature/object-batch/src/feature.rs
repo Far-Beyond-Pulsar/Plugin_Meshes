@@ -35,6 +35,7 @@ impl Feature for ObjectBatchFeature {
                     Ok(())
                 },
             )
+            .once_per_frame()
             .in_slot(Slot::Prepare, -100),
         );
     }
