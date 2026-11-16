@@ -83,6 +83,9 @@ struct MeshJoinUniforms {
 // (`MeshMaterialRows`), a range of `material_rows`.
 @group(0) @binding(17) var<storage, read> material_row_handles: array<Handle>;
 @group(0) @binding(18) var<storage, read> material_rows: array<u32>;
+// Per object row: its owner entity plus one (`helio_mesh_api::STATIC_OBJECT_OWNERS`),
+// zero for a row nothing placed.
+@group(0) @binding(19) var<storage, read_write> owners_out: array<u32>;
 
 /// The owner entity of instance `row` when the instance should draw, else
 /// `NO_OWNER`: attached and enabled, its recorded owner generation matches
@@ -249,5 +252,8 @@ fn cs_join_meshes(@builtin(global_invocation_id) gid: vec3<u32>) {
             palette.count / 2u,
             s,
         );
+        if slot < arrayLength(&owners_out) {
+            owners_out[slot] = owner + 1u;
+        }
     }
 }
