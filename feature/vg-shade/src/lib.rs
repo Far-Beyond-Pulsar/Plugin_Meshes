@@ -178,7 +178,9 @@ pub mod shader_source {
         if bindless {
             return src.replace(
                 "textureSample(scene_textures[slot.texture_index], scene_sampler, uv)",
-                &format!("textureSampleGrad(scene_textures[slot.texture_index], scene_sampler, {GRAD})"),
+                &format!(
+                    "textureSampleGrad(scene_textures[slot.texture_index], scene_sampler, {GRAD})"
+                ),
             );
         }
         let mut out = src.to_string();

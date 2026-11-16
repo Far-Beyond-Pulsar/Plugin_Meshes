@@ -23,7 +23,7 @@ use helio_mesh_api::{
     PORTAL_OCCURRENCES,
 };
 
-use crate::{buffer_entry, storage_layout_entry, RangeCompaction, RangeCompactParams};
+use crate::{buffer_entry, storage_layout_entry, RangeCompactParams, RangeCompaction};
 
 /// `portal_occurrences.wgsl`'s `OccurrenceParams`.
 #[repr(C)]
@@ -170,9 +170,24 @@ impl PortalOccurrencePass {
             indirect: storage_buffer(device, "PortalOccurrences Indirect", 20, true),
             compacted: storage_buffer(device, "PortalOccurrences Compacted", 20, true),
             draw_counts: storage_buffer(device, "PortalOccurrences Range Counts", 16, true),
-            instances: storage_buffer(device, "PortalOccurrences Instances", capacity as u64 * 4, false),
-            chains: storage_buffer(device, "PortalOccurrences Chains", capacity as u64 * 4, false),
-            segment_indirect: storage_buffer(device, "PortalOccurrences Segment Indirect", 20, true),
+            instances: storage_buffer(
+                device,
+                "PortalOccurrences Instances",
+                capacity as u64 * 4,
+                false,
+            ),
+            chains: storage_buffer(
+                device,
+                "PortalOccurrences Chains",
+                capacity as u64 * 4,
+                false,
+            ),
+            segment_indirect: storage_buffer(
+                device,
+                "PortalOccurrences Segment Indirect",
+                20,
+                true,
+            ),
             segment_counts: storage_buffer(device, "PortalOccurrences Segment Counts", 4, true),
             totals: storage_buffer(device, "PortalOccurrences Totals", 16, false),
             capacity,
@@ -187,12 +202,20 @@ impl PortalOccurrencePass {
 
     /// Sizes the per-group buffers for `groups` and the segment buffers as
     /// the occlusion cull's.
-    fn fit(&mut self, device: &wgpu::Device, groups: u32, culled: &CulledBatchFrameData<'_>, batch: &ObjectBatchFrameData<'_>) {
+    fn fit(
+        &mut self,
+        device: &wgpu::Device,
+        groups: u32,
+        culled: &CulledBatchFrameData<'_>,
+        batch: &ObjectBatchFrameData<'_>,
+    ) {
         if groups > self.group_capacity {
             self.group_capacity = groups.next_power_of_two();
             let n = self.group_capacity as u64;
-            self.group_counts = storage_buffer(device, "PortalOccurrences Group Counts", n * 4, false);
-            self.group_cursors = storage_buffer(device, "PortalOccurrences Group Cursors", n * 4, false);
+            self.group_counts =
+                storage_buffer(device, "PortalOccurrences Group Counts", n * 4, false);
+            self.group_cursors =
+                storage_buffer(device, "PortalOccurrences Group Cursors", n * 4, false);
             self.indirect = storage_buffer(device, "PortalOccurrences Indirect", n * 20, true);
             self.compacted = storage_buffer(device, "PortalOccurrences Compacted", n * 20, true);
         }
@@ -201,13 +224,27 @@ impl PortalOccurrencePass {
                 *buffer = storage_buffer(device, label, size, true);
             }
         };
-        fit(&mut self.draw_counts, batch.draw_counts_gpu.size(), "PortalOccurrences Range Counts");
-        fit(&mut self.segment_indirect, culled.segments.indirect.size(), "PortalOccurrences Segment Indirect");
+        fit(
+            &mut self.draw_counts,
+            batch.draw_counts_gpu.size(),
+            "PortalOccurrences Range Counts",
+        );
+        fit(
+            &mut self.segment_indirect,
+            culled.segments.indirect.size(),
+            "PortalOccurrences Segment Indirect",
+        );
         let counts = culled
             .segments
             .counts
-            .map_or((culled.segments.segments.len().max(1) * 4) as u64, |b| b.size());
-        fit(&mut self.segment_counts, counts, "PortalOccurrences Segment Counts");
+            .map_or((culled.segments.segments.len().max(1) * 4) as u64, |b| {
+                b.size()
+            });
+        fit(
+            &mut self.segment_counts,
+            counts,
+            "PortalOccurrences Segment Counts",
+        );
     }
 
     /// Grows the occurrence buffers to hold `total`.
@@ -341,29 +378,32 @@ impl RenderPass for PortalOccurrencePass {
         ) else {
             return Ok(());
         };
-        self.fit(&ctx.device, self.draw_capacity, &culled, &batch);
-        let group = self.bind_group.get_or_create(
-            &ctx.device,
-            &wgpu::BindGroupDescriptor {
-                label: Some("PortalOccurrences BG"),
-                layout: &self.layout,
-                entries: &[
-                    buffer_entry(0, &self.params),
-                    buffer_entry(1, batch.instances),
-                    buffer_entry(2, batch.draw_calls),
-                    buffer_entry(3, spaces.coordinate_spaces),
-                    buffer_entry(4, chains),
-                    buffer_entry(5, stages),
-                    buffer_entry(6, batch.draw_counts_gpu),
-                    buffer_entry(7, &self.group_counts),
-                    buffer_entry(8, &self.group_cursors),
-                    buffer_entry(9, &self.instances),
-                    buffer_entry(10, &self.chains),
-                    buffer_entry(11, &self.indirect),
-                    buffer_entry(12, &self.totals),
-                ],
-            },
-        ).clone();
+        self.fit(ctx.device, self.draw_capacity, &culled, &batch);
+        let group = self
+            .bind_group
+            .get_or_create(
+                ctx.device,
+                &wgpu::BindGroupDescriptor {
+                    label: Some("PortalOccurrences BG"),
+                    layout: &self.layout,
+                    entries: &[
+                        buffer_entry(0, &self.params),
+                        buffer_entry(1, batch.instances),
+                        buffer_entry(2, batch.draw_calls),
+                        buffer_entry(3, spaces.coordinate_spaces),
+                        buffer_entry(4, chains),
+                        buffer_entry(5, stages),
+                        buffer_entry(6, batch.draw_counts_gpu),
+                        buffer_entry(7, &self.group_counts),
+                        buffer_entry(8, &self.group_cursors),
+                        buffer_entry(9, &self.instances),
+                        buffer_entry(10, &self.chains),
+                        buffer_entry(11, &self.indirect),
+                        buffer_entry(12, &self.totals),
+                    ],
+                },
+            )
+            .clone();
         let rows = self.draw_capacity.div_ceil(GROUPS_PER_ROW);
         let across = self.draw_capacity.min(GROUPS_PER_ROW);
         {
@@ -387,7 +427,7 @@ impl RenderPass for PortalOccurrencePass {
             }
             // The total, read back next frame to grow the buffers.
             if self.readback.is_none() {
-                let buffer = self.readbacks.get(&ctx.device, 4);
+                let buffer = self.readbacks.get(ctx.device, 4);
                 cmds.copy_buffer_to_buffer(&self.totals, 0, &buffer, 0, 4);
                 self.readback = Some((buffer, Arc::new(AtomicBool::new(false)), false));
             }
@@ -398,7 +438,7 @@ impl RenderPass for PortalOccurrencePass {
             let compaction_group = self
                 .compaction
                 .bind_group(
-                    &ctx.device,
+                    ctx.device,
                     &mut self.compaction_group,
                     [
                         &self.indirect,
@@ -437,7 +477,8 @@ impl RenderPass for PortalOccurrencePass {
         };
         // SAFETY: the buffers are this pass's, owned by the graph past the
         // frame's registry, as the occlusion cull's publication.
-        let own = |buffer: &wgpu::Buffer| -> &'a wgpu::Buffer { unsafe { std::mem::transmute(buffer) } };
+        let own =
+            |buffer: &wgpu::Buffer| -> &'a wgpu::Buffer { unsafe { std::mem::transmute(buffer) } };
         frame.write(
             helio_core::ResourceKey::new(PORTAL_OCCURRENCES),
             PortalOccurrenceFrameData {

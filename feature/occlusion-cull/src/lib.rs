@@ -360,7 +360,13 @@ impl SegmentTable {
                 self.keys
                     .segments
                     .iter()
-                    .map(|s| (s.material_class, s.graph_hash, s.bucket as u32, s.first, s.capacity))
+                    .map(|s| (
+                        s.material_class,
+                        s.graph_hash,
+                        s.bucket as u32,
+                        s.first,
+                        s.capacity
+                    ))
                     .collect::<Vec<_>>()
             );
         }

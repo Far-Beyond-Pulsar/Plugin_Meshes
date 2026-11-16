@@ -36,10 +36,7 @@ impl Feature for MeshCulling {
                 CATEGORY,
                 "Prepares the indirect dispatch arguments the culling passes use.",
                 |build| {
-                    let pass = IndirectDispatchPass::new(
-                        build.env.device,
-                        build.env.stats,
-                    );
+                    let pass = IndirectDispatchPass::new(build.env.device, build.env.stats);
                     build.graph.add_pass(Box::new(pass));
                     Ok(())
                 },
@@ -60,13 +57,8 @@ impl Feature for MeshCulling {
                         .find_pass::<HiZBuildPass>()
                         .map(|hiz| Arc::clone(&hiz.hiz_sampler))
                         .ok_or_else(|| missing("Occlusion Cull", "Hi-Z Build"))?;
-                    let pass = OcclusionCullPass::new(
-                        build.env.device,
-                        sampler,
-                        iw,
-                        ih,
-                        build.env.stats,
-                    );
+                    let pass =
+                        OcclusionCullPass::new(build.env.device, sampler, iw, ih, build.env.stats);
                     build.graph.add_pass(Box::new(pass));
                     Ok(())
                 },

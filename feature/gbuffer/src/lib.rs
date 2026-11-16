@@ -446,7 +446,6 @@ impl GBufferPass {
     pub fn timing_query(&self) -> Option<&wgpu::QuerySet> {
         self.timing_query.as_ref()
     }
-
 }
 
 impl RenderPass for GBufferPass {
@@ -678,7 +677,11 @@ impl RenderPass for GBufferPass {
                 }),
             ]));
         Some(wgpu::RenderPassDescriptor {
-            label: Some(if loads { "GBuffer Portal Occurrences" } else { "GBuffer" }),
+            label: Some(if loads {
+                "GBuffer Portal Occurrences"
+            } else {
+                "GBuffer"
+            }),
             color_attachments,
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth,
@@ -793,17 +796,19 @@ impl RenderPass for GBufferPass {
         // the portal chains (with the chains' group).
         let (compacted_indices, indirect, segments, occurrence_group) =
             if let Some(occurrences) = self.occurrences.as_mut() {
-                let Some(found) = ctx.registry.get::<helio_mesh_api::PortalOccurrenceFrameData<'_>>(
-                    helio_core::ResourceKey::new(helio_mesh_api::PORTAL_OCCURRENCES),
-                ) else {
+                let Some(found) = ctx
+                    .registry
+                    .get::<helio_mesh_api::PortalOccurrenceFrameData<'_>>(
+                        helio_core::ResourceKey::new(helio_mesh_api::PORTAL_OCCURRENCES),
+                    )
+                else {
                     return Ok(());
                 };
                 let (Some(chains), Some(stages), Some(mask)) = (
                     ctx.registry.buffer_binding(helio_portal_api::PORTAL_CHAINS),
                     ctx.registry.buffer_binding(helio_portal_api::PORTAL_STAGES),
-                    ctx.registry.texture_view(helio_core::ResourceKey::new(
-                        helio_portal_api::PORTAL_MASK,
-                    )),
+                    ctx.registry
+                        .texture_view(helio_core::ResourceKey::new(helio_portal_api::PORTAL_MASK)),
                 ) else {
                     return Ok(());
                 };
@@ -842,7 +847,12 @@ impl RenderPass for GBufferPass {
                 ) else {
                     return Ok(());
                 };
-                (culled.compacted_indices, culled.indirect, culled.segments, None)
+                (
+                    culled.compacted_indices,
+                    culled.indirect,
+                    culled.segments,
+                    None,
+                )
             };
         let (max_draws, draw_count) = batch.all_draws();
         if max_draws == 0 {
@@ -1162,7 +1172,11 @@ impl GBufferPass {
                     .expect("Default PBR template (class 0) missing")
             };
             let (layout, vertex_entry, fragment_entry) = match self.occurrences.as_ref() {
-                Some(occurrences) => (&occurrences.pipeline_layout, "vs_occurrence", "fs_occurrence"),
+                Some(occurrences) => (
+                    &occurrences.pipeline_layout,
+                    "vs_occurrence",
+                    "fs_occurrence",
+                ),
                 None => (&self.pipeline_layout, "vs_main", "fs_main"),
             };
             let module = self.shader_cache.get_or_compile(
