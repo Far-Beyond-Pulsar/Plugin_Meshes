@@ -407,7 +407,9 @@ impl VgRaster {
     /// with [`optional_features`] and `config.force_tile_fallback` is false.
     pub fn new(device: &wgpu::Device, config: VgRasterConfig) -> Self {
         let int64 = supports_int64_atomics(device.features()) && !config.force_tile_fallback;
-        let v = wgpu::ShaderStages::VERTEX;
+        // Tier 1's fragment stage reads the camera too (a clipped view's
+        // plane, `vg_view_clipped`).
+        let v = wgpu::ShaderStages::VERTEX_FRAGMENT;
         let c = wgpu::ShaderStages::COMPUTE;
         let group0 = |vis| {
             let mut e: Vec<_> = (0..6).map(|b| storage_entry(b, vis, true)).collect();
