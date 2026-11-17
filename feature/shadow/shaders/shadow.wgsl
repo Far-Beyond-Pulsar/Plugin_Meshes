@@ -1,4 +1,5 @@
 //!use shadow_atlas
+//!use mesh_skinning
 // Shadow caster pass — depth-only, GPU-driven.
 //
 // Vertex shader projects world-space geometry into each light's clip space using
@@ -95,7 +96,6 @@ fn sphere_pages(m: mat4x4f, center: vec3f, radius: f32) -> vec2u {
     }
     return vec2u(lo, hi);
 }
-struct SkinVertex { joints: vec4<u32>, weights: vec4<f32> }
 @group(0) @binding(5) var<storage, read> skin_vertices: array<SkinVertex>;
 @group(0) @binding(6) var<storage, read> bone_palette: array<mat4x4<f32>>;
 
@@ -119,19 +119,7 @@ fn vs_main(
     // `_pad0` is the dirty bit this layer is gated on (1 dynamic, 2 static); 0 draws unconditionally.
     if face._pad0 != 0u && (face_dirty[face.value] & face._pad0) == 0u { return ShadowVertex(vec4f(2,2,2,1), uv, 0u); }
     let inst  = instances[slot];
-    var local_position = position;
-    if inst.bone_palette_count > 0u {
-        let skin = skin_vertices[vertex_index + inst.skin_vertex_offset];
-        var blended = mat4x4<f32>(vec4f(0.0), vec4f(0.0), vec4f(0.0), vec4f(0.0));
-        var total = 0.0;
-        for (var i = 0u; i < 4u; i = i + 1u) {
-            if skin.weights[i] > 0.0 && skin.joints[i] < inst.bone_palette_count {
-                blended += bone_palette[inst.bone_palette_offset + skin.joints[i]] * skin.weights[i];
-                total += skin.weights[i];
-            }
-        }
-        if total > 0.00001 { local_position = (blended * (1.0 / total) * vec4f(position, 1.0)).xyz; }
-    }
+    let local_position = mesh_skinned_position(inst, position, vertex_index);
     let space = coordinate_spaces[(inst.flags >> 8u) & 0xFFu];
     if face._pad0 == 1u {
         // Redrawing only the dirty pages of the dynamic layer: a caster whose

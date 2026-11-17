@@ -60,6 +60,14 @@ pub const RAY_SURFACE_SNIPPET: helio_core::shader::ShaderSnippet =
 pub const DRAW_ROWS_SNIPPET: helio_core::shader::ShaderSnippet =
     helio_core::wgsl_snippet!("//!use mesh_draw_rows", "shaders/draw_rows.wgsl");
 
+/// The meshes' skinning in WGSL (`//!use mesh_skinning`): `SkinVertex` and
+/// `mesh_skinned_position`, a skinned instance's vertex position blended from
+/// the palette. The includer binds `skin_vertices` ([`SKIN_VERTICES`]) and
+/// `bone_palette` ([`BONE_PALETTE`]) and declares `GpuInstanceData`
+/// ([`DRAW_ROWS_SNIPPET`]).
+pub const SKINNING_SNIPPET: helio_core::shader::ShaderSnippet =
+    helio_core::wgsl_snippet!("//!use mesh_skinning", "shaders/skinning.wgsl");
+
 /// Graph key of the rows that follow the frame's TLAS instance order, a
 /// [`RayInstance`] an instance.
 pub const RAY_INSTANCES: &str = "ray_instances";
