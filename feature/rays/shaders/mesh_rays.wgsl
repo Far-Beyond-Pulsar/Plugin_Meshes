@@ -190,7 +190,7 @@ fn mesh_rays_nearest(@builtin(global_invocation_id) id: vec3<u32>) {
     // interpolated normal turns away (a silhouette's grazing hit).
     let n = select(face, shading, dot(shading, ray.dir) < 0.0);
     // A hit at the origin itself is still a hit (t 0 means none).
-    hits[id.x] = scene_hit(trace.info.y, max(c.t, 1e-6), inside, ray_row(c), c.primitive_index, pack2x16unorm(c.barycentrics));
+    hits[id.x] = scene_nearest(trace.info.y, max(c.t, 1e-6), inside, ray_row(c), c.primitive_index, pack2x16unorm(c.barycentrics));
     let material = material_of(instance.material);
     let metallic = select(0.0, material.roughness_metallic.y, material.workflow == MATERIAL_WORKFLOW_METALLIC);
     surfaces[id.x] = scene_surface(
