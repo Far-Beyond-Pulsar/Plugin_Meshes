@@ -22,12 +22,9 @@
 //! has no sky and no GI probes; the background colour and the ambient
 //! light stand in.
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera,
-    HelioAction, HelioCommandBridge, PerfOverlayMode, Renderer, RendererBuilder, RendererConfig,
-};
+use helio::{Camera, HelioAction, HelioCommandBridge, Renderer, RendererBuilder, RendererConfig};
 use helio_bake::BakeConfig;
 use pulsar_scenedb::{Entity, SceneDb};
 use v3_demo_common::{
@@ -105,7 +102,6 @@ struct AppState {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
     surface_format: wgpu::TextureFormat,
     renderer: Arc<Mutex<Renderer>>,
     action_rx: Receiver<HelioAction>,
@@ -148,7 +144,6 @@ struct AppState {
 
     // Debug
     debug_mode: u32,
-    perf_overlay_mode: PerfOverlayMode,
     debug_overlay_enabled: bool,
 
     // Scene state
@@ -194,7 +189,6 @@ impl ApplicationHandler for App {
         let device = graphics.device.clone();
         let queue = graphics.queue.clone();
         let format = graphics.surface_config.format;
-        let surface_format = format;
 
         let config = RendererConfig::new(size.width, size.height, format)
             .with_feature(helio_light_api::ShadowSettings {
@@ -567,7 +561,6 @@ impl ApplicationHandler for App {
             window,
             surface,
             device,
-            queue,
             surface_format: format,
             renderer,
             action_rx,
@@ -600,7 +593,6 @@ impl ApplicationHandler for App {
             cursor_grabbed: false,
             mouse_delta: (0.0, 0.0),
             debug_mode: 0,
-            perf_overlay_mode: PerfOverlayMode::Disabled,
             debug_overlay_enabled: false,
             chandelier_light_ids,
             candle_light_ids,

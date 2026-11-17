@@ -1,6 +1,6 @@
 //! Embedded FBX showcase using the `helio` wrapper.
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -8,10 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glam::Vec3;
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera, Renderer,
-    RendererBuilder, RendererConfig,
-};
+use helio::{Camera, Renderer, RendererBuilder, RendererConfig};
 use helio_asset_compat::{load_scene_bytes_with_config, AssetError, ConvertedScene, LoadConfig};
 use pulsar_scenedb::{SceneDb, World};
 use v3_demo_common::{
@@ -252,7 +249,6 @@ struct AppState {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
     surface_format: wgpu::TextureFormat,
     renderer: Renderer,
     scene_db: SceneDb,
@@ -382,7 +378,6 @@ impl ApplicationHandler for App {
                     window,
                     surface,
                     device,
-                    queue,
                     surface_format,
                     renderer,
                     scene_db,
@@ -436,7 +431,6 @@ impl ApplicationHandler for App {
             window,
             surface,
             device,
-            queue,
             surface_format,
             renderer,
             scene_db,

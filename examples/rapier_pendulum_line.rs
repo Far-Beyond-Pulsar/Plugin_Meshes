@@ -7,7 +7,7 @@
 //!   WASD / Space / Shift — fly camera
 //!   Escape — release cursor / exit
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 use pulsar_scenedb::{Entity, SceneDb};
 use v3_demo_common::{
     box_mesh, despawn_object, make_material, new_scene_db_with_gpu_mirror, plane_mesh, point_light,
@@ -15,10 +15,7 @@ use v3_demo_common::{
     spawn_object_with_movability, update_object_transform,
 };
 
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera, Renderer,
-    RendererBuilder, RendererConfig,
-};
+use helio::{Camera, Renderer, RendererBuilder, RendererConfig};
 use rapier3d::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -116,7 +113,6 @@ impl ApplicationHandler for App {
         let device = graphics.device.clone();
         let queue = graphics.queue.clone();
         let format = graphics.surface_config.format;
-        let surface_format = format;
         let fmt = format;
 
         let config = RendererConfig::new(size.width, size.height, fmt);
@@ -378,7 +374,6 @@ impl AppState {
         let seg_length = 1.0;
 
         let mut parent_handle = pivot_handle;
-        let mut last_body_handle = pivot_handle;
 
         for i in 0..chain_length {
             // Start horizontal at height 18.0 and extend along +X, so gravity will swing the chain.
@@ -426,7 +421,6 @@ impl AppState {
                 collider_handle,
             });
             parent_handle = body_handle;
-            last_body_handle = body_handle;
         }
 
         let ground_body = RigidBodyBuilder::fixed()

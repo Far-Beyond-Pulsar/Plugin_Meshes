@@ -15,11 +15,8 @@
 //!   Mouse drag  — look around (click to grab cursor)
 //!   Escape      — release cursor / exit
 
-mod v3_demo_common;
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera, Renderer,
-    RendererBuilder, RendererConfig,
-};
+use helio::{Camera, Renderer, RendererBuilder, RendererConfig};
+use meshes_examples::v3_demo_common;
 use pulsar_scenedb::{Entity, SceneDb};
 use v3_demo_common::{
     box_mesh, cube_mesh, directional_light, make_material, new_scene_db_with_gpu_mirror,
@@ -160,7 +157,6 @@ impl ApplicationHandler for App {
         let device = graphics.device.clone();
         let queue = graphics.queue.clone();
         let format = graphics.surface_config.format;
-        let surface_format = format;
 
         let config = RendererConfig::new(size.width, size.height, format);
         let mut scene_db = new_scene_db_with_gpu_mirror(&device, &queue);

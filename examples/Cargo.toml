@@ -14,6 +14,10 @@ flate2 = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
 serde_json = { workspace = true }
 
+# The helpers the examples and GPU tests share (`lib.rs`).
+[lib]
+path = "lib.rs"
+
 [[bin]]
 name = "render_v2_basic"
 path = "render_v2_basic.rs"

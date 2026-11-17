@@ -59,10 +59,10 @@
 
 #![allow(dead_code)]
 
-mod architectural_mesh;
+use meshes_examples::architectural_mesh;
 mod cathedral_large;
-mod hlfs_capture;
-mod v3_demo_common;
+use meshes_examples::hlfs_capture;
+use meshes_examples::v3_demo_common;
 
 use glam::{Mat4, Quat, Vec3};
 use helio::{Camera, Renderer, RendererBuilder, RendererConfig};

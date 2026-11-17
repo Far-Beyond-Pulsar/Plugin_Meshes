@@ -11,12 +11,9 @@
 //!   Mouse drag  — look around (click to grab cursor)
 //!   Escape      — release cursor / exit
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera, Renderer,
-    RendererBuilder, RendererConfig,
-};
+use helio::{Camera, Renderer, RendererBuilder, RendererConfig};
 use helio_core::texture_mips::{mip_chain, TexelKind};
 use pulsar_scenedb::SceneDb;
 use v3_demo_common::{
@@ -165,7 +162,6 @@ struct AppState {
     renderer: Renderer,
     scene_db: SceneDb,
     last_frame: std::time::Instant,
-    start_time: std::time::Instant,
 
     cam_pos: glam::Vec3,
     cam_yaw: f32,
@@ -345,7 +341,6 @@ impl ApplicationHandler for App {
             renderer,
             scene_db,
             last_frame: std::time::Instant::now(),
-            start_time: std::time::Instant::now(),
             cam_pos: glam::Vec3::new(0.0, 50.0, 120.0),
             cam_yaw: 0.0,
             cam_pitch: -0.35,

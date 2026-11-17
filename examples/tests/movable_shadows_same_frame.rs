@@ -6,9 +6,7 @@
 //! caster count as read back on the CPU, two or more frames late: a new
 //! caster's shadow appeared late, and a removed one's shadow lingered.
 
-#[path = "../v3_demo_common.rs"]
-#[allow(dead_code)]
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 use glam::{Mat4, Vec3};
 use helio::{Camera, Movability, RendererBuilder, RendererConfig};

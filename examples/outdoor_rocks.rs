@@ -15,7 +15,7 @@
 //!   Escape      — release cursor / exit
 //!   F3          — toggle triangle debug view
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -23,10 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{EulerRot, Mat4, Quat, Vec3};
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera, Renderer,
-    RendererBuilder, RendererConfig,
-};
+use helio::{Camera, Renderer, RendererBuilder, RendererConfig};
 use helio_asset_compat::{load_scene_bytes_with_config, load_scene_file_with_config, LoadConfig};
 use pulsar_scenedb::SceneDb;
 use v3_demo_common::{
@@ -91,7 +88,6 @@ struct AppState {
     surface_format: wgpu::TextureFormat,
     renderer: Renderer,
     last_frame: Instant,
-    start_time: Instant,
 
     cam_pos: Vec3,
     cam_yaw: f32,
@@ -333,7 +329,6 @@ impl ApplicationHandler for App {
                 let transform = Mat4::from_scale_rotation_translation(scale, rot, pos);
 
                 // World-space bounding sphere used for instance-level culling.
-                let center = pos + Vec3::Y * scale.y * 0.5;
                 let bounds_radius = base_scale * 1.2;
 
                 if _global_rock_idx % BILLBOARD_EVERY_N == 0 {
@@ -443,7 +438,6 @@ impl ApplicationHandler for App {
             surface_format,
             renderer,
             last_frame: Instant::now(),
-            start_time: Instant::now(),
             cam_pos: Vec3::new(0.0, 12.0, 50.0),
             cam_yaw: 0.0,
             cam_pitch: -0.18,
@@ -585,7 +579,6 @@ impl ApplicationHandler for App {
                 let frame_start = Instant::now();
                 let now = frame_start;
                 let dt = now.duration_since(state.last_frame).as_secs_f32().min(0.05);
-                let t = now.duration_since(state.start_time).as_secs_f32();
                 state.last_frame = now;
 
                 // ── Sun rotation ──────────────────────────────────────────

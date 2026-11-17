@@ -25,13 +25,12 @@
 //!   Left stick  — move (XR)
 //!   Right stick — turn (XR)
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 use helio::{
     Camera, HelioAction, HelioCommandBridge, HelioGraphicsConfig, HelioGraphicsContext,
     HelioXrInput, Renderer, RendererBuilder, RendererConfig,
 };
-use helio_pass_postprocess::PostProcessPass;
 use helio_pass_postprocess::PostProcessSettings;
 use pulsar_scenedb::{Entity, SceneDb, World};
 use v3_demo_common::{
@@ -535,7 +534,7 @@ impl FlickerLight {
     /// matter (a full phase change, a toggle, or a blip).
     fn update(&mut self, world: &mut World, dt: f32) {
         self.phase_timer -= dt;
-        let mut ratio = self.last_ratio;
+        let mut ratio: f32;
         let mut force_apply = false;
 
         match self.phase {
@@ -683,8 +682,6 @@ struct App {
 struct AppState {
     window: Arc<Window>,
     graphics: HelioGraphicsContext<'static>,
-    device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
     renderer: Arc<Mutex<Renderer>>,
     scene_db: SceneDb,
     action_rx: Receiver<HelioAction>,
@@ -1087,8 +1084,6 @@ impl ApplicationHandler for App {
         let state = AppState {
             window,
             graphics,
-            device,
-            queue,
             renderer,
             scene_db,
             action_rx,

@@ -1,9 +1,7 @@
 //! The object-batch pass skips its pipeline while nothing it reads changes.
 //! A move after a run of skipped frames must still reach the image.
 
-#[path = "../v3_demo_common.rs"]
-#[allow(dead_code)]
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 use glam::{Mat4, Vec3};
 use helio::{Camera, RendererBuilder, RendererConfig};

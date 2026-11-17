@@ -144,12 +144,12 @@ fn view(rng: &mut Rng, perspective: bool) -> Mat4 {
         rng.range(-5.0, 5.0),
     );
     let target = Vec3::new(rng.range(-2.0, 2.0), 0.0, rng.range(-2.0, 2.0));
-    let look = Mat4::look_at_rh(eye, target, Vec3::Y);
+    let look = glam::camera::rh::view::look_at_mat4(eye, target, Vec3::Y);
     let projection = if perspective {
-        Mat4::perspective_rh(rng.range(0.6, 1.6), 1.0, 0.1, 100.0)
+        glam::camera::rh::proj::directx::perspective(rng.range(0.6, 1.6), 1.0, 0.1, 100.0)
     } else {
         let half = rng.range(4.0, 14.0);
-        Mat4::orthographic_rh(-half, half, -half, half, 0.1, 100.0)
+        glam::camera::rh::proj::directx::orthographic(-half, half, -half, half, 0.1, 100.0)
     };
     projection * look
 }
@@ -224,8 +224,8 @@ fn page_masks_contain_every_point_of_the_sphere() {
 
 #[test]
 fn a_small_sphere_dirties_few_pages_and_a_huge_one_all() {
-    let matrix = Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0)
-        * Mat4::look_at_rh(Vec3::new(0.0, 0.0, 10.0), Vec3::ZERO, Vec3::Y);
+    let matrix = glam::camera::rh::proj::directx::perspective(1.0, 1.0, 0.1, 100.0)
+        * glam::camera::rh::view::look_at_mat4(Vec3::new(0.0, 0.0, 10.0), Vec3::ZERO, Vec3::Y);
     let cases = [
         Case {
             matrix: matrix.to_cols_array(),

@@ -10,7 +10,7 @@ use meshes_plugin as _;
 
 use std::sync::Arc;
 
-use engine_backend::scene::{SceneWorldExt, SpawnObject, Transform, Visibility, attachments};
+use engine_backend::scene::{SceneWorldExt, SpawnObject, Transform};
 use helio_component::components::ObjectMovability;
 use helio_pass_object_batch::scene_join::{
     BufferHandle, BufferKey, ENTITY_GENERATIONS_KEY, SceneBufferProjection, SceneDerivation,

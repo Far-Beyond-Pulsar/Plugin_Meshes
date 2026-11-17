@@ -69,10 +69,14 @@ pub fn render_features() -> helio_feature_api::FeatureSet {
 /// ([`host_part::MeshesHostPart`] configures first), and a setting already
 /// there is left alone.
 pub fn configure_renderer(mut config: helio::RendererConfig) -> helio::RendererConfig {
-    if config.features.get::<helio_vg_stream::VgSettings>().is_none() {
-        config.features.insert(helio_vg_stream::VgSettings::for_runtime(
-            probe_runtime(),
-        ));
+    if config
+        .features
+        .get::<helio_vg_stream::VgSettings>()
+        .is_none()
+    {
+        config
+            .features
+            .insert(helio_vg_stream::VgSettings::for_runtime(probe_runtime()));
     }
     config
 }

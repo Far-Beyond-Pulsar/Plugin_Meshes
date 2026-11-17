@@ -8,9 +8,7 @@
 //! with the materials plugin's feature and an authored row equal to the
 //! stand-in. The two frames must agree, and show the box.
 
-#[path = "../v3_demo_common.rs"]
-#[allow(dead_code)]
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 use glam::{Mat4, Vec3};
 use helio::{Camera, RendererBuilder, RendererConfig};

@@ -6,9 +6,7 @@
 //! frames late. When the layout shifted, a late table drew some groups with
 //! a neighbouring material's pipeline until the readback caught up.
 
-#[path = "../v3_demo_common.rs"]
-#[allow(dead_code)]
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 use glam::{Mat4, Vec3};
 use helio::{Camera, RendererBuilder, RendererConfig};

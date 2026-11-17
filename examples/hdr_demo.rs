@@ -10,12 +10,9 @@
 //!   H           — cycle HDR output mode
 //!   Escape      — release cursor / exit
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera,
-    HdrOutputMode, Renderer, RendererBuilder, RendererConfig,
-};
+use helio::{Camera, HdrOutputMode, Renderer, RendererBuilder, RendererConfig};
 use v3_demo_common::{
     cube_mesh, directional_light, make_material, new_scene_db_with_gpu_mirror, plane_mesh,
     point_light, scene_db_handle, spawn_light, spawn_material, spawn_mesh, spawn_object,
@@ -54,7 +51,6 @@ struct AppState {
     renderer: Renderer,
     scene_db: pulsar_scenedb::SceneDb,
     last_frame: std::time::Instant,
-    start_time: std::time::Instant,
 
     cam_pos: glam::Vec3,
     cam_yaw: f32,
@@ -212,7 +208,6 @@ impl ApplicationHandler for App {
             surface_format,
             renderer,
             last_frame: std::time::Instant::now(),
-            start_time: std::time::Instant::now(),
             cam_pos: glam::Vec3::new(0.0, 3.0, 6.0),
             cam_yaw: 0.0,
             cam_pitch: -0.3,
@@ -323,7 +318,6 @@ impl ApplicationHandler for App {
                 let now = std::time::Instant::now();
                 let dt = (now - state.last_frame).as_secs_f32().min(0.05);
                 state.last_frame = now;
-                let time = state.start_time.elapsed().as_secs_f32();
 
                 let speed = 5.0;
                 let (sy, cy) = state.cam_yaw.sin_cos();

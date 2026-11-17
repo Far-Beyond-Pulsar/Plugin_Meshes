@@ -2,9 +2,7 @@
 //! SceneDB holds, not a fixed 64, and must re-cull when lights move while the
 //! camera stays still.
 
-#[path = "../v3_demo_common.rs"]
-#[allow(dead_code)]
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 use glam::{Mat4, Vec3};
 use helio::{Camera, RendererBuilder, RendererConfig};
@@ -120,7 +118,7 @@ fn culling_covers_grown_light_buffers_and_follows_moving_lights() {
         0.1,
         100.0,
     );
-    let mut render = |scene_db: &pulsar_scenedb::SceneDb, renderer: &mut helio::Renderer| {
+    let render = |scene_db: &pulsar_scenedb::SceneDb, renderer: &mut helio::Renderer| {
         for _ in 0..3 {
             flush_scene_db(scene_db, &queue);
             renderer.render(&camera, &view).unwrap();

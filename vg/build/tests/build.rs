@@ -488,9 +488,6 @@ fn cone_is_conservative() {
             let d = page.decode_cluster(i as u32).unwrap();
             for eye in eyes {
                 let ctr = [c.sphere[0], c.sphere[1], c.sphere[2]];
-                let v = [ctr[0] - eye[0], ctr[1] - eye[1], ctr[2] - eye[2]];
-                let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-                let dp = v[0] * axis[0] + v[1] * axis[1] + v[2] * axis[2];
                 if helio_vg_format::cone_culled(eye, ctr, c.sphere[3], axis, cutoff) {
                     culled_any = true;
                     for t in &d.tris {

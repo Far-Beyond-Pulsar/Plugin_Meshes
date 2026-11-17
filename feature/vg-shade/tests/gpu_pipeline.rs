@@ -298,13 +298,6 @@ fn f16s(bytes: &[u8], pixel: usize) -> [f32; 4] {
     out
 }
 
-fn put_u32(page: &mut [u8], at: usize, v: u32) {
-    page[at..at + 4].copy_from_slice(&v.to_le_bytes());
-}
-fn put_f32(page: &mut [u8], at: usize, v: f32) {
-    page[at..at + 4].copy_from_slice(&v.to_le_bytes());
-}
-
 /// Attribute rows (16 B per vertex): normal (0,0,1) snorm8x4, tangent (1,0,0)
 /// with bitangent sign +, uv0 f16x2, uv1 zero.
 fn attr_rows(uv: [[u16; 2]; 3]) -> Vec<[u8; 16]> {

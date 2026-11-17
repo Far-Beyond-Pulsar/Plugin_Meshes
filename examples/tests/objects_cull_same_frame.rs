@@ -6,9 +6,7 @@
 //! draw group was then left unculled (so undrawn) until the readback caught
 //! up, and a removed one kept being drawn from stale records.
 
-#[path = "../v3_demo_common.rs"]
-#[allow(dead_code)]
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 use glam::{Mat4, Vec3};
 use helio::{Camera, RendererBuilder, RendererConfig};

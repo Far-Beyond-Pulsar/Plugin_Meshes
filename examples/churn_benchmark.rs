@@ -8,17 +8,14 @@
 //!   C                    — toggle object-object collisions on/off
 //!   Escape               — release cursor / exit
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 use v3_demo_common::{
     box_mesh, cube_mesh, despawn_object, make_material, new_scene_db_with_gpu_mirror, plane_mesh,
     point_light, scene_db_handle, spawn_light, spawn_material, spawn_mesh, spawn_object,
     spawn_object_with_movability, update_object_transform,
 };
 
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera, Renderer,
-    RendererBuilder, RendererConfig,
-};
+use helio::{Camera, Renderer, RendererBuilder, RendererConfig};
 use pulsar_scenedb::{Entity, SceneDb};
 use rapier3d::prelude::*;
 
@@ -43,8 +40,6 @@ struct SpawnedObject {
     seed: f32,
     speed: f32,
     scale: f32,
-    mesh: Entity,
-    material: Entity,
     body_handle: RigidBodyHandle,
     collider_handle: ColliderHandle,
 }
@@ -158,7 +153,6 @@ impl ApplicationHandler for App {
         let device = graphics.device.clone();
         let queue = graphics.queue.clone();
         let format = graphics.surface_config.format;
-        let surface_format = format;
         let fmt = format;
 
         let config = RendererConfig::new(size.width, size.height, fmt);
@@ -359,10 +353,7 @@ impl ApplicationHandler for App {
                 state.surface.configure(
                     &state.device,
                     &wgpu::SurfaceConfiguration {
-                        // COPY_SRC so the debug frame-dump (see dump_frame_png) can
-                        // read the actual presented swapchain texture back.
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                            | wgpu::TextureUsages::COPY_SRC,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                         format: state.surface_format,
                         width: s.width,
                         height: s.height,
@@ -478,8 +469,6 @@ impl AppState {
                     seed: self.rng.next_f32(0.0, std::f32::consts::TAU),
                     speed: self.rng.next_f32(0.4, 1.6),
                     scale,
-                    mesh,
-                    material,
                     body_handle,
                     collider_handle,
                 });
@@ -705,130 +694,6 @@ impl AppState {
                 dt * 1000.0
             );
         }
-    }
-}
-
-/// Debug capture: read the actual presented swapchain texture back to CPU
-/// and save it as a PNG. Deliberately reads the *final* output rather than
-/// an intermediate render-graph buffer (G-buffer albedo, depth, etc.):
-/// those are privately owned inside each pass crate (`Renderer` itself only
-/// holds `depth_texture` as a raw `wgpu::Texture`; everything else is a
-/// `wgpu::TextureView` handed out per-frame via `ResourceRegistry`, with no
-/// path back to the owning `Texture` `copy_texture_to_buffer` needs), so
-/// capturing them would mean adding a new debug-only trait method to
-/// `RenderPass` and implementing it pass-by-pass -- worth doing later if a
-/// specific intermediate stage needs inspecting, but the final frame
-/// already answers "does anything render at all" with zero engine changes
-/// beyond adding `COPY_SRC` to the surface's usage flags.
-///
-/// Blocks the calling thread until the GPU readback completes (a one-time
-/// debug capture, not a hot-path concern).
-fn dump_frame_png(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
-    format: wgpu::TextureFormat,
-    width: u32,
-    height: u32,
-    path: &std::path::Path,
-) {
-    let Some(bytes_per_pixel) = format.block_copy_size(None) else {
-        log::error!("dump_frame_png: unsupported (non-color) format {format:?}");
-        return;
-    };
-
-    let unpadded_bytes_per_row = width * bytes_per_pixel;
-    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
-    let buffer_size = (padded_bytes_per_row as u64) * (height as u64);
-
-    let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Debug Frame Dump Buffer"),
-        size: buffer_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("Debug Frame Dump Encoder"),
-    });
-    encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyBufferInfo {
-            buffer: &readback_buffer,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(padded_bytes_per_row),
-                rows_per_image: Some(height),
-            },
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    queue.submit([encoder.finish()]);
-
-    let slice = readback_buffer.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-    if let Err(e) = device.poll(wgpu::PollType::wait_indefinitely()) {
-        log::error!("dump_frame_png: device.poll failed: {e:?}");
-        return;
-    }
-    match rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            log::error!("dump_frame_png: buffer map failed: {e:?}");
-            return;
-        }
-        Err(e) => {
-            log::error!("dump_frame_png: map_async never signaled: {e:?}");
-            return;
-        }
-    }
-
-    let mapped = match slice.get_mapped_range() {
-        Ok(m) => m,
-        Err(e) => {
-            log::error!("dump_frame_png: get_mapped_range failed: {e:?}");
-            return;
-        }
-    };
-    let mut rgba = vec![0u8; (width * height * 4) as usize];
-    let is_bgra = matches!(
-        format,
-        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
-    );
-    for y in 0..height {
-        let row_start = (y * padded_bytes_per_row) as usize;
-        let src_row = &mapped[row_start..row_start + unpadded_bytes_per_row as usize];
-        let dst_row = &mut rgba[(y * width * 4) as usize..((y + 1) * width * 4) as usize];
-        if is_bgra {
-            for (src_px, dst_px) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
-                dst_px[0] = src_px[2];
-                dst_px[1] = src_px[1];
-                dst_px[2] = src_px[0];
-                dst_px[3] = src_px[3];
-            }
-        } else {
-            dst_row.copy_from_slice(&src_row[..dst_row.len().min(src_row.len())]);
-        }
-    }
-    drop(mapped);
-    readback_buffer.unmap();
-
-    match image::save_buffer(path, &rgba, width, height, image::ColorType::Rgba8) {
-        Ok(()) => log::info!("dump_frame_png: wrote {}", path.display()),
-        Err(e) => log::error!("dump_frame_png: failed to save {}: {e:?}", path.display()),
     }
 }
 

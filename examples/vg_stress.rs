@@ -13,7 +13,7 @@
 
 #![recursion_limit = "512"]
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 mod vg_stress_bench;
 mod vg_stress_capture;
 mod vg_stress_cook;

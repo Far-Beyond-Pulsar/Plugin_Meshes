@@ -4,7 +4,6 @@
 //! and Helio's GPU-driven rendering pipeline. It handles conversion of CPU-side
 //! scene data to GPU buffers while maintaining performance standards.
 
-mod animation_system;
 mod camera_converter;
 mod ies;
 mod light_converter;

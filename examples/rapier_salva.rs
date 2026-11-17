@@ -19,7 +19,7 @@
 //!   WASD / Space / Shift — fly camera
 //!   Escape — release cursor / exit
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 use pulsar_scenedb::{Entity, SceneDb};
 use v3_demo_common::{
     box_mesh, despawn_object, make_material, new_scene_db_with_gpu_mirror, point_light,
@@ -27,10 +27,7 @@ use v3_demo_common::{
     spawn_object_with_movability, sphere_mesh, update_object_transform,
 };
 
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera, Renderer,
-    RendererBuilder, RendererConfig,
-};
+use helio::{Camera, Renderer, RendererBuilder, RendererConfig};
 use salva3d::{
     kernel::CubicSplineKernel,
     object::{Boundary, Fluid},
@@ -38,7 +35,7 @@ use salva3d::{
     LiquidWorld,
 };
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use winit::{
@@ -155,7 +152,6 @@ struct AppState {
     physics_state: Arc<PhysicsSharedState>,
 
     particle_radius: f32,
-    fluid_density: f32,
 
     scene_db: SceneDb,
     fluid_particles: Vec<FluidParticle>,
@@ -426,7 +422,6 @@ impl ApplicationHandler for App {
         let device = graphics.device.clone();
         let queue = graphics.queue.clone();
         let format = graphics.surface_config.format;
-        let surface_format = format;
         let fmt = format;
 
         let config = RendererConfig::new(size.width, size.height, fmt);
@@ -471,7 +466,6 @@ impl ApplicationHandler for App {
         let sphere_mesh = spawn_mesh(&mut scene_db.world, sphere_mesh([0.0, 0.0, 0.0], 1.0));
 
         let particle_radius = 0.2;
-        let fluid_density = 1000.0;
 
         // Create shared physics state (direct access - no channels!)
         let physics_state = Arc::new(PhysicsSharedState::new());
@@ -489,7 +483,6 @@ impl ApplicationHandler for App {
         // Visual representation constants
         let container_size = 20.0;
         let wall_height = 6.0;
-        let wall_thickness = 0.5;
 
         // Render container floor
         let floor_mesh = spawn_mesh(
@@ -618,7 +611,6 @@ impl ApplicationHandler for App {
             physics_enabled: true,
             physics_state,
             particle_radius,
-            fluid_density,
             scene_db,
             fluid_particles: Vec::new(),
             pending_spawn_count: 0,

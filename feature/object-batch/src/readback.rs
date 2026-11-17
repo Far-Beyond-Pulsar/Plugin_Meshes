@@ -294,7 +294,13 @@ impl RangeReadback {
             }
             let copy = pending.copy;
             let needed = required_range_capacity(gen);
-            if std::env::var("PROBE_SEGMENTS").is_ok() { eprintln!("PROBE harvest copy={copy} needed={needed} cap={} published={}", gen.range_capacity(), self.published); }
+            if std::env::var("PROBE_SEGMENTS").is_ok() {
+                eprintln!(
+                    "PROBE harvest copy={copy} needed={needed} cap={} published={}",
+                    gen.range_capacity(),
+                    self.published
+                );
+            }
             if needed > gen.range_capacity() {
                 // Truncated tables: keep the previous ones, grow the staging
                 // and copy again, whether or not the batch runs again (a
@@ -378,7 +384,12 @@ impl RangeReadback {
         self.owed = false;
         self.copies += 1;
         let copy = self.copies;
-        if std::env::var("PROBE_SEGMENTS").is_ok() { eprintln!("PROBE kick copy={copy} requested={kick_off_copy} cap={}", self.range_capacity); }
+        if std::env::var("PROBE_SEGMENTS").is_ok() {
+            eprintln!(
+                "PROBE kick copy={copy} requested={kick_off_copy} cap={}",
+                self.range_capacity
+            );
+        }
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("ObjBatch Readback Copy"),

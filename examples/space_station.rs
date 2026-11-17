@@ -8,11 +8,8 @@
 //!   Mouse drag            — look (click to grab cursor)
 //!   Escape                — release cursor / exit
 
-mod v3_demo_common;
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera, Renderer,
-    RendererBuilder, RendererConfig,
-};
+use helio::{Camera, Renderer, RendererBuilder, RendererConfig};
+use meshes_examples::v3_demo_common;
 use pulsar_scenedb::{Entity, SceneDb, World};
 use v3_demo_common::{
     box_mesh, directional_light, make_material, new_scene_db_with_gpu_mirror, point_light,
@@ -49,7 +46,6 @@ struct AppState {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
     surface_format: wgpu::TextureFormat,
     renderer: Renderer,
     scene_db: SceneDb,
@@ -100,7 +96,6 @@ impl ApplicationHandler for App {
         let device = graphics.device.clone();
         let queue = graphics.queue.clone();
         let format = graphics.surface_config.format;
-        let surface_format = format;
         let fmt = format;
 
         let config = RendererConfig::new(size.width, size.height, fmt);
@@ -195,7 +190,6 @@ impl ApplicationHandler for App {
             window,
             surface,
             device,
-            queue,
             surface_format: fmt,
             renderer,
             scene_db,

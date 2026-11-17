@@ -55,7 +55,9 @@ use std::sync::Arc;
 use glam::{DMat4, DVec3};
 use helio_core::{BlasGeometry, BlasManager, BlasSegment, TlasInstanceInput, TlasManager};
 use helio_mats::instance::{MaterialInstanceComponent, row_of};
-use helio_mesh_api::{RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_TWO_SIDED, RayInstance};
+use helio_mesh_api::{
+    RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_TWO_SIDED, RayInstance,
+};
 use helio_mesh_host::ray_proxies::{Lookup, ProxyRange, VgRayProxies};
 use helio_mesh_host::texture_means::TextureMeans;
 use pulsar_scene_model::attachments::ComponentOwner;
@@ -373,7 +375,9 @@ impl WorldRayScene {
                 self.tlas_ok = false;
                 if !self.warned {
                     self.warned = true;
-                    tracing::warn!("Meshes: the ray-traced scene's TLAS failed ({error}); rays see no meshes");
+                    tracing::warn!(
+                        "Meshes: the ray-traced scene's TLAS failed ({error}); rays see no meshes"
+                    );
                 }
             }
         }
@@ -406,7 +410,12 @@ impl WorldRayScene {
 
     /// The journals' changes since last frame, as meshes to re-evaluate
     /// (`dirty`) and to re-place (`moved`); everything after an overflow.
-    fn read_changes(&mut self, world: &World, dirty: &mut HashSet<Entity>, moved: &mut HashSet<Entity>) {
+    fn read_changes(
+        &mut self,
+        world: &World,
+        dirty: &mut HashSet<Entity>,
+        moved: &mut HashSet<Entity>,
+    ) {
         let complete = match self.cursors.as_mut() {
             None => false,
             Some(cursors) => {
@@ -455,13 +464,23 @@ impl WorldRayScene {
             self.cursors = Some(Cursors::open(world));
             self.surfaces.clear();
             dirty.extend(self.entries.keys().copied());
-            dirty.extend(world.query::<&StaticMeshComponent>().map(|(entity, _)| entity));
+            dirty.extend(
+                world
+                    .query::<&StaticMeshComponent>()
+                    .map(|(entity, _)| entity),
+            );
         }
     }
 
     /// Re-evaluate the mesh `entity` from the world: drop what it traced,
     /// trace what it now draws.
-    fn evaluate(&mut self, world: &World, mirror: &GpuMirrorHandle, store: &SceneGpuStore, entity: Entity) {
+    fn evaluate(
+        &mut self,
+        world: &World,
+        mirror: &GpuMirrorHandle,
+        store: &SceneGpuStore,
+        entity: Entity,
+    ) {
         if let Some(old) = self.entries.remove(&entity) {
             self.forget(entity, old);
         }
@@ -533,7 +552,13 @@ impl WorldRayScene {
     }
 
     /// What the mesh `entity` traces now (`None`: it is no mesh).
-    fn entry(&mut self, world: &World, mirror: &GpuMirrorHandle, store: &SceneGpuStore, entity: Entity) -> Option<Entry> {
+    fn entry(
+        &mut self,
+        world: &World,
+        mirror: &GpuMirrorHandle,
+        store: &SceneGpuStore,
+        entity: Entity,
+    ) -> Option<Entry> {
         let mesh = world.get::<StaticMeshComponent>(entity)?;
         let link = world.get::<ComponentOwner>(entity)?;
         let owner = link.entity();
@@ -571,14 +596,16 @@ impl WorldRayScene {
         ) else {
             return Err(Skip::Unmirrored);
         };
-        if vertices.count as usize != mesh.vertices.len() || indices.count as usize != mesh.indices.len() {
+        if vertices.count as usize != mesh.vertices.len()
+            || indices.count as usize != mesh.indices.len()
+        {
             return Err(Skip::Unmirrored);
         }
         let Some(instances) = world.get::<MeshMaterials>(entity) else {
             return Err(Skip::NoMaterials);
         };
-        let world_matrix =
-            pulsar_scene_model::hierarchy_transform::world_matrix_of(world, owner).ok_or(Skip::Disabled)?;
+        let world_matrix = pulsar_scene_model::hierarchy_transform::world_matrix_of(world, owner)
+            .ok_or(Skip::Disabled)?;
         // The traced sections: each with its material instance and surface.
         let mut sections = Vec::new();
         for section in StaticMeshDraw::of(mesh).sections {
@@ -591,7 +618,9 @@ impl WorldRayScene {
                 .0
                 .get(section.material_slot as usize)
                 .ok_or(Skip::NoMaterials)?;
-            let surface = self.surface(world, mirror, material).ok_or(Skip::NoMaterials)?;
+            let surface = self
+                .surface(world, mirror, material)
+                .ok_or(Skip::NoMaterials)?;
             if !surface.blended {
                 sections.push((section, material, surface));
             }
@@ -599,15 +628,16 @@ impl WorldRayScene {
         if sections.is_empty() {
             return Err(Skip::Glass);
         }
-        let row = |first_index, base_vertex, flags, material: Entity, surface: &Surface| RayInstance {
-            first_index,
-            base_vertex,
-            flags: flags | surface.flags,
-            material: row_of(material),
-            base_color: surface.base_color,
-            emissive: surface.emissive,
-            transmission: [0.0; 4],
-        };
+        let row =
+            |first_index, base_vertex, flags, material: Entity, surface: &Surface| RayInstance {
+                first_index,
+                base_vertex,
+                flags: flags | surface.flags,
+                material: row_of(material),
+                base_color: surface.base_color,
+                emissive: surface.emissive,
+                transmission: [0.0; 4],
+            };
         let lookup = match self.vg.as_mut() {
             Some(vg) => vg.lookup((vertices.offset, vertices.count)),
             None => Lookup::Classic,
@@ -626,7 +656,13 @@ impl WorldRayScene {
                         key,
                         opaque: surface.flags & RAY_INSTANCE_MASKED == 0,
                     },
-                    vec![row(range.first_index, range.first_vertex, RAY_INSTANCE_PROXY, *material, surface)],
+                    vec![row(
+                        range.first_index,
+                        range.first_vertex,
+                        RAY_INSTANCE_PROXY,
+                        *material,
+                        surface,
+                    )],
                     vec![*material],
                     Some(key),
                     (Source::Proxy(range), u64::from(range.index_count / 3)),
@@ -638,14 +674,24 @@ impl WorldRayScene {
                     sections: sections
                         .iter()
                         .map(|(s, _, surface)| {
-                            (s.first_index, s.index_count, surface.flags & RAY_INSTANCE_MASKED == 0)
+                            (
+                                s.first_index,
+                                s.index_count,
+                                surface.flags & RAY_INSTANCE_MASKED == 0,
+                            )
                         })
                         .collect(),
                 },
                 sections
                     .iter()
                     .map(|(s, material, surface)| {
-                        row(indices.offset + s.first_index, vertices.offset, 0, *material, surface)
+                        row(
+                            indices.offset + s.first_index,
+                            vertices.offset,
+                            0,
+                            *material,
+                            surface,
+                        )
                     })
                     .collect(),
                 sections.iter().map(|(_, material, _)| *material).collect(),
@@ -655,7 +701,10 @@ impl WorldRayScene {
                         vertices,
                         first_index: indices.offset,
                     },
-                    sections.iter().map(|(s, _, _)| u64::from(s.index_count / 3)).sum(),
+                    sections
+                        .iter()
+                        .map(|(s, _, _)| u64::from(s.index_count / 3))
+                        .sum(),
                 ),
             ),
         };
@@ -673,13 +722,16 @@ impl WorldRayScene {
 
     /// Re-place the traced mesh `entity` after a transform change above it.
     fn place(&mut self, world: &World, entity: Entity) {
-        let Some(Entry { chain, state: Ok(traced) }) = self.entries.get_mut(&entity) else {
+        let Some(Entry {
+            chain,
+            state: Ok(traced),
+        }) = self.entries.get_mut(&entity)
+        else {
             return;
         };
-        let Some(matrix) = chain
-            .first()
-            .and_then(|owner| pulsar_scene_model::hierarchy_transform::world_matrix_of(world, *owner))
-        else {
+        let Some(matrix) = chain.first().and_then(|owner| {
+            pulsar_scene_model::hierarchy_transform::world_matrix_of(world, *owner)
+        }) else {
             return;
         };
         traced.world = matrix;
@@ -736,10 +788,16 @@ impl WorldRayScene {
             let key = self.build_queue.pop_front().expect("front");
             let blas = self.blases.get_mut(&key).expect("present");
             let result = match (&key, blas.source) {
-                (BlasKey::Mesh { sections, .. }, Source::Mesh { vertices, first_index }) => {
-                    match (&vertex_pool, &index_pool) {
-                        (Some(vertex_pool), Some(index_pool)) => {
-                            let segments = sections
+                (
+                    BlasKey::Mesh { sections, .. },
+                    Source::Mesh {
+                        vertices,
+                        first_index,
+                    },
+                ) => match (&vertex_pool, &index_pool) {
+                    (Some(vertex_pool), Some(index_pool)) => {
+                        let segments =
+                            sections
                                 .iter()
                                 .map(|&(first, count, opaque)| BlasSegment {
                                     geometry: BlasGeometry {
@@ -747,7 +805,9 @@ impl WorldRayScene {
                                         vertices: &vertex_pool.buffer,
                                         first_vertex: vertices.offset,
                                         vertex_count: vertices.count,
-                                        vertex_stride: std::mem::size_of::<helio_mesh_api::PackedVertex>()
+                                        vertex_stride: std::mem::size_of::<
+                                            helio_mesh_api::PackedVertex,
+                                        >()
                                             as u64,
                                         indices: Some(&index_pool.buffer),
                                         first_index: first_index + first,
@@ -756,13 +816,12 @@ impl WorldRayScene {
                                     opaque,
                                 })
                                 .collect();
-                            self.blas
-                                .build_segments(blas.id, encoder, segments)
-                                .map_err(|e| e.to_string())
-                        }
-                        _ => Err("the mesh pools are not registered".into()),
+                        self.blas
+                            .build_segments(blas.id, encoder, segments)
+                            .map_err(|e| e.to_string())
                     }
-                }
+                    _ => Err("the mesh pools are not registered".into()),
+                },
                 (BlasKey::Proxy { opaque, .. }, Source::Proxy(range)) => match proxies {
                     Some((vertices, indices)) => self
                         .blas
@@ -792,7 +851,9 @@ impl WorldRayScene {
                 Ok(_) => blas.state = BlasState::Built,
                 Err(error) => {
                     blas.state = BlasState::Failed;
-                    tracing::warn!("Meshes: a ray-tracing BLAS could not be built ({error}); its meshes are not traced");
+                    tracing::warn!(
+                        "Meshes: a ray-tracing BLAS could not be built ({error}); its meshes are not traced"
+                    );
                 }
             }
             budget = budget.saturating_sub(blas.triangles);
@@ -878,7 +939,12 @@ impl WorldRayScene {
 
     /// What a ray sees of the material instance `entity` (cached until it
     /// changes).
-    fn surface(&mut self, world: &World, mirror: &GpuMirrorHandle, entity: Entity) -> Option<Surface> {
+    fn surface(
+        &mut self,
+        world: &World,
+        mirror: &GpuMirrorHandle,
+        entity: Entity,
+    ) -> Option<Surface> {
         if let Some(surface) = self.surfaces.get(&entity) {
             return *surface;
         }
@@ -896,7 +962,8 @@ impl WorldRayScene {
             })
             .flatten()
             .and_then(|bytes| {
-                bytemuck::try_pod_read_unaligned::<helio_mats::host_rows::MaterialComponent>(&bytes).ok()
+                bytemuck::try_pod_read_unaligned::<helio_mats::host_rows::MaterialComponent>(&bytes)
+                    .ok()
             })
             .map(helio_mats::GpuMaterial::from);
         let surface = row.map(|row| {
@@ -930,7 +997,10 @@ impl WorldRayScene {
                 *skipped.entry(skip).or_default() += 1;
             }
         }
-        let mut skipped: Vec<_> = skipped.into_iter().map(|(skip, n)| (skip.label(), n)).collect();
+        let mut skipped: Vec<_> = skipped
+            .into_iter()
+            .map(|(skip, n)| (skip.label(), n))
+            .collect();
         skipped.sort();
         Stats {
             meshes: self.entries.len(),
@@ -1018,7 +1088,10 @@ mod tests {
             DVec3::new(1000.0, 5.0, -3.0),
         );
         let t = tlas_transform(matrix, DVec3::new(1000.0, 0.0, 0.0));
-        assert_eq!(t, [2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 5.0, 0.0, 0.0, 2.0, -3.0]);
+        assert_eq!(
+            t,
+            [2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 5.0, 0.0, 0.0, 2.0, -3.0]
+        );
     }
 
     /// A mesh's chain is its owner then each ancestor, and a parent cycle

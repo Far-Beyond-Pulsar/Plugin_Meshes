@@ -1,8 +1,8 @@
-mod architectural_mesh;
-mod hlfs_capture;
+use meshes_examples::architectural_mesh;
+use meshes_examples::hlfs_capture;
 mod hlfs_viewer;
 mod technology_gallery;
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 fn main() {
     env_logger::init();
     let mut args = std::env::args().skip(1);

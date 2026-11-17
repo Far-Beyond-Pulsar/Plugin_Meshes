@@ -14,6 +14,8 @@
 //! once — interactively (TUI) or headless (`--headless`, used by CI). It also
 //! writes the landing-page HTML and serves the result locally.
 
+// Each build enables one demo feature, which uses only part of the helpers.
+#[allow(dead_code, unused_macros)]
 #[macro_use]
 mod common;
 

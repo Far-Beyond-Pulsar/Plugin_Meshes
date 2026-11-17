@@ -15,7 +15,7 @@
 //! times between the size given and 80% of it and times each resize's frame
 //! less a steady frame. Prints one `GRAPHCOST` line.
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 use std::sync::Arc;
 use std::time::Instant;

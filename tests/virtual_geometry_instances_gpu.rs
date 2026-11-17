@@ -114,7 +114,6 @@ fn object_row(slot: u32, mesh_generation: u32, scale: [f32; 3]) -> [u32; 63] {
 
 struct Scene {
     projection: SceneBufferProjection,
-    keys: VgInstanceKeys,
 }
 
 /// Eight mesh instances (rows 0..8 own objects 10..18), VG components at
@@ -203,7 +202,7 @@ fn scene(device: &wgpu::Device, queue: &wgpu::Queue, asset_generation: u64) -> S
             upload(device, queue, &ready, asset_generation),
         ),
     ]);
-    Scene { projection, keys }
+    Scene { projection }
 }
 
 fn derive(

@@ -122,13 +122,13 @@ fn the_chain_is_absent_by_default_and_idle_without_assets() {
     let view = target(&device);
 
     // Classic graph: no VG pass at all.
-    let mut classic = build(&device, &queue, None);
+    let classic = build(&device, &queue, None);
     assert!(classic.find_pass::<VgCullEarlyPass>().is_none());
     assert!(classic.find_pass::<VgShadePass>().is_none());
 
     // Requested: present when the device supports it, absent otherwise.
     let runtime = VgRuntime::new(VgRuntimeSettings::default());
-    let mut renderer = build(&device, &queue, Some(&runtime));
+    let renderer = build(&device, &queue, Some(&runtime));
     let supported = helio_pass_vg::virtual_geometry_supported(&device);
     assert_eq!(renderer.find_pass::<VgCullEarlyPass>().is_some(), supported);
     assert_eq!(renderer.find_pass::<VgShadePass>().is_some(), supported);

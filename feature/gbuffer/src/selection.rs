@@ -77,7 +77,9 @@ impl SelectionDraws {
 }
 
 fn lock(shared: &Mutex<SelectionDraws>) -> std::sync::MutexGuard<'_, SelectionDraws> {
-    shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[repr(C)]
@@ -217,7 +219,11 @@ impl RenderPass for SelectionSelectPass {
             draws.clone(),
             count.clone(),
         ];
-        if self.bind.as_ref().is_none_or(|(cached, _)| *cached != bound) {
+        if self
+            .bind
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != bound)
+        {
             let layout = self.pipeline.get_bind_group_layout(0);
             let entries: Vec<wgpu::BindGroupEntry<'_>> = bound
                 .iter()
@@ -375,7 +381,8 @@ impl RenderPass for SelectionMaskPass {
         if !self.editor {
             return None;
         }
-        let mask = resources.read_texture_view(ResourceKey::new(MASK_DEPTH), "MeshSelectionMask")?;
+        let mask =
+            resources.read_texture_view(ResourceKey::new(MASK_DEPTH), "MeshSelectionMask")?;
         Some(wgpu::RenderPassDescriptor {
             label: Some("Mesh Selection Mask"),
             color_attachments: &[],
@@ -444,7 +451,11 @@ impl RenderPass for SelectionMaskPass {
             skin.clone(),
             palette.clone(),
         ];
-        if self.bind.as_ref().is_none_or(|(cached, _)| *cached != bound) {
+        if self
+            .bind
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != bound)
+        {
             let layout = self.pipeline.get_bind_group_layout(0);
             let entries: Vec<wgpu::BindGroupEntry<'_>> = bound
                 .iter()

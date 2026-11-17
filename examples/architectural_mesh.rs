@@ -4,14 +4,14 @@ use glam::Vec3;
 use helio_mesh_api::PackedVertex;
 
 #[derive(Default)]
-pub(crate) struct Mesh {
-    pub(crate) vertices: Vec<PackedVertex>,
-    pub(crate) indices: Vec<u32>,
+pub struct Mesh {
+    pub vertices: Vec<PackedVertex>,
+    pub indices: Vec<u32>,
 }
 impl Mesh {
     /// Dominant-plane mapping in metres for flat architectural stone faces.
     /// Rebuild the tangent basis to agree with the projected UV axes.
-    pub(crate) fn world_space_uv(&mut self, tile_metres: f32) {
+    pub fn world_space_uv(&mut self, tile_metres: f32) {
         assert!(tile_metres > 0.0 && tile_metres.is_finite());
         for vertex in &mut self.vertices {
             let decode = |shift| ((vertex.normal >> shift) as u8 as i8) as f32 / 127.0;
@@ -40,7 +40,7 @@ impl Mesh {
             vertex.bitangent_sign = packed.bitangent_sign;
         }
     }
-    pub(crate) fn triangle(&mut self, a: Vec3, b: Vec3, c: Vec3) {
+    pub fn triangle(&mut self, a: Vec3, b: Vec3, c: Vec3) {
         let normal = (b - a).cross(c - a).normalize();
         let tangent = (b - a).normalize();
         let base = self.vertices.len() as u32;
@@ -55,7 +55,7 @@ impl Mesh {
         }
         self.indices.extend_from_slice(&[base, base + 1, base + 2]);
     }
-    pub(crate) fn quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3) {
+    pub fn quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3) {
         // Both triangles share one UV rectangle. Calling triangle twice maps
         // the whole texture onto each half and disagrees along the diagonal.
         // Preserve per-triangle face normals for non-planar architectural quads.
@@ -87,14 +87,14 @@ impl Mesh {
             self.indices.extend_from_slice(&[base, base + 1, base + 2]);
         }
     }
-    pub(crate) fn block(&mut self, center: [f32; 3], half: [f32; 3]) {
+    pub fn block(&mut self, center: [f32; 3], half: [f32; 3]) {
         let mesh = box_mesh(center, half);
         let base = self.vertices.len() as u32;
         self.vertices.extend(mesh.vertices);
         self.indices
             .extend(mesh.indices.into_iter().map(|i| i + base));
     }
-    pub(crate) fn rod(&mut self, a: Vec3, b: Vec3, radius: f32, sides: usize) {
+    pub fn rod(&mut self, a: Vec3, b: Vec3, radius: f32, sides: usize) {
         let axis = (b - a).normalize();
         let helper = if axis.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
         let u = axis.cross(helper).normalize() * radius;
@@ -110,7 +110,7 @@ impl Mesh {
         }
     }
     /// Smooth cylindrical sides with a duplicated UV seam and flat end caps.
-    pub(crate) fn smooth_rod(&mut self, a: Vec3, b: Vec3, radius: f32, sides: usize) {
+    pub fn smooth_rod(&mut self, a: Vec3, b: Vec3, radius: f32, sides: usize) {
         assert!(sides >= 3 && radius > 0.0 && a.distance_squared(b) > 0.0);
         let axis = (b - a).normalize();
         let helper = if axis.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
@@ -169,7 +169,7 @@ impl Mesh {
             }
         }
     }
-    pub(crate) fn ring(&mut self, center: Vec3, u: Vec3, v: Vec3, radius: f32, thickness: f32) {
+    pub fn ring(&mut self, center: Vec3, u: Vec3, v: Vec3, radius: f32, thickness: f32) {
         for i in 0..48 {
             let t = i as f32 * std::f32::consts::TAU / 48.;
             let t1 = (i + 1) as f32 * std::f32::consts::TAU / 48.;
@@ -183,14 +183,7 @@ impl Mesh {
     }
     /// A connected tube around a ring, without the hidden cylinder caps at
     /// every segment. Used for small-scale tracery and suspended metalwork.
-    pub(crate) fn smooth_ring(
-        &mut self,
-        center: Vec3,
-        u: Vec3,
-        v: Vec3,
-        radius: f32,
-        thickness: f32,
-    ) {
+    pub fn smooth_ring(&mut self, center: Vec3, u: Vec3, v: Vec3, radius: f32, thickness: f32) {
         const SEGMENTS: usize = 48;
         const SIDES: usize = 8;
         let u = u.normalize();
@@ -222,24 +215,9 @@ impl Mesh {
             }
         }
     }
-    pub(crate) fn arch(&mut self, a: Vec3, b: Vec3, rise: f32, radius: f32) {
-        // Two curved halves meet at a pointed crown.
-        let mid = (a + b) * 0.5 + Vec3::Y * rise;
-        for (start, end) in [(a, mid), (b, mid)] {
-            let mut previous = start;
-            for i in 1..=24 {
-                let t = i as f32 / 24.;
-                let mut p = start.lerp(end, t);
-                p.y += rise * 0.24 * (t * std::f32::consts::PI).sin();
-                self.rod(previous, p, radius, 10);
-                previous = p;
-            }
-        }
-    }
-
     /// One connected tube along a planar pointed arch. Adjacent rings share
     /// vertices; there are no overlapping cylinder end caps at every segment.
-    pub(crate) fn smooth_arch(&mut self, a: Vec3, b: Vec3, rise: f32, radius: f32) {
+    pub fn smooth_arch(&mut self, a: Vec3, b: Vec3, rise: f32, radius: f32) {
         assert!(radius.is_finite() && radius > 0.0 && rise.is_finite() && rise > 0.0);
         assert!((b - a).cross(Vec3::Y).length_squared() > 0.0);
         let mid = (a + b) * 0.5 + Vec3::Y * rise;
