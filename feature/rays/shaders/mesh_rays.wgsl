@@ -129,7 +129,6 @@ fn mesh_rays_nearest(@builtin(global_invocation_id) id: vec3<u32>) {
     if ray.t_max <= 0.0 { return; }
     let reach = scene_hit_reach(ray, hits[id.x]);
     let seed = ray_seed(id.x);
-    let spread = scene_ray_spread(ray);
     // Sheets are candidates, never confirmed: nearest-hit rays see through
     // glass. Cut-outs are confirmed where their surface is.
     var q: ray_query;
@@ -139,7 +138,7 @@ fn mesh_rays_nearest(@builtin(global_invocation_id) id: vec3<u32>) {
         let candidate = rayQueryGetCandidateIntersection(&q);
         if !is_cut_out(ray_row(candidate)) { continue; }
         cut_outs++;
-        if cut_outs > MAX_CUT_OUTS || cut_out_surface(candidate, ray.dir, spread * candidate.t, seed) {
+        if cut_outs > MAX_CUT_OUTS || cut_out_surface(candidate, ray.dir, scene_ray_footprint(ray, candidate.t), seed) {
             rayQueryConfirmIntersection(&q);
         }
     }
@@ -211,14 +210,13 @@ fn mesh_rays_nearest(@builtin(global_invocation_id) id: vec3<u32>) {
 fn transmittance(ray: SceneRay, seed: u32) -> vec3<f32> {
     var q: ray_query;
     rayQueryInitialize(&q, acc_struct, RayDesc(FIRST_HIT, scene_ray_mask(ray), 0.0, ray.t_max, ray.origin, ray.dir));
-    let spread = scene_ray_spread(ray);
     var through = vec3<f32>(1.0);
     var cut_outs = 0u;
     while rayQueryProceed(&q) {
         let sheet = rayQueryGetCandidateIntersection(&q);
         if is_cut_out(ray_row(sheet)) {
             cut_outs++;
-            if cut_outs <= MAX_CUT_OUTS && !cut_out_surface(sheet, ray.dir, spread * sheet.t, seed) { continue; }
+            if cut_outs <= MAX_CUT_OUTS && !cut_out_surface(sheet, ray.dir, scene_ray_footprint(ray, sheet.t), seed) { continue; }
             rayQueryTerminate(&q);
             return vec3<f32>(0.0);
         }

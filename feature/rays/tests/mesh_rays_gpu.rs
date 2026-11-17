@@ -451,26 +451,12 @@ fn cut_out_materials(gpu: &Gpu, texture: &wgpu::Texture) -> Materials {
 
 // ── Streams ─────────────────────────────────────────────────────────────────
 
-/// `cone` of a ray: `spread` as a half float, the caster `mask`.
-fn cone(spread: f32, mask: u8) -> u32 {
-    // Half floats of the normal range only (spreads are small positives).
-    let half = if spread <= 0.0 {
-        0
-    } else {
-        let bits = spread.to_bits();
-        let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-        assert!((1..31).contains(&exponent), "spread {spread} out of range");
-        ((exponent as u32) << 10) | ((bits >> 13) & 0x3ff)
-    };
-    half | (u32::from(mask) << 16)
-}
-
 fn ray(origin: Vec3, dir: Vec3, t_max: f32, spread: f32, mask: u8) -> SceneRay {
     SceneRay {
         origin: origin.to_array(),
         t_max,
         dir: dir.normalize().to_array(),
-        cone: cone(spread, mask),
+        cone: SceneRay::cone(0.0, spread, mask),
     }
 }
 
