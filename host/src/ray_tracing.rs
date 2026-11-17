@@ -20,7 +20,9 @@
 //! glass or as opaque) still refuses them.
 use crate::ray_proxies::{Lookup, VgRayProxies, VgRayStats};
 use crate::{MeshComponent, RenderGroupComponent, StaticObjectComponent};
-use helio_core::{BlasGeometry, BlasManager, Movability, TlasInstanceInput, TlasManager};
+use helio_core::{
+    BlasGeometry, BlasManager, BlasSegment, Movability, TlasInstanceInput, TlasManager,
+};
 use helio_mats::host_rows::MaterialComponent;
 use helio_mesh_api::{
     RayInstance, RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_TWO_SIDED,
@@ -249,6 +251,8 @@ impl SceneDbRayTracing {
     /// mesh entity to skip that hash: its BLAS is then built once and reused
     /// until SceneDB reallocates or replaces the mesh's geometry range.
     pub fn prepare(&mut self, world: &World) -> helio_core::Result<&wgpu::Tlas> {
+        // Compact the BLASes built in earlier frames (a few a frame).
+        self.blas.maintain(&self.queue);
         // Texture means that arrived change the instances' colours: rebuild.
         if self.texture_means.collect() {
             self.cursors = None;
@@ -583,20 +587,24 @@ impl SceneDbRayTracing {
                             .and_then(VgRayProxies::buffers)
                             .ok_or_else(|| error("missing proxy pool"))?;
                         self.blas
-                            .build_from_buffers_with_opacity(
+                            .build(
                                 id,
                                 &mut encoder,
-                                BlasGeometry {
-                                    revision: 0,
-                                    vertices,
-                                    first_vertex: range.first_vertex,
-                                    vertex_count: range.vertex_count,
-                                    vertex_stride: helio_mesh_api::RAY_PROXY_VERTEX_BYTES,
-                                    indices: Some(proxy_indices),
-                                    first_index: range.first_index,
-                                    index_count: range.index_count,
-                                },
-                                opaque,
+                                vec![BlasSegment {
+                                    geometry: BlasGeometry {
+                                        positions_revision: 0,
+                                        topology_revision: 0,
+                                        vertices,
+                                        first_vertex: range.first_vertex,
+                                        vertex_count: range.vertex_count,
+                                        vertex_stride: helio_mesh_api::RAY_PROXY_VERTEX_BYTES,
+                                        indices: Some(proxy_indices),
+                                        first_index: range.first_index,
+                                        index_count: range.index_count,
+                                    },
+                                    opaque,
+                                }],
+                                Movability::Static,
                             )
                             .map_err(|e| error(&e.to_string()))?;
                     }
@@ -632,42 +640,54 @@ impl SceneDbRayTracing {
                         // for in-place edits. A mesh that promises not to deform is
                         // never re-read: its BLAS key (buffer, ranges, opacity) still
                         // rebuilds it when SceneDB moves or replaces the allocation.
-                        let revision = if world
-                            .get::<Movability>(*entity)
-                            .is_none_or(|movability| movability.can_deform())
-                        {
-                            // Streaming hash's vectorized bulk path for large meshes.
-                            let mut hash = twox_hash::XxHash3_64::default();
-                            hash.write(bytemuck::cast_slice(&mesh.vertices));
-                            hash.write(bytemuck::cast_slice(&mesh.indices));
-                            hash.finish()
-                        } else {
-                            0
-                        };
+                        let movability = world.get::<Movability>(*entity).copied();
+                        // Positions and topology apart: a deforming mesh whose
+                        // positions alone changed is refit, not rebuilt.
+                        let (positions_revision, topology_revision) =
+                            if movability.is_none_or(|movability| movability.can_deform()) {
+                                // Streaming hash's vectorized bulk path for large meshes.
+                                let hash = |bytes: &[u8]| {
+                                    let mut hash = twox_hash::XxHash3_64::default();
+                                    hash.write(bytes);
+                                    hash.finish()
+                                };
+                                (
+                                    hash(bytemuck::cast_slice(&mesh.vertices)),
+                                    hash(bytemuck::cast_slice(&mesh.indices)),
+                                )
+                            } else {
+                                (0, 0)
+                            };
                         self.blas
-                            .build_from_buffers_with_opacity(
+                            .build(
                                 id,
                                 &mut encoder,
-                                BlasGeometry {
-                                    revision,
-                                    vertices: &vertices
-                                        .as_ref()
-                                        .ok_or_else(|| error("missing vertex pool"))?
-                                        .buffer,
-                                    first_vertex: vertex_range.offset,
-                                    vertex_count: vertex_range.count,
-                                    vertex_stride: std::mem::size_of::<helio_mesh_api::PackedVertex>()
-                                        as u64,
-                                    indices: Some(
-                                        &indices
+                                vec![BlasSegment {
+                                    geometry: BlasGeometry {
+                                        positions_revision,
+                                        topology_revision,
+                                        vertices: &vertices
                                             .as_ref()
-                                            .ok_or_else(|| error("missing index pool"))?
+                                            .ok_or_else(|| error("missing vertex pool"))?
                                             .buffer,
-                                    ),
-                                    first_index: index_range.offset,
-                                    index_count: index_range.count,
-                                },
-                                opaque,
+                                        first_vertex: vertex_range.offset,
+                                        vertex_count: vertex_range.count,
+                                        vertex_stride: std::mem::size_of::<
+                                            helio_mesh_api::PackedVertex,
+                                        >()
+                                            as u64,
+                                        indices: Some(
+                                            &indices
+                                                .as_ref()
+                                                .ok_or_else(|| error("missing index pool"))?
+                                                .buffer,
+                                        ),
+                                        first_index: index_range.offset,
+                                        index_count: index_range.count,
+                                    },
+                                    opaque,
+                                }],
+                                movability.unwrap_or(Movability::Static),
                             )
                             .map_err(|e| error(&e.to_string()))?;
                     }

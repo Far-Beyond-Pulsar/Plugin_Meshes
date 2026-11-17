@@ -29,10 +29,9 @@
 //! - **Spread out.** New BLASes are built under a per-frame triangle budget
 //!   (a mesh joins the TLAS once its BLAS is built), and mesh evaluations
 //!   under a per-frame count, so a level loading does not stall one frame on
-//!   thousands of builds. BLASes are not compacted: wgpu-core's
-//!   `Queue::compact_blas` takes `pending_writes` before
-//!   `command_indices`, the reverse of `Queue::present`, and deadlocks
-//!   against the editor UI presenting on the same device from its thread.
+//!   thousands of builds. Built BLASes are compacted a few a frame
+//!   (`BlasManager::maintain`): a level's BLASes shrink to their final size
+//!   over the frames after it loads.
 //!
 //! What it traces: every enabled, visible static mesh section whose
 //! material is opaque or a cut-out. Cut-outs are non-opaque segments flagged
@@ -311,6 +310,8 @@ impl WorldRayScene {
             return;
         };
         let store = mirror.store();
+        // Compact the BLASes built in earlier frames (a few a frame).
+        self.blas.maintain(&self.queue);
         // Proxies that came or went: re-evaluate everything.
         if self
             .vg
@@ -802,7 +803,8 @@ impl WorldRayScene {
                                 .iter()
                                 .map(|&(first, count, opaque)| BlasSegment {
                                     geometry: BlasGeometry {
-                                        revision: 0,
+                                        positions_revision: 0,
+                                        topology_revision: 0,
                                         vertices: &vertex_pool.buffer,
                                         first_vertex: vertices.offset,
                                         vertex_count: vertices.count,
@@ -818,7 +820,7 @@ impl WorldRayScene {
                                 })
                                 .collect();
                         self.blas
-                            .build_segments(blas.id, encoder, segments)
+                            .build(blas.id, encoder, segments, helio_core::Movability::Static)
                             .map_err(|e| e.to_string())
                     }
                     _ => Err("the mesh pools are not registered".into()),
@@ -826,12 +828,13 @@ impl WorldRayScene {
                 (BlasKey::Proxy { opaque, .. }, Source::Proxy(range)) => match proxies {
                     Some((vertices, indices)) => self
                         .blas
-                        .build_segments(
+                        .build(
                             blas.id,
                             encoder,
                             vec![BlasSegment {
                                 geometry: BlasGeometry {
-                                    revision: 0,
+                                    positions_revision: 0,
+                                    topology_revision: 0,
                                     vertices,
                                     first_vertex: range.first_vertex,
                                     vertex_count: range.vertex_count,
@@ -842,6 +845,7 @@ impl WorldRayScene {
                                 },
                                 opaque: *opaque,
                             }],
+                            helio_core::Movability::Static,
                         )
                         .map_err(|e| e.to_string()),
                     None => Err("the proxy pool is missing".into()),

@@ -365,6 +365,8 @@ impl RtTier {
 
         let t_requests = t_start.elapsed();
         let mut info = RtFrameInfo::default();
+        // Compact the BLASes built in earlier frames (a few a frame).
+        self.blas.maintain(env.queue);
         if !requests.is_empty() {
             let mut encoder = env
                 .device

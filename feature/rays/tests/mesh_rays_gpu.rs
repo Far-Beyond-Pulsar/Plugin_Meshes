@@ -248,12 +248,13 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
             Some((v, i)) if q.proxy() => (v, i, 20),
             _ => (&vertex_buffer, &index_buffer, 40),
         };
-        blas.build_segments(
+        blas.build(
             k as u64,
             &mut encoder,
             vec![BlasSegment {
                 geometry: BlasGeometry {
-                    revision: 0,
+                    positions_revision: 0,
+                    topology_revision: 0,
                     vertices,
                     first_vertex: row.base_vertex,
                     vertex_count: 4,
@@ -264,6 +265,7 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
                 },
                 opaque,
             }],
+            helio_core::Movability::Static,
         )
         .unwrap();
         inputs.push(TlasInstanceInput {

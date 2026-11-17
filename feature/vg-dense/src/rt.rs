@@ -667,20 +667,28 @@ impl DenseRtPass {
                 info.over_tau_instances += 1;
             }
             let lod = &asset.lods[sel.lod];
-            if blas.build_from_buffers(
-                proxy_mesh_id(r.asset_key, sel.lod),
-                encoder,
-                BlasGeometry {
-                    revision: 0,
-                    vertices: &lod.vertices,
-                    first_vertex: 0,
-                    vertex_count: lod.vertex_count,
-                    vertex_stride: 12,
-                    indices: Some(&lod.indices),
-                    first_index: 0,
-                    index_count: lod.index_count,
-                },
-            )? {
+            if blas
+                .build(
+                    proxy_mesh_id(r.asset_key, sel.lod),
+                    encoder,
+                    vec![helio_core::BlasSegment {
+                        geometry: BlasGeometry {
+                            positions_revision: 0,
+                            topology_revision: 0,
+                            vertices: &lod.vertices,
+                            first_vertex: 0,
+                            vertex_count: lod.vertex_count,
+                            vertex_stride: 12,
+                            indices: Some(&lod.indices),
+                            first_index: 0,
+                            index_count: lod.index_count,
+                        },
+                        opaque: true,
+                    }],
+                    helio_core::Movability::Static,
+                )?
+                .recorded()
+            {
                 info.blas_builds += 1;
             }
             info.selections.push((r.instance_id, sel));
