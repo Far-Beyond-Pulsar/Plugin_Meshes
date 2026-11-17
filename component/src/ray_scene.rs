@@ -54,6 +54,7 @@ use std::sync::Arc;
 
 use glam::{DMat4, DVec3};
 use helio_core::{BlasGeometry, BlasManager, BlasSegment, TlasInstanceInput, TlasManager};
+use helio_frame_api::rays::stream::{MASK_MOVABLE, MASK_STATIC};
 use helio_mats::instance::{MaterialInstanceComponent, row_of};
 use helio_mesh_api::{
     RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_TWO_SIDED, RayInstance,
@@ -887,8 +888,12 @@ impl WorldRayScene {
                 transform: tlas_transform(traced.world, self.origin),
                 custom_data: 0,
             });
-            // The shadow casters' masks: static 1, movable 2.
-            self.masks.push(if traced.movable { 2 } else { 1 });
+            // The casters' masks rays select by (the frame's ray masks).
+            self.masks.push(if traced.movable {
+                MASK_MOVABLE
+            } else {
+                MASK_STATIC
+            });
             self.rows_dirty = true;
         }
     }

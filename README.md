@@ -31,6 +31,7 @@ draw phases and api crates.
 | `helio-pass-indirect-dispatch` | `feature/indirect-dispatch/` | Helio pass: builds the meshes' indirect draw arguments |
 | `helio-pass-object-batch` | `feature/object-batch/` | GPU-driven sort/group/batch pipeline: turns SceneDB's StaticObjectComponent rows into instances/draw_calls/material_class_ranges with zero per-frame CPU involvement |
 | `helio-pass-occlusion-cull` | `feature/occlusion-cull/` | Helio pass: Hi-Z occlusion culling of the mesh instances |
+| `helio-pass-mesh-rays` | `feature/rays/` | Helio pass: the meshes' tracer of ray streams (`helio_frame_api::rays::stream`): ray queries against the frame's TLAS, nearest hits with their surfaces and occlusion |
 | `helio-pass-shadow` | `feature/shadow/` | Helio pass: the meshes' shadow-caster drawer (opens the shadow-caster phase) |
 | `helio-pass-shadow-dirty` | `feature/shadow-dirty/` | Helio pass: which shadow views need redrawing |
 | `helio-pass-transparent` | `feature/transparent/` | Helio pass: the meshes' transparent drawer |
@@ -69,8 +70,8 @@ only inside a Pulsar-Native checkout:
 ```bash
 git clone --recursive https://github.com/Far-Beyond-Pulsar/Pulsar-Native
 cd Pulsar-Native
-cargo check -p helio-android-demos -p helio-mesh-api -p helio-asset-compat -p meshes_component -p meshes_editor -p meshes_plugin --features meshes_plugin/editor -p meshes-examples -p helio-pass-forward-lit -p helio-pass-gbuffer -p helio-pass-indirect-dispatch -p helio-pass-object-batch -p helio-pass-occlusion-cull -p helio-pass-shadow -p helio-pass-shadow-dirty -p helio-pass-transparent -p helio-pass-vg -p helio-pass-vg-bvh -p helio-pass-vg-cull -p helio-pass-vg-dense -p helio-pass-vg-raster -p helio-pass-vg-shade -p helio-mesh-host -p helio-snapshot -p helio-vg-build -p helio-vg-format -p helio-vg-stream -p helio-web-demos --tests
-cargo test -p helio-mesh-api -p meshes_component -p meshes_plugin -p helio-pass-forward-lit -p helio-pass-gbuffer -p helio-pass-indirect-dispatch -p helio-pass-object-batch -p helio-pass-occlusion-cull -p helio-pass-shadow -p helio-pass-shadow-dirty -p helio-pass-transparent -p helio-pass-vg -p helio-pass-vg-bvh -p helio-pass-vg-cull -p helio-pass-vg-dense -p helio-pass-vg-raster -p helio-pass-vg-shade
+cargo check -p helio-android-demos -p helio-mesh-api -p helio-asset-compat -p meshes_component -p meshes_editor -p meshes_plugin --features meshes_plugin/editor -p meshes-examples -p helio-pass-forward-lit -p helio-pass-gbuffer -p helio-pass-indirect-dispatch -p helio-pass-object-batch -p helio-pass-occlusion-cull -p helio-pass-mesh-rays -p helio-pass-shadow -p helio-pass-shadow-dirty -p helio-pass-transparent -p helio-pass-vg -p helio-pass-vg-bvh -p helio-pass-vg-cull -p helio-pass-vg-dense -p helio-pass-vg-raster -p helio-pass-vg-shade -p helio-mesh-host -p helio-snapshot -p helio-vg-build -p helio-vg-format -p helio-vg-stream -p helio-web-demos --tests
+cargo test -p helio-mesh-api -p meshes_component -p meshes_plugin -p helio-pass-forward-lit -p helio-pass-gbuffer -p helio-pass-indirect-dispatch -p helio-pass-object-batch -p helio-pass-occlusion-cull -p helio-pass-mesh-rays -p helio-pass-shadow -p helio-pass-shadow-dirty -p helio-pass-transparent -p helio-pass-vg -p helio-pass-vg-bvh -p helio-pass-vg-cull -p helio-pass-vg-dense -p helio-pass-vg-raster -p helio-pass-vg-shade
 ```
 
 Suites that render real frames need a GPU; CI leaves them out by name

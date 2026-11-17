@@ -703,10 +703,11 @@ impl SceneDbRayTracing {
             .casters
             .iter()
             .map(|(_, key)| {
+                // The casters' masks rays select by (the frame's ray masks).
                 if key.flags & helio_mesh_api::INSTANCE_FLAG_MOVABLE != 0 {
-                    2
+                    helio_frame_api::rays::stream::MASK_MOVABLE
                 } else {
-                    1
+                    helio_frame_api::rays::stream::MASK_STATIC
                 }
             })
             .collect();

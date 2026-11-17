@@ -283,7 +283,7 @@ status = "unverified"
 [[buffer]]
 key = "builtin_mesh_index"
 producers = ["MeshComponent", "SkeletalMeshComponent", "StaticMeshComponent"]
-consumers = ["helio-mesh-host", "helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-gi", "helio-pass-shadow", "helio-pass-transparent", "meshes_component"]
+consumers = ["helio-mesh-host", "helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-mesh-rays", "helio-pass-shadow", "helio-pass-transparent", "meshes_component"]
 owner = "helio_component (StaticMeshComponent pools); also declared by gbuffer's MeshComponent"
 disposition = "keep: same as builtin_mesh_vertex"
 target_contract = "Phase 2; 03-gpu-reflection-and-rendering.md"
@@ -293,7 +293,7 @@ status = "verified"
 [[buffer]]
 key = "builtin_mesh_vertex"
 producers = ["MeshComponent", "SkeletalMeshComponent", "StaticMeshComponent"]
-consumers = ["helio-mesh-host", "helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-gi", "helio-pass-shadow", "helio-pass-transparent", "meshes_component"]
+consumers = ["helio-mesh-host", "helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-mesh-rays", "helio-pass-shadow", "helio-pass-transparent", "meshes_component"]
 owner = "helio_component (StaticMeshComponent pools); also declared by gbuffer's MeshComponent"
 disposition = "keep: authored StaticMeshComponent pools are the canonical geometry; retire or merge the second, pass-owned producer"
 target_contract = "Phase 2; 03-gpu-reflection-and-rendering.md"
@@ -440,6 +440,16 @@ owner = "helio-pass-occlusion-cull"
 disposition = "keep: engine-internal (no authored scene input of its own); runs in the editor graph"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
 test = "plugins/installed/tests/render_acceptance.rs (every_pass_of_the_editor_graph_runs)"
+status = "verified"
+
+[[pass]]
+crate = "helio-pass-mesh-rays"
+in_default_graph = false
+reads = ["builtin_mesh_index", "builtin_mesh_vertex", "materials"]
+owner = "helio-pass-mesh-rays"
+disposition = "keep: the meshes' tracer of ray streams (helio_frame_api::rays::stream, rendering.md r1); its passes join a graph only where a consumer's node traces a stream"
+target_contract = "r1; Helio docs/architecture/rendering.md"
+test = "plugins/vendor/meshes/feature/rays/tests/mesh_rays_gpu.rs"
 status = "verified"
 
 [[pass]]

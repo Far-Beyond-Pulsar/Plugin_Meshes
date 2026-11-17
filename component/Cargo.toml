@@ -40,6 +40,7 @@ helio-pass-forward-lit = { workspace = true }
 helio-pass-gbuffer = { workspace = true }
 helio-pass-object-batch = { workspace = true }
 helio-pass-occlusion-cull = { workspace = true }
+helio-pass-mesh-rays = { workspace = true }
 helio-pass-shadow = { workspace = true }
 helio-pass-transparent = { workspace = true }
 helio-pass-vg = { workspace = true }

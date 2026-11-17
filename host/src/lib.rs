@@ -21,7 +21,8 @@ pub mod texture_means;
 pub use helio_mesh_api::host_rows::{MeshComponent, RenderGroupComponent, StaticObjectComponent};
 
 /// The meshes' Helio features: the object batch, its culling, the drawers
-/// (G-buffer, shadow casters, forward, transparent) and virtual geometry.
+/// (G-buffer, shadow casters, forward, transparent), virtual geometry and
+/// the meshes' tracer of ray streams.
 pub fn features() -> helio_feature_api::FeatureSet {
     helio_feature_api::FeatureSet::new()
         .with(helio_pass_object_batch::ObjectBatchFeature)
@@ -32,6 +33,7 @@ pub fn features() -> helio_feature_api::FeatureSet {
         .with(helio_pass_forward_lit::ForwardDrawers)
         .with(helio_pass_transparent::TransparentDrawers)
         .with(helio_pass_vg::VgFeature)
+        .with(helio_pass_mesh_rays::MeshRays)
 }
 
 /// Registers the meshes' columns (meshes, objects, render groups) with a
