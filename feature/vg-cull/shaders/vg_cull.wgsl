@@ -63,34 +63,13 @@ struct PhaseParams {
     pad1: u32,
 }
 
-// GpuStaticObject row as published by the scene join (see
-// helio-pass-object-batch `StaticObjectRow`); only `transform` is read.
-struct VgObjectRow {
-    mesh_slot: u32,
-    mesh_generation: u32,
-    material_slot: u32,
-    material_generation: u32,
-    transform: array<array<f32, 4>, 4>,
-    prev_transform: array<array<f32, 4>, 4>,
-    normal_mat: array<array<f32, 4>, 3>,
-    bounds: array<f32, 4>,
-    index_count: u32,
-    first_index: u32,
-    vertex_offset: i32,
-    material_class: u32,
-    graph_hash_lo: u32,
-    graph_hash_hi: u32,
-    flags: u32,
-    skin_vertex_offset: u32,
-    bone_palette_offset: u32,
-    bone_palette_count: u32,
-    _skin_pad: u32,
-}
+// `StaticObjectRow` (prepended, `helio_mesh_api::OBJECT_ROW_SNIPPET`): only
+// `transform` is read.
 
 @group(0) @binding(0) var<storage, read> cameras: array<Camera, 2>;
 @group(0) @binding(1) var<uniform> params: CullParams;
 @group(0) @binding(2) var<storage, read> vg_instances: array<VgInstance>;
-@group(0) @binding(3) var<storage, read> objects: array<VgObjectRow>;
+@group(0) @binding(3) var<storage, read> objects: array<StaticObjectRow>;
 // Bindings 4..=11 (page pool, residency, nodes, group refs, asset headers,
 // bases, quant, feedback) are declared by `helio_vg_stream::bindings_wgsl(0, 4, true)`.
 @group(0) @binding(12) var<storage, read> vg_gcbvh_nodes: array<VgBvhNode>;
@@ -392,7 +371,16 @@ const POLICY_DROP: u32 = 2u;
 //            Wrong answers here are safe both ways: a false "visible" is just
 //            an extra draw, a false "occluded" is retested in phase 1.
 //   phase 1: retest deferred work against the Hi-Z built from phase-0 depth.
+//   current Hi-Z (VGC_FLAG_CURRENT_HIZ): one phase against this frame's depth
+//            so far (exact), with this frame's view-projection: occluded work is
+//            dropped.
 fn occlusion_policy(job: vec2<u32>, c: vec3<f32>, r: f32) -> u32 {
+    if (params.flags & VGC_FLAG_CURRENT_HIZ) != 0u {
+        if rp.hiz_valid != 0u && hiz_sphere_occluded(c, r, cameras[0].view_proj) {
+            return POLICY_DROP;
+        }
+        return POLICY_PROCESS;
+    }
     if (params.flags & VGC_FLAG_TWO_PHASE) == 0u { return POLICY_PROCESS; }
     if rp.phase == 0u {
         if !hyst_test(job_key(job)) { return POLICY_DEFER; }
@@ -1165,6 +1153,39 @@ fn cs_seed() {
     queue_put(0u, 0u, vec2<u32>(0u, vg_gcbvh_header.root_node));
     atomicStore(&state[VGC_ST_Q_TAIL], 1u);
     atomicStore(&state[VGC_ST_OUTSTANDING], 1u);
+}
+
+// Frame start of a run whose instances are a spatial query's result
+// (`VgCullConfig::seeds_instances`, no instance tree): every enabled instance
+// is a job, one queue reservation per workgroup.
+var<workgroup> seed_n: atomic<u32>;
+var<workgroup> seed_base: u32;
+
+@compute @workgroup_size(64)
+fn cs_seed_instances(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+) {
+    if params.mode == VGC_MODE_OFF { return; }
+    if lid == 0u { atomicStore(&seed_n, 0u); }
+    workgroupBarrier();
+    let i = gid.x;
+    var enabled = false;
+    if i < params.instance_count && i < arrayLength(&vg_instances) {
+        enabled = (vg_instances[i].flags & VG_INST_ENABLED) != 0u;
+    }
+    var at = 0u;
+    if enabled { at = atomicAdd(&seed_n, 1u); }
+    workgroupBarrier();
+    if lid == 0u {
+        let n = atomicLoad(&seed_n);
+        seed_base = 0xffffffffu;
+        if n > 0u { seed_base = queue_reserve(0u, n); }
+    }
+    let base = workgroupUniformLoad(&seed_base);
+    if enabled && base != 0xffffffffu {
+        queue_put(0u, base + at, vec2<u32>(i, 3u << 30u));
+    }
 }
 
 // One thread, late phase start: the early phase's deferred jobs (queue 1) are

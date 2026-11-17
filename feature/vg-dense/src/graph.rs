@@ -37,7 +37,7 @@ use crate::{
 };
 
 /// [`VgDenseFrameData`] after Tier 3.
-pub const KEY_DENSE: &str = "vg_dense";
+pub const KEY_DENSE: &str = helio_vg_format::VgRun::DIRECT.dense;
 
 /// The Tier 3 result for `vis_resolve`.
 #[derive(Clone, Copy)]

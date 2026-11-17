@@ -6,6 +6,8 @@ description = "Virtual geometry GPU culling: instance BVH + cluster DAG cut, two
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# The scene join's object row the cull reads (`OBJECT_ROW_SNIPPET`).
+helio-mesh-api = { workspace = true }
 helio-core = { workspace = true }
 helio-mats = { workspace = true }
 helio-vg-format = { workspace = true }

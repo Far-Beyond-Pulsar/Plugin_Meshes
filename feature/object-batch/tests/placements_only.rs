@@ -76,7 +76,7 @@ fn rows(rng: &mut Rng, count: usize) -> Vec<StaticObjectComponent> {
                 skin_vertex_offset: 0,
                 bone_palette_offset: 0,
                 bone_palette_count: 0,
-                _skin_pad: 0,
+                section_index: 0,
             }
         })
         .collect()

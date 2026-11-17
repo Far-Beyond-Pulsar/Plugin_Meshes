@@ -61,6 +61,12 @@ pub const RAY_SURFACE_SNIPPET: helio_core::shader::ShaderSnippet =
 pub const DRAW_ROWS_SNIPPET: helio_core::shader::ShaderSnippet =
     helio_core::wgsl_snippet!("//!use mesh_draw_rows", "shaders/draw_rows.wgsl");
 
+/// The object row in WGSL (`//!use mesh_object_row`): [`StaticObjectRow`]
+/// as `struct StaticObjectRow`, for what reads the `static_objects` rows on
+/// the GPU.
+pub const OBJECT_ROW_SNIPPET: helio_core::shader::ShaderSnippet =
+    helio_core::wgsl_snippet!("//!use mesh_object_row", "shaders/object_row.wgsl");
+
 /// Graph key of the rows that follow the frame's TLAS instance order, a
 /// [`RayInstance`] an instance.
 pub const RAY_INSTANCES: &str = "ray_instances";

@@ -14,6 +14,8 @@ struct VsOut {
     @location(0) @interpolate(flat) id: u32,
     // Frame-space position, for a clipped view's plane.
     @location(1) world: vec3<f32>,
+    // The instance (a run drawn through another space clips per instance).
+    @location(2) @interpolate(flat) instance: u32,
 }
 
 // Whether the pipeline draws a clipped view (`helio_frame_api::view::CLIP_CONSTANT`).
@@ -29,6 +31,7 @@ fn vs_main(
     out.pos = vec4<f32>(0.0, 0.0, 2.0, 1.0);
     out.id = 0u;
     out.world = vec3<f32>(0.0);
+    out.instance = 0u;
 
     let vis = vg_visible[ii];
     let cs = vis.cluster_slot;
@@ -48,12 +51,16 @@ fn vs_main(
     out.pos = vg_to_clip(m, p);
     out.world = (m * vec4<f32>(p, 1.0)).xyz;
     out.id = vg_vis_pack(ii, tri);
+    out.instance = vis.instance;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) u32 {
     if HELIO_VIEW_CLIP && vg_view_clipped(in.world) {
+        discard;
+    }
+    if vg_chain_clipped(in.instance, in.world, vec2<i32>(in.pos.xy)) {
         discard;
     }
     return in.id;

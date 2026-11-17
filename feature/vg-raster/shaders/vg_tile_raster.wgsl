@@ -115,6 +115,7 @@ fn tile_raster_main(
                 local_hits++;                     // counted like the atomic kernel: every fragment passing Tier 1
                 if (db < best_db) { continue; }   // behind the current best
                 let id = tile_bin_entries[tile * vg_params.tile_bin_cap + b * VG_TILE_BATCH + i];
+                if (vg_chain_clipped(vg_visible[vg_vis_cluster(id)].instance, vg_pixel_world(px, py, d), vec2<i32>(px, py))) { continue; }
                 if (db > best_db || !found || id > best_id) {
                     best_db = db;
                     best_id = id;

@@ -56,6 +56,10 @@ fn group_of(workgroup: vec3<u32>) -> u32 {
 
 /// Whether `inst` may show through `chain`.
 fn occurs(inst: GpuInstanceData, chain: GpuPortalChain) -> bool {
+    // Another drawer draws it (virtual geometry, through its own chains run).
+    if (inst.flags & INSTANCE_FLAG_CLASSIC_SUPPRESSED) != 0u {
+        return false;
+    }
     let space = coordinate_spaces[instance_coordinate_space(inst.flags)];
     let center = (space * vec4<f32>(inst.bounds.xyz, 1.0)).xyz;
     let radius = inst.bounds.w;

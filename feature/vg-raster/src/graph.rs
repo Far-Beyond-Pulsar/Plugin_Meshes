@@ -15,22 +15,23 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use helio_core::graph::{ResourceBuilder, ResourceFormat, ResourceSize};
-use helio_core::{
-    BufferKey, PassContext, PrepareContext, RenderPass, ResourceKey, Result as HelioResult,
-};
+use helio_core::{PassContext, PrepareContext, RenderPass, ResourceKey, Result as HelioResult};
 use helio_pass_vg_cull::{
     hw_masked_draw_args_offset, state, sw_dispatch_args_offset, sw_masked_dispatch_args_offset,
     VgCullFrameData, VgCullInputs, ARGS_BYTE_OFFSET, ARGS_PHASE_BYTES, BIN_COUNT, BIN_SW,
-    BIN_SW_MASKED, KEY_CULL, KEY_CULL_EARLY, KEY_HIZ_LATE, KEY_INPUTS,
+    BIN_SW_MASKED,
 };
+use helio_vg_format::VgRun;
 use wgpu::util::DeviceExt;
 
-use crate::{VgMaskedInputs, VgRaster, VgRasterConfig, VgRasterInputs, VgTargets};
+use crate::{VgChainClip, VgMaskedInputs, VgRaster, VgRasterConfig, VgRasterInputs, VgTargets};
 
-/// [`VgRasterFrameData`] after phase 0.
-pub const KEY_RASTER_EARLY: &str = "vg_raster_early";
-/// [`VgRasterFrameData`] after phase 1 and tile classification (final).
-pub const KEY_RASTER: &str = "vg_raster";
+/// [`VgRasterFrameData`] after phase 0, of the frame's own run
+/// ([`VgRun::DIRECT`]`.raster_early`; every run names its own).
+pub const KEY_RASTER_EARLY: &str = VgRun::DIRECT.raster_early;
+/// [`VgRasterFrameData`] after phase 1 and tile classification (final), of
+/// the frame's own run ([`VgRun::DIRECT`]`.raster`).
+pub const KEY_RASTER: &str = VgRun::DIRECT.raster;
 
 /// What the dense tier and the shading read. `Copy` so it lives in the frame
 /// registry.
@@ -185,17 +186,21 @@ impl Published {
     }
 }
 
-fn cull_inputs<'a>(registry: &'a helio_core::ResourceRegistry<'a>) -> Option<VgCullInputs<'a>> {
-    registry.get::<VgCullInputs<'a>>(ResourceKey::new(KEY_INPUTS))
+fn cull_inputs<'a>(
+    registry: &'a helio_core::ResourceRegistry<'a>,
+    run: &VgRun,
+) -> Option<VgCullInputs<'a>> {
+    registry.get::<VgCullInputs<'a>>(ResourceKey::new(run.inputs))
 }
 
 fn record_phase(
     shared: &VgRasterShared,
     ctx: &mut PassContext,
+    run: &VgRun,
     cull_key: &'static str,
     phase: u32,
 ) -> Option<Published> {
-    let inputs = cull_inputs(ctx.registry)?;
+    let inputs = cull_inputs(ctx.registry, run)?;
     let cull = ctx
         .registry
         .get::<VgCullFrameData<'_>>(ResourceKey::new(cull_key))?;
@@ -219,6 +224,18 @@ fn record_phase(
         }),
         _ => None,
     };
+    // A run drawn through portal chains: the chains it clips to, as the
+    // portals published them this frame.
+    let clip = inputs.remaps.and_then(|remaps| {
+        let reg = ctx.registry;
+        Some(VgChainClip {
+            remaps,
+            chains: reg.buffer(ResourceKey::new(helio_portal_api::PORTAL_CHAINS))?,
+            stages: reg.buffer(ResourceKey::new(helio_portal_api::PORTAL_STAGES))?,
+            mask: ctx.resource_pool.get_view(helio_portal_api::PORTAL_MASK)?,
+            view_remaps: reg.buffer(ResourceKey::new(helio_frame_api::lighting::VIEW_REMAPS))?,
+        })
+    });
     let raster_inputs = VgRasterInputs {
         camera: ctx.camera,
         view_index: 0,
@@ -234,6 +251,7 @@ fn record_phase(
         sw_dispatch: cull.state,
         sw_dispatch_offset: sw_dispatch_args_offset(phase),
         masked,
+        clip,
     };
     let mut rec = ctx.graphics_cmds();
     raster.encode_phase(
@@ -260,6 +278,8 @@ fn record_phase(
 pub struct VgRasterEarlyPass {
     shared: VgRasterShared,
     published: Option<Published>,
+    run: &'static VgRun,
+    gate: Option<helio_vg_format::VgRunGate>,
 }
 
 impl VgRasterEarlyPass {
@@ -267,17 +287,31 @@ impl VgRasterEarlyPass {
         &self.shared
     }
 
-    pub fn new(shared: VgRasterShared) -> Self {
+    pub fn new(shared: VgRasterShared, run: &'static VgRun) -> Self {
         Self {
             shared,
             published: None,
+            run,
+            gate: None,
         }
+    }
+
+    /// Schedule this pass only while `gate` is open (a run whose content
+    /// another pass decides, [`helio_vg_format::VgRunGate`]).
+    pub fn with_gate(mut self, gate: helio_vg_format::VgRunGate) -> Self {
+        self.gate = Some(gate);
+        self
     }
 }
 
 impl RenderPass for VgRasterEarlyPass {
+    /// A gated run's pass is a member only while its gate is open.
+    fn is_member(&mut self, _scene: &mut helio_core::SceneContent<'_>) -> bool {
+        self.gate.as_ref().is_none_or(|gate| gate.is_open())
+    }
+
     fn name(&self) -> &'static str {
-        "VgRasterEarly"
+        self.run.names.raster_early
     }
 
     fn reads(&self) -> &'static [&'static str] {
@@ -285,13 +319,13 @@ impl RenderPass for VgRasterEarlyPass {
     }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
-        builder.read(KEY_INPUTS);
-        builder.read(KEY_CULL_EARLY);
-        builder.write_buffer(KEY_RASTER_EARLY);
+        builder.read(self.run.inputs);
+        builder.read(self.run.cull_early);
+        builder.write_buffer(self.run.raster_early);
     }
 
     fn prepare(&mut self, ctx: &PrepareContext) -> HelioResult<()> {
-        if cull_inputs(ctx.registry).is_some() {
+        if cull_inputs(ctx.registry, self.run).is_some() {
             self.shared
                 .ensure_targets(ctx.device, ctx.width, ctx.height);
         }
@@ -299,16 +333,16 @@ impl RenderPass for VgRasterEarlyPass {
     }
 
     fn execute(&mut self, ctx: &mut PassContext) -> HelioResult<()> {
-        self.published = record_phase(&self.shared, ctx, KEY_CULL_EARLY, 0);
+        self.published = record_phase(&self.shared, ctx, self.run, self.run.cull_early, 0);
         Ok(())
     }
 
     fn publish<'a>(&self, frame: &mut helio_core::ResourceRegistry<'a>) {
         if let Some(p) = &self.published {
             frame.write(
-                ResourceKey::new(KEY_RASTER_EARLY),
+                ResourceKey::new(self.run.raster_early),
                 p.data(),
-                "VgRasterEarly",
+                self.run.names.raster_early,
             );
         }
     }
@@ -318,20 +352,36 @@ impl RenderPass for VgRasterEarlyPass {
 pub struct VgRasterLatePass {
     shared: VgRasterShared,
     published: Option<Published>,
+    run: &'static VgRun,
+    gate: Option<helio_vg_format::VgRunGate>,
 }
 
 impl VgRasterLatePass {
-    pub fn new(shared: VgRasterShared) -> Self {
+    pub fn new(shared: VgRasterShared, run: &'static VgRun) -> Self {
         Self {
             shared,
             published: None,
+            run,
+            gate: None,
         }
+    }
+
+    /// Schedule this pass only while `gate` is open (a run whose content
+    /// another pass decides, [`helio_vg_format::VgRunGate`]).
+    pub fn with_gate(mut self, gate: helio_vg_format::VgRunGate) -> Self {
+        self.gate = Some(gate);
+        self
     }
 }
 
 impl RenderPass for VgRasterLatePass {
+    /// A gated run's pass is a member only while its gate is open.
+    fn is_member(&mut self, _scene: &mut helio_core::SceneContent<'_>) -> bool {
+        self.gate.as_ref().is_none_or(|gate| gate.is_open())
+    }
+
     fn name(&self) -> &'static str {
-        "VgRasterLate"
+        self.run.names.raster_late
     }
 
     fn reads(&self) -> &'static [&'static str] {
@@ -339,27 +389,31 @@ impl RenderPass for VgRasterLatePass {
     }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
-        builder.read(KEY_RASTER_EARLY);
-        builder.read(KEY_CULL);
-        builder.write_buffer(KEY_RASTER);
+        builder.read(self.run.raster_early);
+        builder.read(self.run.cull);
+        builder.write_buffer(self.run.raster);
     }
 
     fn execute(&mut self, ctx: &mut PassContext) -> HelioResult<()> {
         self.published = None;
         if ctx
             .registry
-            .get::<VgRasterFrameData<'_>>(ResourceKey::new(KEY_RASTER_EARLY))
+            .get::<VgRasterFrameData<'_>>(ResourceKey::new(self.run.raster_early))
             .is_none()
         {
             return Ok(());
         }
-        self.published = record_phase(&self.shared, ctx, KEY_CULL, 1);
+        self.published = record_phase(&self.shared, ctx, self.run, self.run.cull, 1);
         Ok(())
     }
 
     fn publish<'a>(&self, frame: &mut helio_core::ResourceRegistry<'a>) {
         if let Some(p) = &self.published {
-            frame.write(ResourceKey::new(KEY_RASTER), p.data(), "VgRasterLate");
+            frame.write(
+                ResourceKey::new(self.run.raster),
+                p.data(),
+                self.run.names.raster_late,
+            );
         }
     }
 }
@@ -406,9 +460,22 @@ struct HizLevel {
     groups: (u32, u32),
 }
 
-/// Builds the Hi-Z pyramid of the phase-0 depth into the graph texture
-/// `vg_hiz_late`, which the late cull samples (`KEY_HIZ_LATE`).
-pub struct VgHizLatePass {
+/// What a [`VgHizPass`] builds its pyramid from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VgHizSource {
+    /// The run's own phase-0 depth, into its `hiz_late` (the late cull's).
+    PhaseZero,
+    /// The frame's depth as the drawers before the run left it, into the run's
+    /// `hiz_early` (a run drawn after other drawers, `VgRun::builds_hiz_early`).
+    FrameDepth,
+}
+
+/// Builds a Hi-Z pyramid ([`VgHizSource`]) into a graph texture the run's cull
+/// samples.
+pub struct VgHizPass {
+    run: &'static VgRun,
+    source: VgHizSource,
+    gate: Option<helio_vg_format::VgRunGate>,
     mip0: wgpu::ComputePipeline,
     mip0_bgl: wgpu::BindGroupLayout,
     mipn: wgpu::ComputePipeline,
@@ -419,8 +486,20 @@ pub struct VgHizLatePass {
     mip_views: Vec<wgpu::TextureView>,
 }
 
-impl VgHizLatePass {
-    pub fn new(device: &wgpu::Device) -> Self {
+impl VgHizPass {
+    /// Schedule this pass only while `gate` is open (a run whose content
+    /// another pass decides, [`helio_vg_format::VgRunGate`]).
+    pub fn with_gate(mut self, gate: helio_vg_format::VgRunGate) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// The late cull's Hi-Z of the run's phase-0 depth.
+    pub fn late(device: &wgpu::Device, run: &'static VgRun) -> Self {
+        Self::new(device, run, VgHizSource::PhaseZero)
+    }
+
+    pub fn new(device: &wgpu::Device, run: &'static VgRun, source: VgHizSource) -> Self {
         let cs = wgpu::ShaderStages::COMPUTE;
         let uniform = |binding| wgpu::BindGroupLayoutEntry {
             binding,
@@ -494,6 +573,9 @@ impl VgHizLatePass {
             })
         };
         Self {
+            run,
+            source,
+            gate: None,
             mip0: pipeline("VG Hiz mip0", HIZ_MIP0_WGSL, "mip0", &mip0_bgl),
             mipn: pipeline("VG Hiz mipN", HIZ_MIPN_WGSL, "mipn", &mipn_bgl),
             mip0_bgl,
@@ -579,16 +661,37 @@ impl VgHizLatePass {
     }
 }
 
-impl RenderPass for VgHizLatePass {
+impl VgHizPass {
+    fn output(&self) -> &'static str {
+        match self.source {
+            VgHizSource::PhaseZero => self.run.hiz_late,
+            VgHizSource::FrameDepth => self.run.hiz_early,
+        }
+    }
+}
+
+impl RenderPass for VgHizPass {
+    /// A gated run's pass is a member only while its gate is open.
+    fn is_member(&mut self, _scene: &mut helio_core::SceneContent<'_>) -> bool {
+        self.gate.as_ref().is_none_or(|gate| gate.is_open())
+    }
+
     fn name(&self) -> &'static str {
-        "VgHizLate"
+        match self.source {
+            VgHizSource::PhaseZero => self.run.names.hiz_late,
+            VgHizSource::FrameDepth => self.run.names.hiz_early,
+        }
     }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
-        builder.read(KEY_RASTER_EARLY);
+        match self.source {
+            VgHizSource::PhaseZero => builder.read(self.run.raster_early),
+            // After the drawers before the run: their depth.
+            VgHizSource::FrameDepth => builder.read(helio_core::resource_keys::DEPTH),
+        }
         // Full mip chain is allocated for R32Float by the graph (like `hiz`).
         builder.write_color(
-            KEY_HIZ_LATE,
+            self.output(),
             ResourceFormat::R32Float,
             ResourceSize::MatchSurface,
         );
@@ -602,24 +705,39 @@ impl RenderPass for VgHizLatePass {
     }
 
     fn execute(&mut self, ctx: &mut PassContext) -> HelioResult<()> {
-        let Some(early) = ctx
+        // Nothing to cull this frame: no pyramid.
+        if ctx
             .registry
-            .get::<VgRasterFrameData<'_>>(ResourceKey::new(KEY_RASTER_EARLY))
-        else {
+            .get::<VgCullInputs<'_>>(ResourceKey::new(self.run.inputs))
+            .is_none()
+        {
+            return Ok(());
+        }
+        let (depth, width, height) = match self.source {
+            VgHizSource::PhaseZero => {
+                let Some(early) = ctx
+                    .registry
+                    .get::<VgRasterFrameData<'_>>(ResourceKey::new(self.run.raster_early))
+                else {
+                    return Ok(());
+                };
+                (early.depth, early.width, early.height)
+            }
+            VgHizSource::FrameDepth => (ctx.depth, ctx.width, ctx.height),
+        };
+        let Some(texture) = ctx.resource_pool.get_texture(self.output()) else {
             return Ok(());
         };
-        let Some(texture) = ctx.resource_pool.get_texture(KEY_HIZ_LATE) else {
-            return Ok(());
-        };
-        let stale = self.built_for.as_ref().is_none_or(|(view, w, h)| {
-            view != early.depth || *w != early.width || *h != early.height
-        });
+        let stale = self
+            .built_for
+            .as_ref()
+            .is_none_or(|(view, w, h)| view != depth || *w != width || *h != height);
         if stale {
-            self.rebuild(ctx.device, texture, early.depth, early.width, early.height);
+            self.rebuild(ctx.device, texture, depth, width, height);
         }
         let mut cmds = ctx.graphics_cmds();
         let mut pass = cmds.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("VG Hiz Late"),
+            label: Some(self.name()),
             timestamp_writes: None,
         });
         for (mip, level) in self.levels.iter().enumerate() {
@@ -631,21 +749,21 @@ impl RenderPass for VgHizLatePass {
     }
 }
 
-/// The three passes, sharing one [`VgRasterShared`].
+/// The three passes of `run`, sharing one [`VgRasterShared`].
 pub struct VgRasterPasses {
     pub shared: VgRasterShared,
     pub early: VgRasterEarlyPass,
-    pub hiz_late: VgHizLatePass,
+    pub hiz_late: VgHizPass,
     pub late: VgRasterLatePass,
 }
 
 impl VgRasterPasses {
-    pub fn new(device: &wgpu::Device, config: VgRasterConfig) -> Self {
+    pub fn new(device: &wgpu::Device, config: VgRasterConfig, run: &'static VgRun) -> Self {
         let shared = VgRasterShared::new(device, config);
         Self {
-            early: VgRasterEarlyPass::new(shared.clone()),
-            hiz_late: VgHizLatePass::new(device),
-            late: VgRasterLatePass::new(shared.clone()),
+            early: VgRasterEarlyPass::new(shared.clone(), run),
+            hiz_late: VgHizPass::late(device, run),
+            late: VgRasterLatePass::new(shared.clone(), run),
             shared,
         }
     }

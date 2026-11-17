@@ -524,7 +524,10 @@ impl ObjectBatchPass {
             device,
             "ObjectBatch Shader",
             helio_core::include_wgsl!("../shaders/object_batch.wgsl"),
-            &[helio_mats::MATERIAL_ROW_SNIPPET],
+            &[
+                helio_mats::MATERIAL_ROW_SNIPPET,
+                helio_mesh_api::OBJECT_ROW_SNIPPET,
+            ],
         );
 
         let cs = wgpu::ShaderStages::COMPUTE;

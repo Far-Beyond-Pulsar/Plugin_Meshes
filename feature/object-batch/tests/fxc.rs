@@ -14,7 +14,8 @@ fn compute_shaders_compile_under_fxc() {
     let sources: Vec<(&str, String)> = vec![
         ("scene_join_meshes", helio_pass_object_batch::scene_join::mesh_join_source()),
         ("object_batch", format!("{}
-{}", include_str!("../shaders/object_batch.wgsl"), helio_mats::MATERIAL_ROW_SNIPPET.source)),
+{}
+{}", include_str!("../shaders/object_batch.wgsl"), helio_mats::MATERIAL_ROW_SNIPPET.source, helio_mesh_api::OBJECT_ROW_SNIPPET.source)),
     ];
     let mut failures = Vec::new();
     for (name, src) in sources {

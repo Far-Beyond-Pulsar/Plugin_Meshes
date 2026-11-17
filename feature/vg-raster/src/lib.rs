@@ -75,11 +75,11 @@ pub mod shaders;
 pub mod stream;
 
 pub use pass::{
-    optional_features, supports_int64_atomics, VgMaskedInputs, VgRaster,
+    optional_features, supports_int64_atomics, VgChainClip, VgMaskedInputs, VgRaster,
     VgRasterConfig, VgRasterInputs, VgTargets, DEPTH_FORMAT, VIS_FORMAT,
 };
 
 pub use graph::{
-    VgHizLatePass, VgRasterEarlyPass, VgRasterFrameData, VgRasterLatePass, VgRasterPasses,
+    VgHizPass, VgHizSource, VgRasterEarlyPass, VgRasterFrameData, VgRasterLatePass, VgRasterPasses,
     VgRasterShared, KEY_RASTER, KEY_RASTER_EARLY,
 };

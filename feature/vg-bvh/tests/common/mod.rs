@@ -46,7 +46,7 @@ pub fn object(center: [f32; 3], radius: f32) -> StaticObjectRow {
         skin_vertex_offset: 0,
         bone_palette_offset: 0,
         bone_palette_count: 0,
-        _skin_pad: 0,
+        section_index: 0,
     }
 }
 

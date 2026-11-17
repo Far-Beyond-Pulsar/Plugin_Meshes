@@ -52,6 +52,11 @@ pub struct VgRasterConfig {
     /// hardware raster tests it per pixel (the cull sends every cluster
     /// crossing it there).
     pub clip: bool,
+    /// The run draws through another space (its instances carry remaps,
+    /// `helio_vg_format::VgRun::remapped`): every tier clips each fragment to
+    /// what its instance's chain shows (`shaders/vg_chain_clip.wgsl`, group 3,
+    /// [`VgChainClip`]).
+    pub chain_clip: bool,
 }
 
 /// Calibration override (measurement runs only): a `u32` from the environment.
@@ -72,6 +77,7 @@ impl Default for VgRasterConfig {
             dense_max_tiles: env_u32("HELIO_VG_DENSE_MAX_TILES").unwrap_or(512),
             force_tile_fallback: false,
             clip: false,
+            chain_clip: false,
         }
     }
 }
@@ -107,6 +113,22 @@ pub struct VgRasterInputs<'a> {
     /// Alpha-masked clusters (bins 6 and 7 of the cull). `None` records nothing
     /// for them; the opaque tiers are identical either way.
     pub masked: Option<VgMaskedInputs<'a>>,
+    /// The chains a run drawn through another space clips to
+    /// ([`VgRasterConfig::chain_clip`]); such a run records nothing without it.
+    pub clip: Option<VgChainClip<'a>>,
+}
+
+/// What [`VgRasterConfig::chain_clip`] clips with (group 3 of every tier): each
+/// instance's chain, the portals' chain rows and aperture mask
+/// (`helio_portal_api`), and the frame's remaps (drawn space to the content's
+/// world, `helio_frame_api::lighting::VIEW_REMAPS`).
+#[derive(Clone, Copy)]
+pub struct VgChainClip<'a> {
+    pub remaps: &'a wgpu::Buffer,
+    pub chains: &'a wgpu::Buffer,
+    pub stages: &'a wgpu::Buffer,
+    pub mask: &'a wgpu::TextureView,
+    pub view_remaps: &'a wgpu::Buffer,
 }
 
 /// Inputs of the alpha-masked tiers (see `helio_mats::vg_alpha`).
@@ -338,16 +360,66 @@ fn pipeline_layout(
     label: &str,
     layouts: &[&wgpu::BindGroupLayout],
 ) -> wgpu::PipelineLayout {
-    let layouts: Vec<Option<&wgpu::BindGroupLayout>> = layouts.iter().map(|l| Some(*l)).collect();
+    pipeline_layout_with_clip(device, label, layouts, None)
+}
+/// `layouts` in groups 0.., then `clip` in group 3 (a run drawn through
+/// another space, [`VgChainClip`]).
+fn pipeline_layout_with_clip(
+    device: &wgpu::Device,
+    label: &str,
+    layouts: &[&wgpu::BindGroupLayout],
+    clip: Option<&wgpu::BindGroupLayout>,
+) -> wgpu::PipelineLayout {
+    let mut layouts: Vec<Option<&wgpu::BindGroupLayout>> =
+        layouts.iter().map(|l| Some(*l)).collect();
+    if let Some(clip) = clip {
+        layouts.resize(CLIP_GROUP as usize, None);
+        layouts.push(Some(clip));
+    }
     device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
         bind_group_layouts: &layouts,
         immediate_size: 0,
     })
 }
+/// The bind group of [`VgChainClip`] in every tier's pipelines.
+const CLIP_GROUP: u32 = 3;
+fn clip_layout(
+    device: &wgpu::Device,
+    label: &str,
+    vis: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayout {
+    let fragment_or_compute = vis;
+    bgl(
+        device,
+        label,
+        &[
+            storage_entry(0, fragment_or_compute, true),
+            storage_entry(1, fragment_or_compute, true),
+            storage_entry(2, fragment_or_compute, true),
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: fragment_or_compute,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            uniform_entry(4, fragment_or_compute),
+        ],
+    )
+}
 fn module(device: &wgpu::Device, label: &str, src: String) -> wgpu::ShaderModule {
-    // Expands the prelude `vg_bindings.wgsl` opts into (the frame's camera).
-    helio_core::shader::module(device, label, src.as_str())
+    // Expands the prelude `vg_bindings.wgsl` opts into (the frame's camera),
+    // and the portals' chain tests a chain-clipped run's kernels use.
+    helio_core::shader::module_with(
+        device,
+        label,
+        src.as_str(),
+        &[helio_portal_api::PORTAL_CHAIN_SNIPPET],
+    )
 }
 fn compute(
     device: &wgpu::Device,
@@ -393,6 +465,8 @@ pub struct VgRaster {
     /// Built on first use: devices and scenes without alpha-tested materials
     /// never compile (or pay for) the masked pipelines.
     masked: std::sync::OnceLock<MaskedPipelines>,
+    /// Group 3 of a chain-clipped run (render and compute visibility).
+    clip_bgl: Option<(wgpu::BindGroupLayout, wgpu::BindGroupLayout)>,
 }
 
 struct MaskedPipelines {
@@ -418,10 +492,24 @@ impl VgRaster {
         };
         let bgl0_vertex = bgl(device, "VG Raster G0 (vertex)", &group0(v));
         let bgl0_compute = bgl(device, "VG Raster G0 (compute)", &group0(c));
+        let clip = config.chain_clip;
+        let clip_bgl = clip.then(|| {
+            (
+                clip_layout(
+                    device,
+                    "VG Raster Clip G3 (fragment)",
+                    wgpu::ShaderStages::FRAGMENT,
+                ),
+                clip_layout(device, "VG Raster Clip G3 (compute)", c),
+            )
+        });
+        let clip_render = clip_bgl.as_ref().map(|(render, _)| render);
+        let clip_compute = clip_bgl.as_ref().map(|(_, compute)| compute);
 
         // Tier 1.
-        let hw_mod = module(device, "VG HW Raster", shaders::hw_raster_source());
-        let hw_layout = pipeline_layout(device, "VG HW Raster PL", &[&bgl0_vertex]);
+        let hw_mod = module(device, "VG HW Raster", shaders::hw_raster_source(clip));
+        let hw_layout =
+            pipeline_layout_with_clip(device, "VG HW Raster PL", &[&bgl0_vertex], clip_render);
         let hw = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("VG HW Raster"),
             layout: Some(&hw_layout),
@@ -466,7 +554,7 @@ impl VgRaster {
 
         // Tier 2.
         let (sw64, tile) = if int64 {
-            let m = module(device, "VG SW Raster", shaders::sw_raster_source());
+            let m = module(device, "VG SW Raster", shaders::sw_raster_source(clip));
             let bgl1 = bgl(
                 device,
                 "VG SW Raster G1",
@@ -478,7 +566,12 @@ impl VgRaster {
                     storage_entry(4, c, true),
                 ],
             );
-            let pl = pipeline_layout(device, "VG SW Raster PL", &[&bgl0_compute, &bgl1]);
+            let pl = pipeline_layout_with_clip(
+                device,
+                "VG SW Raster PL",
+                &[&bgl0_compute, &bgl1],
+                clip_compute,
+            );
             (
                 Some(Sw64 {
                     pipeline: compute(device, "VG SW Raster", &pl, &m, "sw_raster_main"),
@@ -499,7 +592,7 @@ impl VgRaster {
                 ],
             );
             let bpl = pipeline_layout(device, "VG SW Bin PL", &[&bgl0_compute, &bin_bgl1]);
-            let tm = module(device, "VG Tile Raster", shaders::tile_raster_source());
+            let tm = module(device, "VG Tile Raster", shaders::tile_raster_source(clip));
             let raster_bgl1 = bgl(
                 device,
                 "VG Tile Raster G1",
@@ -511,7 +604,12 @@ impl VgRaster {
                     storage_entry(4, c, false),
                 ],
             );
-            let tpl = pipeline_layout(device, "VG Tile Raster PL", &[&bgl0_compute, &raster_bgl1]);
+            let tpl = pipeline_layout_with_clip(
+                device,
+                "VG Tile Raster PL",
+                &[&bgl0_compute, &raster_bgl1],
+                clip_compute,
+            );
             (
                 None,
                 Some(TileFallback {
@@ -554,6 +652,7 @@ impl VgRaster {
             classify_bgl,
             binding: helio_mats::MaterialBindingConfig::for_device(device),
             masked: std::sync::OnceLock::new(),
+            clip_bgl,
         }
     }
 
@@ -580,12 +679,13 @@ impl VgRaster {
             let hw_mod = module(
                 device,
                 "VG HW Raster Masked",
-                shaders::hw_masked_source(self.binding),
+                shaders::hw_masked_source(self.binding, self.config.chain_clip),
             );
-            let hw_layout = pipeline_layout(
+            let hw_layout = pipeline_layout_with_clip(
                 device,
                 "VG HW Raster Masked PL",
                 &[&self.bgl0_vertex, &hw_bgl1],
+                self.clip_bgl.as_ref().map(|(render, _)| render),
             );
             let hw = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("VG HW Raster Masked"),
@@ -639,12 +739,13 @@ impl VgRaster {
                 let m = module(
                     device,
                     "VG SW Raster Masked",
-                    shaders::sw_masked_source(self.binding),
+                    shaders::sw_masked_source(self.binding, self.config.chain_clip),
                 );
-                let pl = pipeline_layout(
+                let pl = pipeline_layout_with_clip(
                     device,
                     "VG SW Raster Masked PL",
                     &[&self.bgl0_compute, &sw64.bgl1, &alpha_bgl],
+                    self.clip_bgl.as_ref().map(|(_, compute)| compute),
                 );
                 (
                     compute(
@@ -695,6 +796,30 @@ impl VgRaster {
         i: &VgRasterInputs<'_>,
         phase: u32,
     ) {
+        // A chain-clipped run draws nothing it cannot clip.
+        let clip_groups = match (&self.clip_bgl, &i.clip) {
+            (None, _) => None,
+            (Some(_), None) => return,
+            (Some((render, compute)), Some(clip)) => {
+                let group = |layout: &wgpu::BindGroupLayout| {
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("VG Raster Clip G3"),
+                        layout,
+                        entries: &[
+                            bind(0, clip.remaps),
+                            bind(1, clip.chains),
+                            bind(2, clip.stages),
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(clip.mask),
+                            },
+                            bind(4, clip.view_remaps),
+                        ],
+                    })
+                };
+                Some((group(render), group(compute)))
+            }
+        };
         let slot = (phase & 1) as usize;
         let params = VgRasterParams {
             width: t.width,
@@ -802,6 +927,9 @@ impl VgRaster {
             });
             pass.set_pipeline(&self.hw);
             pass.set_bind_group(0, &g0v, &[]);
+            if let Some((render, _)) = &clip_groups {
+                pass.set_bind_group(CLIP_GROUP, render, &[]);
+            }
             for b in 0..abi::HW_BIN_CAPS.len() as u64 {
                 pass.draw_indirect(i.hw_indirect, i.hw_indirect_offset + b * 16);
             }
@@ -820,6 +948,9 @@ impl VgRaster {
             label: Some("VG SW Raster"),
             timestamp_writes: None,
         });
+        if let Some((_, compute)) = &clip_groups {
+            cpass.set_bind_group(CLIP_GROUP, compute, &[]);
+        }
         if let Some(sw) = &self.sw64 {
             let g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("VG SW Raster G1"),

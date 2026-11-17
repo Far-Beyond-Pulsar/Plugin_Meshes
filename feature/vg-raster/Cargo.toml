@@ -11,6 +11,8 @@ helio-vg-format = { workspace = true }
 helio-mats = { workspace = true }
 helio-frame-api = { workspace = true }
 helio-pass-vg-cull = { workspace = true }
+# The chain tests a run drawn through portal chains clips with (`portal_chain`).
+helio-portal-api = { workspace = true }
 wgpu            = { workspace = true }
 bytemuck        = { workspace = true, features = ["derive"] }
 log             = { workspace = true }

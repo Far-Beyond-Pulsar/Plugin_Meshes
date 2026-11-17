@@ -87,6 +87,7 @@ fn sw_raster_main(
                     let d = vg_tri_depth_at(s, x, y);
                     if (d < 0.0) { continue; }
                     if (d < textureLoad(hw_depth, vec2<i32>(x, y), 0)) { continue; }
+                    if (vg_chain_clipped(vis.instance, vg_pixel_world(x, y, d), vec2<i32>(x, y))) { continue; }
                     let key = (u64(bitcast<u32>(d)) << 32u) | u64(id);
                     atomicMax(&sw_keys[u32(y) * vg_params.width + u32(x)], key);
                     let tile = (u32(y) >> 4u) * vg_params.tiles_x + (u32(x) >> 4u);

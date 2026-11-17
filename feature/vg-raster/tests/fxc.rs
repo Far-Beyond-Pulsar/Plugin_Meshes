@@ -17,7 +17,13 @@ fn raster_shaders_compile_under_fxc() {
         if name.starts_with("vg_sw_raster") {
             continue;
         }
-        failures.extend(fxc::fxc_failures(&fxc_exe, name, &helio_core::shader::resolve(&src)));
+        // Resolved as the raster resolves it (the chain clip's snippet).
+        let src = helio_core::shader::resolve_with(&src, &[helio_portal_api::PORTAL_CHAIN_SNIPPET]);
+        failures.extend(fxc::fxc_failures(&fxc_exe, name, &src));
     }
-    assert!(failures.is_empty(), "FXC rejected:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "FXC rejected:\n{}",
+        failures.join("\n")
+    );
 }

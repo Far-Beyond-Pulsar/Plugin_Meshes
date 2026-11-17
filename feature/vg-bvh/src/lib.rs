@@ -75,11 +75,11 @@ pub mod keys {
     /// Input: the scene join's moved-slot list (see crate docs).
     pub const MOVED: &str = helio_mesh_api::OBJECTS_MOVED.name();
     /// Output: `array<VgBvhNode>`.
-    pub const NODES: &str = "vg_gcbvh_nodes";
+    pub const NODES: &str = helio_vg_format::VgRun::DIRECT.tree().nodes;
     /// Output: `VgBvhHeader`.
-    pub const HEADER: &str = "vg_gcbvh_header";
+    pub const HEADER: &str = helio_vg_format::VgRun::DIRECT.tree().header;
     /// Output: `array<u32>`, leaf item -> `vg_instances` row.
-    pub const ITEMS: &str = "vg_gcbvh_items";
+    pub const ITEMS: &str = helio_vg_format::VgRun::DIRECT.tree().items;
 }
 
 const WG: u32 = 256;
@@ -406,7 +406,12 @@ impl VgBvhPass {
 
     pub fn with_config(device: &wgpu::Device, cfg: BvhConfig) -> Self {
         let source = format!("{NODES_WGSL}\n{BUILD_WGSL}");
-        let module = helio_core::shader::module(device, "VgBvh Shader", source.as_str());
+        let module = helio_core::shader::module_with(
+            device,
+            "VgBvh Shader",
+            source.as_str(),
+            &[helio_mesh_api::OBJECT_ROW_SNIPPET],
+        );
         let cs = wgpu::ShaderStages::COMPUTE;
 
         let mut bgls = Vec::new();

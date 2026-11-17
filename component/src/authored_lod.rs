@@ -198,7 +198,12 @@ impl AuthoredLodSelection {
         let apply_module = helio_core::shader::module(
             device,
             "Authored LOD Apply",
-            helio_scene_join::join_source(include_str!("authored_lod_apply.wgsl")).as_str(),
+            helio_scene_join::join_source(&format!(
+                "{}\n{}",
+                helio_mesh_api::OBJECT_ROW_SNIPPET.source,
+                include_str!("authored_lod_apply.wgsl")
+            ))
+            .as_str(),
         );
         let apply_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

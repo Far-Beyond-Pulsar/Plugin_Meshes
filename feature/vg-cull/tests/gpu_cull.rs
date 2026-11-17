@@ -156,13 +156,16 @@ impl Resources {
                 asset_quant: &self.quant,
                 feedback: &self.feedback,
             },
-            gcbvh_nodes: &self.bvh_nodes,
-            gcbvh_header: &self.bvh_header,
-            gcbvh_items: &self.bvh_items,
+            tree: Some(helio_pass_vg_cull::VgCullTree {
+                nodes: &self.bvh_nodes,
+                header: &self.bvh_header,
+                items: &self.bvh_items,
+            }),
             dense_mask: None,
             materials: self.materials.as_ref(),
             instance_count: self.instance_count,
             dense_tiles: [1, 1],
+            remaps: None,
         }
     }
 
@@ -995,7 +998,8 @@ fn redistributed_frontier_matches_reference_without_lost_or_duplicate_clusters()
     // One persistent dispatch per phase, any workgroup count, and a job queue
     // from roomy down to the minimum (shares that do not fit stay in the
     // deque): the cut is exact, nothing lost or duplicated.
-    for (max_groups, queue_capacity) in [(1, 65536), (4, 65536), (256, 65536), (1, 256), (256, 256)] {
+    for (max_groups, queue_capacity) in [(1, 65536), (4, 65536), (256, 65536), (1, 256), (256, 256)]
+    {
         let mut core = VgCullCore::new(
             &g.device,
             VgCullConfig {
@@ -1046,7 +1050,13 @@ fn two_phase_persistent_traversal_splits_the_cut_without_loss() {
         .collect();
     let mut r = upload(&g, &s);
     let mut bvh = VgBvhPass::new(&g.device);
-    bvh.run_for_testing(&g.device, &g.queue, &r.instances, &r.objects, BvhMode::Rebuild);
+    bvh.run_for_testing(
+        &g.device,
+        &g.queue,
+        &r.instances,
+        &r.objects,
+        BvhMode::Rebuild,
+    );
     r.bvh_nodes = bvh.nodes_buffer().clone();
     r.bvh_header = bvh.header_buffer().clone();
     r.bvh_items = bvh.items_buffer().clone();
@@ -1075,7 +1085,10 @@ fn two_phase_persistent_traversal_splits_the_cut_without_loss() {
             run_phase(&g, &mut core, &r, 1);
             let (late, _) = collect(&g, &core, &r, 1);
             let what = format!("groups={max_groups}, frame {frame}");
-            assert!(early.items.is_disjoint(&late.items), "{what}: a cluster drawn in both phases");
+            assert!(
+                early.items.is_disjoint(&late.items),
+                "{what}: a cluster drawn in both phases"
+            );
             let all: BTreeSet<Item> = early.items.union(&late.items).copied().collect();
             assert_eq!(all, want, "{what}");
             let stat = |i: u32| late.state[(state::STATS + i) as usize];
@@ -1753,7 +1766,8 @@ fn viewport_resizes_keep_the_tile_block_in_step_with_the_screen() {
             words * 4,
             "{w}x{h}: the state buffer is not sized for the grid"
         );
-        let ro_words = u64::from(b.history_words) + u64::from(TILE_WORDS) * u64::from(grid[0] * grid[1]);
+        let ro_words =
+            u64::from(b.history_words) + u64::from(TILE_WORDS) * u64::from(grid[0] * grid[1]);
         assert_eq!(
             b.history_ro.size(),
             (ro_words * 4).max(16),

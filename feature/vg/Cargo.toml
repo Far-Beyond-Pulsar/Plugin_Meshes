@@ -25,8 +25,12 @@ helio-pass-vg-cull = { workspace = true }
 helio-pass-vg-raster = { workspace = true }
 helio-pass-vg-dense = { workspace = true }
 helio-pass-vg-shade = { workspace = true }
+# Virtual geometry through portal chains: the chains, their volumes and clip.
+helio-portal-api = { workspace = true }
+bytemuck = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
+naga = { version = "30.0.0", features = ["wgsl-in"] }
 helio-mats = { workspace = true, features = ["host-rows"] }
 helio-light-host = { workspace = true }
 pulsar_scenedb = { workspace = true }

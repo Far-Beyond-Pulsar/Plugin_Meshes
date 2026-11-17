@@ -20,6 +20,8 @@ struct MVsOut {
     @location(2) @interpolate(flat) material: u32,
     // Frame-space position, for a clipped view's plane.
     @location(3) world: vec3<f32>,
+    // The instance (a run drawn through another space clips per instance).
+    @location(4) @interpolate(flat) instance: u32,
 }
 
 // Whether the pipeline draws a clipped view (`helio_frame_api::view::CLIP_CONSTANT`).
@@ -36,6 +38,7 @@ fn vs_masked(
     out.uv = vec2<f32>(0.0);
     out.material = 0u;
     out.world = vec3<f32>(0.0);
+    out.instance = 0u;
 
     let vis = vg_visible[ii];
     let cs = vis.cluster_slot;
@@ -55,6 +58,7 @@ fn vs_masked(
     out.pos = vg_to_clip(m, p);
     out.world = (m * vec4<f32>(p, 1.0)).xyz;
     out.id = vg_vis_pack(ii, tri);
+    out.instance = vis.instance;
     out.uv = vga_uv0(cs, blk, idx[corner]);
     // Section `material_slot` of the instance is the object row's material.
     out.material = vg_objects[vg_instances[vis.instance].object_row + vgd_material(cl)].head[2];
@@ -68,6 +72,9 @@ fn fs_masked(in: MVsOut, @builtin(front_facing) front: bool) -> @location(0) u32
     let dy = dpdy(in.uv);
     let a = vga_load(in.material);
     if HELIO_VIEW_CLIP && vg_view_clipped(in.world) {
+        discard;
+    }
+    if vg_chain_clipped(in.instance, in.world, vec2<i32>(in.pos.xy)) {
         discard;
     }
     if (!front && !vga_double_sided(a)) {

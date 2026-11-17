@@ -142,7 +142,7 @@ pub mod shader_source {
 
     /// Final depth module (`vs_main`, `fs_main`).
     pub fn depth() -> String {
-        DEPTH_WGSL.to_string()
+        format!("{}\n{}", helio_vg_format::WGSL, DEPTH_WGSL)
     }
 
     /// The shade module as a drawer program: the G-buffer program's view
@@ -252,6 +252,9 @@ pub struct VgShadeInputs<'a> {
     /// Visible rows of the ray-traced backend (ids `>= DENSE_RT_VISIBLE_BASE`
     /// index it, not the cull's list). `None` binds an empty buffer.
     pub rt_visible: Option<&'a wgpu::Buffer>,
+    /// Per instance row, the remap its pixels carry (a run drawn through
+    /// another space, [`VgShade::with_remaps`]); `None` tags them plain.
+    pub remaps: Option<&'a wgpu::Buffer>,
     /// The dense-tile mask `dense_keys` is valid under (one `u32` per 16x16 tile,
     /// nonzero = resolved by Tier 3). With it, a dense tile takes only the dense
     /// result and other tiles ignore `dense_keys`; `None` merges per pixel.
@@ -308,6 +311,9 @@ pub struct VgShade {
     shade_pipelines: Vec<Option<wgpu::ComputePipeline>>,
     depth_bgl: wgpu::BindGroupLayout,
     depth_pipeline: wgpu::RenderPipeline,
+    /// The final depth of a run drawn through another space ([`Self::with_remaps`]):
+    /// its pixels tagged with their instance's remap.
+    depth_remapped: Option<(wgpu::BindGroupLayout, wgpu::RenderPipeline)>,
     /// Created on the first frame a debug view is selected.
     debug: Option<debug::DebugPipeline>,
 
@@ -400,6 +406,75 @@ const CS: wgpu::ShaderStages = wgpu::ShaderStages::COMPUTE;
 impl VgShade {
     pub fn new(device: &wgpu::Device) -> Self {
         Self::with_decode(device, &shared_decode())
+    }
+
+    /// The shading of a run drawn through another space
+    /// (`helio_vg_format::VgRun::remapped`): its final depth tags each pixel
+    /// with its instance's remap ([`VgShadeInputs::remaps`]).
+    pub fn with_remaps(mut self, device: &wgpu::Device) -> Self {
+        let f = wgpu::ShaderStages::FRAGMENT;
+        let storage = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: f,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("VgShade depth (remapped)"),
+            entries: &[
+                texture_entry(0, f, UNFILTERABLE),
+                texture_entry(1, f, wgpu::TextureSampleType::Uint),
+                storage(2),
+                storage(3),
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("VgShade depth (remapped)"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let module = helio_core::shader::module(
+            device,
+            "VgShade depth (remapped)",
+            shader_source::depth().as_str(),
+        );
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("VgShade depth (remapped)"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_remapped"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: helio_frame_api::gbuffer::SURFACE_FORMAT.to_wgpu(),
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(helio_core::depth::NEARER_EQUAL),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        self.depth_remapped = Some((layout, pipeline));
+        self
     }
 
     /// As [`Self::new`] with an explicit vertex-decode include (default:
@@ -639,6 +714,7 @@ impl VgShade {
             shade_pipelines: (0..BIN_COUNT).map(|_| None).collect(),
             depth_bgl,
             depth_pipeline,
+            depth_remapped: None,
             params,
             globals,
             bins,
@@ -1223,14 +1299,42 @@ impl VgShade {
         }
 
         // 4. final depth
-        let depth_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("VgShade depth"),
-            layout: &self.depth_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: res(depth_view),
-            }],
-        });
+        let remapped = match (&self.depth_remapped, inputs.remaps) {
+            (Some((layout, pipeline)), Some(remaps)) => Some((layout, pipeline, remaps)),
+            _ => None,
+        };
+        let depth_group = match remapped {
+            Some((layout, _, remaps)) => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("VgShade depth (remapped)"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: res(depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: res(payload_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: inputs.visible.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: remaps.as_entire_binding(),
+                    },
+                ],
+            }),
+            None => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("VgShade depth"),
+                layout: &self.depth_bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: res(depth_view),
+                }],
+            }),
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("VgShade depth"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1254,7 +1358,7 @@ impl VgShade {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.depth_pipeline);
+        pass.set_pipeline(remapped.map_or(&self.depth_pipeline, |(_, pipeline, _)| pipeline));
         pass.set_bind_group(0, &depth_group, &[]);
         pass.draw(0..3, 0..1);
     }

@@ -112,6 +112,7 @@ fn sw_raster_masked_main(
                     let d = c.w;
                     if (d < 0.0) { continue; }
                     if (d < textureLoad(hw_depth, vec2<i32>(x, y), 0)) { continue; }
+                    if (vg_chain_clipped(vis.instance, vg_pixel_world(x, y, d), vec2<i32>(x, y))) { continue; }
                     // Alpha test before the race.
                     let wgt = c.xyz * iw;
                     let uv = (uva * wgt.x + uvb * wgt.y + uvc * wgt.z) / max(wgt.x + wgt.y + wgt.z, 1.0e-30);

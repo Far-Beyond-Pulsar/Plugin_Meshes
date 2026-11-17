@@ -181,14 +181,16 @@ fn cs_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             // Only authored bits; derived ones are set below.
             flags = authored.x
-                & ~(OVERRIDE_PRESENT | VG_INST_LOD_SUPPRESS | VG_INST_CONE_CULL);
+                & ~(OVERRIDE_PRESENT | VG_INST_LOD_SUPPRESS | VG_INST_CONE_CULL
+                    | (VG_INST_SECTION_MASK << VG_INST_SECTION_SHIFT));
             scale = bitcast<f32>(authored.y);
         }
     }
     if !(scale > 0.0) || !(scale <= F32_MAX) {
         scale = 1.0;
     }
-    flags = flags | VG_INST_LOD_SUPPRESS;
+    flags = flags | VG_INST_LOD_SUPPRESS
+        | (min(draws.count, VG_INST_SECTION_MASK) << VG_INST_SECTION_SHIFT);
     if cone_cull_allowed(base) {
         flags = flags | VG_INST_CONE_CULL;
     }

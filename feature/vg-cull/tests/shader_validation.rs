@@ -23,7 +23,8 @@ fn cull_shader_validates() {
         for entry in [
             "cs_tiles",
             "cs_seed",
-            "cs_round_prepare",
+            "cs_seed_instances",
+            "cs_phase_init",
             "cs_traverse",
             "cs_finalize",
         ] {
@@ -51,9 +52,9 @@ fn shader_struct_sizes_match_the_uploads() {
     assert_eq!(size("CullParams"), 96);
     assert_eq!(size("VgBvhNode"), 32);
     assert_eq!(size("VgBvhHeader"), 128);
-    assert_eq!(size("RoundParams"), 16);
+    assert_eq!(size("PhaseParams"), 16);
     // Scene-join row: 63 words, only `transform` (word 4) is read.
-    assert_eq!(size("VgObjectRow"), 252);
+    assert_eq!(size("StaticObjectRow"), 252);
 }
 
 #[test]
@@ -103,17 +104,29 @@ fn cull_shader_compiles_under_fxc() {
             .unwrap();
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
-            let errors: Vec<_> = err.lines().filter(|l| l.contains("error")).take(12).collect();
+            let errors: Vec<_> = err
+                .lines()
+                .filter(|l| l.contains("error"))
+                .take(12)
+                .collect();
             failures.push(format!("{}:\n{}", ep.name, errors.join("\n")));
         }
     }
-    assert!(failures.is_empty(), "FXC rejected:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "FXC rejected:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[cfg(windows)]
 fn find_fxc() -> Option<std::path::PathBuf> {
     let root = std::path::Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
-    let mut versions: Vec<_> = std::fs::read_dir(root).ok()?.flatten().map(|e| e.path()).collect();
+    let mut versions: Vec<_> = std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
     versions.sort();
     versions.reverse();
     for v in versions {

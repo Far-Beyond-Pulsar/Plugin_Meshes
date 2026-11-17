@@ -1,4 +1,5 @@
 //!use material_row
+//!use mesh_object_row
 //! GPU-driven object sort/group/batch pipeline.
 //!
 //! Turns every live `StaticObjectComponent` SceneDB row into the exact same
@@ -101,35 +102,7 @@ struct BatchUniforms {
 }
 @group(0) @binding(0) var<uniform> batch: BatchUniforms;
 
-/// SceneDB's `StaticObjectComponent` row -- byte-for-byte identical to
-/// `helio_mesh_api::rows::StaticObjectComponent`'s `#[repr(C)]`
-/// Rust layout (plain fixed-size arrays throughout, not `mat4x4<f32>`/
-/// `vec4<f32>`, for exactly the reason every other SceneDB-mirrored struct
-/// in this codebase avoids those: WGSL's struct-member alignment for those
-/// types doesn't match Rust's packed layout). Keep in lock-step with that
-/// struct; `helio_pass_object_batch`'s own test suite asserts the byte size
-/// matches so a drift fails loudly at `cargo test` time, not at draw time.
-struct StaticObjectRow {
-    mesh_slot: u32,
-    mesh_generation: u32,
-    material_slot: u32,
-    material_generation: u32,
-    transform: array<array<f32, 4>, 4>,
-    prev_transform: array<array<f32, 4>, 4>,
-    normal_mat: array<array<f32, 4>, 3>,
-    bounds: array<f32, 4>,
-    index_count: u32,
-    first_index: u32,
-    vertex_offset: i32,
-    material_class: u32,
-    graph_hash_lo: u32,
-    graph_hash_hi: u32,
-    flags: u32,
-    skin_vertex_offset: u32,
-    bone_palette_offset: u32,
-    bone_palette_count: u32,
-    _skin_pad: u32,
-}
+// `StaticObjectRow`: `//!use mesh_object_row` (the meshes' api).
 @group(0) @binding(1) var<storage, read> static_objects: array<StaticObjectRow>;
 
 // ── Stage 1: cs_gather ──────────────────────────────────────────────────────

@@ -11,9 +11,10 @@ use helio_core::graph::ResourceBuilder;
 use helio_core::{
     PassContext, PrepareContext, RenderPass, ResourceKey, Result as HelioResult, ViewGroup,
 };
-use helio_pass_vg_cull::{VgCullFrameData, VgCullInputs, KEY_CULL, KEY_INPUTS};
-use helio_pass_vg_dense::{VgDenseFrameData, KEY_DENSE};
-use helio_pass_vg_raster::{VgRasterFrameData, KEY_RASTER};
+use helio_pass_vg_cull::{VgCullFrameData, VgCullInputs};
+use helio_pass_vg_dense::VgDenseFrameData;
+use helio_pass_vg_raster::VgRasterFrameData;
+use helio_vg_format::VgRun;
 
 use std::sync::Arc;
 
@@ -150,18 +151,40 @@ pub struct VgShadePass {
     debug_mode: u32,
     tau: Option<VgTauSource>,
     globals: VgShadeGlobals,
+    run: &'static VgRun,
+    gate: Option<helio_vg_format::VgRunGate>,
 }
 
 impl VgShadePass {
     /// `has_dense`: a `VgDensePass` precedes this one (declares the ordering).
     pub fn new(device: &wgpu::Device, has_dense: bool) -> Self {
+        Self::for_run(device, has_dense, &VgRun::DIRECT)
+    }
+
+    /// The shading of `run` (a run drawn through another space tags its
+    /// pixels with their instances' remaps, [`VgShade::with_remaps`]).
+    pub fn for_run(device: &wgpu::Device, has_dense: bool, run: &'static VgRun) -> Self {
+        let shade = VgShade::new(device);
         Self {
-            shade: VgShade::new(device),
+            shade: if run.remapped() {
+                shade.with_remaps(device)
+            } else {
+                shade
+            },
             has_dense,
             debug_mode: 0,
             tau: None,
             globals: VgShadeGlobals::default(),
+            run,
+            gate: None,
         }
+    }
+
+    /// Schedule this pass only while `gate` is open (a run whose content
+    /// another pass decides, [`helio_vg_format::VgRunGate`]).
+    pub fn with_gate(mut self, gate: helio_vg_format::VgRunGate) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// The LOD error threshold the debug views compare against (default 1 px).
@@ -177,6 +200,11 @@ impl VgShadePass {
 }
 
 impl RenderPass for VgShadePass {
+    /// A gated run's pass is a member only while its gate is open.
+    fn is_member(&mut self, _scene: &mut helio_core::SceneContent<'_>) -> bool {
+        self.gate.as_ref().is_none_or(|gate| gate.is_open())
+    }
+
     fn scene_buffers(&self) -> &'static [&'static str] {
         const LIST: &[&str] = &[
             helio_mats::MATERIALS.name(),
@@ -186,7 +214,7 @@ impl RenderPass for VgShadePass {
     }
 
     fn name(&self) -> &'static str {
-        "VgShade"
+        self.run.names.shade
     }
 
     fn reads(&self) -> &'static [&'static str] {
@@ -203,11 +231,11 @@ impl RenderPass for VgShadePass {
     }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
-        builder.read(KEY_INPUTS);
-        builder.read(KEY_CULL);
-        builder.read(KEY_RASTER);
+        builder.read(self.run.inputs);
+        builder.read(self.run.cull);
+        builder.read(self.run.raster);
         if self.has_dense {
-            builder.read(KEY_DENSE);
+            builder.read(self.run.dense);
         }
     }
 
@@ -215,7 +243,13 @@ impl RenderPass for VgShadePass {
         self.debug_mode = mode;
     }
 
+    /// The views are the pipeline's, registered once by the frame's own run;
+    /// a later run (`VgRun::remapped`) draws them too through
+    /// [`Self::set_debug_mode`].
     fn debug_views(&self) -> &'static [DebugViewDescriptor] {
+        if self.run.remapped() {
+            return &[];
+        }
         &VIEWS
     }
 
@@ -270,25 +304,25 @@ impl RenderPass for VgShadePass {
     fn execute(&mut self, ctx: &mut PassContext) -> HelioResult<()> {
         let Some(cull_inputs) = ctx
             .registry
-            .get::<VgCullInputs<'_>>(ResourceKey::new(KEY_INPUTS))
+            .get::<VgCullInputs<'_>>(ResourceKey::new(self.run.inputs))
         else {
             return Ok(());
         };
         let Some(cull) = ctx
             .registry
-            .get::<VgCullFrameData<'_>>(ResourceKey::new(KEY_CULL))
+            .get::<VgCullFrameData<'_>>(ResourceKey::new(self.run.cull))
         else {
             return Ok(());
         };
         let Some(raster) = ctx
             .registry
-            .get::<VgRasterFrameData<'_>>(ResourceKey::new(KEY_RASTER))
+            .get::<VgRasterFrameData<'_>>(ResourceKey::new(self.run.raster))
         else {
             return Ok(());
         };
         let dense = ctx
             .registry
-            .get::<VgDenseFrameData<'_>>(ResourceKey::new(KEY_DENSE));
+            .get::<VgDenseFrameData<'_>>(ResourceKey::new(self.run.dense));
         let Some(material_textures) = ctx
             .registry
             .get::<helio_mats::MaterialTextureBindings<'_>>(helio_mats::material_textures())
@@ -340,6 +374,7 @@ impl RenderPass for VgShadePass {
             dense_keys: dense.map(|d| d.dense_key),
             rt: None,
             rt_visible: dense.and_then(|d| d.rt_visible),
+            remaps: cull_inputs.remaps,
             dense_mask: dense.map(|d| d.tile_mask),
             dense_merge: dense.is_some_and(|d| d.merge),
             // `from_active_id`, not `from_id`: the renderer-wide "Ray Trace vs Raster"

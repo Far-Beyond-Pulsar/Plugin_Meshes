@@ -35,6 +35,27 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> DepthOut {
     return DepthOut(GBUFFER_TAG_PLAIN, d);
 }
 
+// A run drawn through another space (`helio_vg_format::VgRun::remapped`):
+// the plain tag carries the remap of the pixel's instance
+// (`gbuffer_remap_tag`), so lighting and decals take the pixel back to its
+// content's world. Needs the format declarations (`VgVisibleCluster`,
+// `vg_vis_cluster`) prepended.
+@group(0) @binding(1) var vg_payload: texture_2d<u32>;
+@group(0) @binding(2) var<storage, read> vg_visible_rows: array<VgVisibleCluster>;
+@group(0) @binding(3) var<storage, read> vg_remaps: array<u32>;
+
+@fragment
+fn fs_remapped(@builtin(position) pos: vec4<f32>) -> DepthOut {
+    let ipx = vec2<i32>(pos.xy);
+    let d = textureLoad(resolved_depth, ipx, 0).x;
+    if d <= 0.0 {
+        discard;
+    }
+    let id = textureLoad(vg_payload, ipx, 0).x;
+    let instance = vg_visible_rows[vg_vis_cluster(id)].instance;
+    return DepthOut(gbuffer_remap_tag(vg_remaps[instance], GBUFFER_TAG_PLAIN), d);
+}
+
 @fragment
 fn fs_depth_only(@builtin(position) pos: vec4<f32>) -> DepthOnly {
     let d = textureLoad(resolved_depth, vec2<i32>(pos.xy), 0).x;
