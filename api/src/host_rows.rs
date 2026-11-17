@@ -117,10 +117,11 @@ pub struct StaticObjectComponent {
     /// Number of valid joint matrices for this instance.
     #[gpu]
     pub bone_palette_count: u32,
+    /// Which section of its mesh the row draws ([`crate::StaticObjectRow::section_index`]).
     #[gpu]
-    pub _skin_pad: u32,
+    pub section_index: u32,
 }
-same_layout!(StaticObjectComponent, crate::StaticObjectRow, crate::STATIC_OBJECTS, "static_objects"; mesh_slot, mesh_generation, material_slot, material_generation, transform, prev_transform, normal_mat, bounds, index_count, first_index, vertex_offset, material_class, graph_hash_lo, graph_hash_hi, flags, skin_vertex_offset, bone_palette_offset, bone_palette_count, _skin_pad);
+same_layout!(StaticObjectComponent, crate::StaticObjectRow, crate::STATIC_OBJECTS, "static_objects"; mesh_slot, mesh_generation, material_slot, material_generation, transform, prev_transform, normal_mat, bounds, index_count, first_index, vertex_offset, material_class, graph_hash_lo, graph_hash_hi, flags, skin_vertex_offset, bone_palette_offset, bone_palette_count, section_index);
 
 // ---- row builders, returning the component (see builders.py note) ----
 

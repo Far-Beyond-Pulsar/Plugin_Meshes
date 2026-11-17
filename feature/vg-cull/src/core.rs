@@ -10,8 +10,8 @@ use helio_core::CommandRecorder;
 use helio_vg_format::VgMode;
 
 use crate::{
-    mode_bits, state, stats, FLAG_DENSE_MASK, FLAG_MASKED, FLAG_NO_ROOT_SHORTCUT, FLAG_STATS,
-    FLAG_SW_MASKED, FLAG_TWO_PHASE, MAX_BIN_CAPACITY,
+    mode_bits, state, stats, FLAG_CURRENT_HIZ, FLAG_DENSE_MASK, FLAG_MASKED, FLAG_NO_ROOT_SHORTCUT,
+    FLAG_STATS, FLAG_SW_MASKED, FLAG_TWO_PHASE, MAX_BIN_CAPACITY,
 };
 
 /// Stride of the per-phase uniform blocks (dynamic-offset alignment).
@@ -68,6 +68,14 @@ pub struct VgCullConfig {
     /// under tau directly, without walking its hierarchy (exactly the same cut).
     /// `HELIO_VG_NO_ROOT_SHORTCUT=1` turns it off for A/B measurements.
     pub root_shortcut: bool,
+    /// The early Hi-Z is this frame's depth so far, not last frame's (a run drawn
+    /// after other drawers, `helio_vg_format::VgRun::builds_hiz_early`): one
+    /// exact occlusion phase, no deferral, no late phase ([`crate::FLAG_CURRENT_HIZ`]).
+    pub current_hiz: bool,
+    /// The run's instances are the result of a spatial query (few, every one
+    /// a candidate, `helio_vg_format::VgRun::tree` `None`): the traversal
+    /// starts from every enabled instance instead of an instance BVH's root.
+    pub seeds_instances: bool,
 }
 
 impl Default for VgCullConfig {
@@ -87,6 +95,8 @@ impl Default for VgCullConfig {
             max_bin_capacity: MAX_BIN_CAPACITY,
             sw_masked: false,
             root_shortcut: std::env::var_os("HELIO_VG_NO_ROOT_SHORTCUT").is_none(),
+            current_hiz: false,
+            seeds_instances: false,
         }
     }
 }
@@ -100,16 +110,14 @@ impl Default for VgCullConfig {
 /// | `instances` (`"vg_instances"`) | [`helio_vg_format::GpuVgInstance`] |
 /// | `objects` (`"static_objects"`) | 252-byte (63-word) scene-join row; `transform` is read via `GpuVgInstance::object_row` |
 /// | `stream` | the eight `helio-vg-stream` buffers (pool, residency, nodes, group refs, headers, bases, quant, feedback); the cull appends page requests / touches straight into `feedback` |
-/// | `gcbvh_nodes`/`gcbvh_header`/`gcbvh_items` | `helio-pass-vg-bvh` outputs (`vg_gcbvh_*`) |
+/// | `tree` | `helio-pass-vg-bvh` outputs (`vg_gcbvh_*`); `None` for a run that seeds its instances ([`VgCullConfig::seeds_instances`]) |
 /// | `dense_mask` | one `u32` per 16x16 tile, row-major, nonzero = dense last frame |
 #[derive(Clone, Copy)]
 pub struct VgCullInputs<'a> {
     pub instances: &'a wgpu::Buffer,
     pub objects: &'a wgpu::Buffer,
     pub stream: helio_vg_stream::VgStreamBuffers<'a>,
-    pub gcbvh_nodes: &'a wgpu::Buffer,
-    pub gcbvh_header: &'a wgpu::Buffer,
-    pub gcbvh_items: &'a wgpu::Buffer,
+    pub tree: Option<VgCullTree<'a>>,
     pub dense_mask: Option<&'a wgpu::Buffer>,
     /// The scene's `materials` table (`GpuMaterial` rows, 24 words). `Some` turns on
     /// alpha-mask routing; `None` is the opaque-only path with no material loads.
@@ -118,6 +126,19 @@ pub struct VgCullInputs<'a> {
     pub instance_count: u32,
     /// Dense-mask grid `[tiles_x, tiles_y]`.
     pub dense_tiles: [u32; 2],
+    /// Per `instances` row, the surface remap its pixels carry
+    /// (`helio_vg_format::VgInstanceSource::Registry::remaps`): a run drawn
+    /// through another space. The raster clips to it and the shading tags
+    /// it; `None` for a run drawn where its instances are.
+    pub remaps: Option<&'a wgpu::Buffer>,
+}
+
+/// A run's instance BVH as the cull reads it (`helio-pass-vg-bvh`).
+#[derive(Clone, Copy)]
+pub struct VgCullTree<'a> {
+    pub nodes: &'a wgpu::Buffer,
+    pub header: &'a wgpu::Buffer,
+    pub items: &'a wgpu::Buffer,
 }
 
 /// Per-frame values the graph knows.
@@ -202,8 +223,9 @@ impl VgCullBuffers {
         history_words: u32,
         tiles: [u32; 2],
     ) -> (wgpu::Buffer, wgpu::Buffer) {
-        let usage =
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+        let usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST;
         let tile_words = Self::tile_block_words(tiles);
         let state_words = u64::from(state::HISTORY) + u64::from(history_words) + tile_words;
         let ro_words = u64::from(history_words) + tile_words;
@@ -286,6 +308,7 @@ struct Readback {
 struct Pipelines {
     tiles: wgpu::ComputePipeline,
     seed: wgpu::ComputePipeline,
+    seed_instances: wgpu::ComputePipeline,
     phase_init: wgpu::ComputePipeline,
     traverse: wgpu::ComputePipeline,
     finalize: wgpu::ComputePipeline,
@@ -307,6 +330,9 @@ pub struct VgCullCore {
     sampler: wgpu::Sampler,
     dummy_view: wgpu::TextureView,
     dummy_buf: wgpu::Buffer,
+    /// Bound as the tree of a run without one (the shader declares the
+    /// header's 128 bytes).
+    dummy_tree: wgpu::Buffer,
     buffers: Arc<VgCullBuffers>,
     bind_cache: [BindCache; 2],
     frame: u64,
@@ -425,6 +451,7 @@ impl VgCullCore {
         let pipelines = Pipelines {
             tiles: pipeline("VgCull Tiles", &pl2, "cs_tiles"),
             seed: pipeline("VgCull Seed", &pl2, "cs_seed"),
+            seed_instances: pipeline("VgCull Seed Instances", &pl2, "cs_seed_instances"),
             phase_init: pipeline("VgCull PhaseInit", &pl2, "cs_phase_init"),
             traverse: pipeline("VgCull Traverse", &pl2, "cs_traverse"),
             finalize: pipeline("VgCull Finalize", &pl2, "cs_finalize"),
@@ -506,6 +533,16 @@ impl VgCullCore {
             sampler,
             dummy_view,
             dummy_buf,
+            dummy_tree: {
+                let tree = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("VgCull Empty Tree"),
+                    size: 128,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: true,
+                });
+                tree.unmap();
+                tree
+            },
             buffers,
             bind_cache: [None, None],
             frame: 0,
@@ -629,6 +666,9 @@ impl VgCullCore {
         if !self.config.root_shortcut {
             flags |= FLAG_NO_ROOT_SHORTCUT;
         }
+        if self.config.current_hiz {
+            flags |= FLAG_CURRENT_HIZ;
+        }
         if inputs.materials.is_some() {
             flags |= FLAG_MASKED;
             if self.config.sw_masked {
@@ -730,8 +770,10 @@ impl VgCullCore {
         }
         // Phase 0 trusts last frame's Hi-Z only from the second frame on
         // (frame 1 has no previous depth). Stale-but-valid is still safe.
-        let hiz_valid =
-            self.config.two_phase_occlusion && hiz.is_some() && (phase == 1 || self.frame >= 2);
+        // This frame's Hi-Z (`current_hiz`) is valid whenever it is there.
+        let hiz_valid = hiz.is_some()
+            && (self.config.current_hiz
+                || (self.config.two_phase_occlusion && (phase == 1 || self.frame >= 2)));
 
         let block = u64::from(phase) * ROUND_STRIDE;
         queue.write_buffer(
@@ -778,12 +820,17 @@ impl VgCullCore {
         pass.set_bind_group(1, &self.bg1, &[block as u32]);
         // The phase's queued work: the root (early), the early phase's
         // deferrals (late).
-        pass.set_pipeline(if phase == 0 {
-            &self.pipelines.seed
+        if phase == 0 && self.config.seeds_instances {
+            pass.set_pipeline(&self.pipelines.seed_instances);
+            pass.dispatch_workgroups(inputs.instance_count.div_ceil(64).max(1), 1, 1);
         } else {
-            &self.pipelines.phase_init
-        });
-        pass.dispatch_workgroups(1, 1, 1);
+            pass.set_pipeline(if phase == 0 {
+                &self.pipelines.seed
+            } else {
+                &self.pipelines.phase_init
+            });
+            pass.dispatch_workgroups(1, 1, 1);
+        }
         // The whole traversal, one persistent dispatch (see the crate docs).
         pass.set_pipeline(&self.pipelines.traverse);
         pass.dispatch_workgroups(self.config.max_groups.max(1), 1, 1);
@@ -821,10 +868,15 @@ impl VgCullCore {
         let materials = i.materials.unwrap_or(&self.dummy_buf);
         let mut bufs: Vec<&wgpu::Buffer> = vec![camera, &self.params_buf, i.instances, i.objects];
         bufs.extend(i.stream.as_array());
+        let tree = i.tree.unwrap_or(VgCullTree {
+            nodes: &self.dummy_tree,
+            header: &self.dummy_tree,
+            items: &self.dummy_tree,
+        });
         bufs.extend([
-            i.gcbvh_nodes,
-            i.gcbvh_header,
-            i.gcbvh_items,
+            tree.nodes,
+            tree.header,
+            tree.items,
             dense,
             &b.state,
             &b.queues,

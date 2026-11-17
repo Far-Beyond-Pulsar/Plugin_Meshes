@@ -90,6 +90,23 @@ fn the_ray_surface_rows_match_the_rust() {
     );
 }
 
+const OBJECT_ROW_READER: &str = "//!use mesh_object_row
+@group(0) @binding(0) var<storage, read> objects: array<StaticObjectRow>;
+@compute @workgroup_size(1)
+fn main() {
+    _ = objects[0].bounds[3];
+}
+";
+
+#[test]
+fn the_object_row_matches_the_rust() {
+    let m = module(OBJECT_ROW_READER, OBJECT_ROW_SNIPPET);
+    assert_eq!(
+        struct_size(&m, "StaticObjectRow"),
+        std::mem::size_of::<StaticObjectRow>()
+    );
+}
+
 #[test]
 fn the_draw_rows_match_the_rust() {
     let m = module(DRAW_ROWS_READER, DRAW_ROWS_SNIPPET);

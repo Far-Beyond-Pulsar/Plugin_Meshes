@@ -55,6 +55,7 @@ fn frame_data<'a>(buffers: &'a VgCullBuffers, phase: u32) -> VgCullFrameData<'a>
 pub(crate) fn make_passes(
     device: &wgpu::Device,
     config: VgCullConfig,
+    run: &'static helio_vg_format::VgRun,
 ) -> (VgCullEarlyPass, VgCullLatePass) {
     let core = VgCullCore::new(device, config);
     let buffers = core.buffers().clone();
@@ -64,8 +65,15 @@ pub(crate) fn make_passes(
             core: core.clone(),
             buffers: buffers.clone(),
             settings: None,
+            run,
+            gate: None,
         },
-        VgCullLatePass { core, buffers },
+        VgCullLatePass {
+            core,
+            buffers,
+            run,
+            gate: None,
+        },
     )
 }
 
@@ -84,10 +92,27 @@ impl VgCullEarlyPass {
         crate::VgCullStats::from_state_words(self.core.lock().ok()?.last_state_words()?)
     }
 
-    /// Both halves of the cull sharing one core. Put the early pass before the
+    /// Both halves of the cull sharing one core, for the frame's own instances
+    /// ([`helio_vg_format::VgRun::DIRECT`]). Put the early pass before the
     /// early raster, the late pass after the Hi-Z rebuild.
     pub fn pair(device: &wgpu::Device, config: VgCullConfig) -> (VgCullEarlyPass, VgCullLatePass) {
-        make_passes(device, config)
+        make_passes(device, config, &helio_vg_format::VgRun::DIRECT)
+    }
+
+    /// [`Self::pair`] for `run`'s instances, keys and Hi-Z.
+    pub fn pair_for(
+        device: &wgpu::Device,
+        config: VgCullConfig,
+        run: &'static helio_vg_format::VgRun,
+    ) -> (VgCullEarlyPass, VgCullLatePass) {
+        make_passes(device, config, run)
+    }
+
+    /// Schedule this pass only while `gate` is open (a run whose content
+    /// another pass decides, [`helio_vg_format::VgRunGate`]).
+    pub fn with_gate(mut self, gate: helio_vg_format::VgRunGate) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Re-read threshold, mode, occlusion and the visible-cluster ceiling from
@@ -120,27 +145,48 @@ pub struct VgCullEarlyPass {
     core: Arc<Mutex<VgCullCore>>,
     buffers: Arc<VgCullBuffers>,
     settings: Option<VgCullSettingsSource>,
+    run: &'static helio_vg_format::VgRun,
+    gate: Option<helio_vg_format::VgRunGate>,
 }
 
 /// Phase 1: retest deferred work against the Hi-Z of the phase-0 depth.
 pub struct VgCullLatePass {
     core: Arc<Mutex<VgCullCore>>,
     buffers: Arc<VgCullBuffers>,
+    run: &'static helio_vg_format::VgRun,
+    gate: Option<helio_vg_format::VgRunGate>,
 }
 
-fn inputs<'a>(registry: &'a helio_core::ResourceRegistry<'a>) -> Option<VgCullInputs<'a>> {
-    registry.get::<VgCullInputs<'a>>(ResourceKey::new(crate::KEY_INPUTS))
+impl VgCullLatePass {
+    /// Schedule this pass only while `gate` is open (a run whose content
+    /// another pass decides, [`helio_vg_format::VgRunGate`]).
+    pub fn with_gate(mut self, gate: helio_vg_format::VgRunGate) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+}
+
+fn inputs<'a>(
+    registry: &'a helio_core::ResourceRegistry<'a>,
+    run: &helio_vg_format::VgRun,
+) -> Option<VgCullInputs<'a>> {
+    registry.get::<VgCullInputs<'a>>(ResourceKey::new(run.inputs))
 }
 
 impl RenderPass for VgCullEarlyPass {
+    /// A gated run's pass is a member only while its gate is open.
+    fn is_member(&mut self, _scene: &mut helio_core::SceneContent<'_>) -> bool {
+        self.gate.as_ref().is_none_or(|gate| gate.is_open())
+    }
+
     fn name(&self) -> &'static str {
-        "VgCullEarly"
+        self.run.names.cull_early
     }
 
     fn declare_resources(&self, builder: &mut helio_core::graph::ResourceBuilder) {
         // The integration publishes `VgCullInputs` before this pass.
-        builder.read(crate::KEY_INPUTS);
-        builder.write_buffer(crate::KEY_CULL_EARLY);
+        builder.read(self.run.inputs);
+        builder.write_buffer(self.run.cull_early);
     }
 
     fn publish<'a>(&self, frame: &mut helio_core::ResourceRegistry<'a>) {
@@ -148,14 +194,14 @@ impl RenderPass for VgCullEarlyPass {
         // pass-owned buffers.
         let buffers: &'a VgCullBuffers = unsafe { std::mem::transmute(&*self.buffers) };
         frame.write(
-            ResourceKey::new(crate::KEY_CULL_EARLY),
+            ResourceKey::new(self.run.cull_early),
             frame_data(buffers, 0),
-            "VgCullEarly",
+            self.run.names.cull_early,
         );
     }
 
     fn prepare(&mut self, ctx: &PrepareContext) -> HelioResult<()> {
-        let Some(inputs) = inputs(ctx.registry) else {
+        let Some(inputs) = inputs(ctx.registry, self.run) else {
             return Ok(());
         };
         let mut core = self.core.lock().unwrap();
@@ -183,6 +229,10 @@ impl RenderPass for VgCullEarlyPass {
             // dropped 475k clusters of a 100k-instance view). Clamped to MAX_BIN_CAPACITY
             // by the core, so bin * capacity stays under the 24-bit visible index.
             core.config.max_bin_capacity = (s.max_visible_clusters / 4).max(16).next_power_of_two();
+            // A run culling against this frame's Hi-Z has one phase.
+            if core.config.current_hiz {
+                core.config.two_phase_occlusion = false;
+            }
         }
         core.begin_frame(
             ctx.device,
@@ -198,12 +248,12 @@ impl RenderPass for VgCullEarlyPass {
     }
 
     fn execute(&mut self, ctx: &mut PassContext) -> HelioResult<()> {
-        let Some(inputs) = inputs(ctx.registry) else {
+        let Some(inputs) = inputs(ctx.registry, self.run) else {
             return Ok(());
         };
         let hiz = ctx
             .registry
-            .texture_view(ResourceKey::new(crate::KEY_HIZ_EARLY));
+            .texture_view(ResourceKey::new(self.run.hiz_early));
         let mut core = self.core.lock().unwrap();
         if !core.prepared() {
             return Ok(());
@@ -215,21 +265,26 @@ impl RenderPass for VgCullEarlyPass {
 }
 
 impl RenderPass for VgCullLatePass {
+    /// A gated run's pass is a member only while its gate is open.
+    fn is_member(&mut self, _scene: &mut helio_core::SceneContent<'_>) -> bool {
+        self.gate.as_ref().is_none_or(|gate| gate.is_open())
+    }
+
     fn name(&self) -> &'static str {
-        "VgCullLate"
+        self.run.names.cull_late
     }
 
     fn declare_resources(&self, builder: &mut helio_core::graph::ResourceBuilder) {
-        builder.read(crate::KEY_CULL_EARLY);
-        builder.write_buffer(crate::KEY_CULL);
+        builder.read(self.run.cull_early);
+        builder.write_buffer(self.run.cull);
     }
 
     fn publish<'a>(&self, frame: &mut helio_core::ResourceRegistry<'a>) {
         let buffers: &'a VgCullBuffers = unsafe { std::mem::transmute(&*self.buffers) };
         frame.write(
-            ResourceKey::new(crate::KEY_CULL),
+            ResourceKey::new(self.run.cull),
             frame_data(buffers, 1),
-            "VgCullLate",
+            self.run.names.cull_late,
         );
     }
 
@@ -239,7 +294,7 @@ impl RenderPass for VgCullLatePass {
     }
 
     fn execute(&mut self, ctx: &mut PassContext) -> HelioResult<()> {
-        let Some(inputs) = inputs(ctx.registry) else {
+        let Some(inputs) = inputs(ctx.registry, self.run) else {
             return Ok(());
         };
         let mut core = self.core.lock().unwrap();
@@ -248,7 +303,7 @@ impl RenderPass for VgCullLatePass {
         }
         let hiz = ctx
             .registry
-            .texture_view(ResourceKey::new(crate::KEY_HIZ_LATE));
+            .texture_view(ResourceKey::new(self.run.hiz_late));
         let mut rec = ctx.graphics_cmds();
         core.record_phase(&mut rec, ctx.device, ctx.queue, ctx.camera, &inputs, hiz, 1);
         Ok(())

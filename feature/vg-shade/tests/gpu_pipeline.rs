@@ -124,7 +124,12 @@ fn depth_texture(gpu: &Gpu, label: &str, data: &[f32]) -> wgpu::Texture {
     );
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("depth fill"),
-        source: wgpu::ShaderSource::Wgsl(shader_source::depth().into()),
+        // Resolved as the pass resolves it (the prelude's surface tags).
+        source: wgpu::ShaderSource::Wgsl(
+            helio_core::shader::resolve(&shader_source::depth())
+                .into_owned()
+                .into(),
+        ),
     });
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
@@ -606,6 +611,7 @@ fn resolve_bin_shade_and_final_depth() {
                 dense_keys: None,
                 rt: None,
                 rt_visible: None,
+                remaps: None,
                 dense_mask: None,
                 dense_merge: false,
                 debug: $debug,

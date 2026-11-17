@@ -96,7 +96,9 @@ pub struct StaticObjectRow {
     pub bone_palette_offset: u32,
     /// Number of valid joint matrices for this instance.
     pub bone_palette_count: u32,
-    pub _skin_pad: u32,
+    /// Which section of its mesh the row draws (the scene join writes one
+    /// row per section; the authored LOD reads it to pick the section).
+    pub section_index: u32,
 }
 
 // SAFETY: a `#[repr(C)]` bytemuck `Pod` row: no padding bytes, any bit
@@ -214,7 +216,7 @@ impl StaticObjectRow {
             skin_vertex_offset: 0,
             bone_palette_offset: 0,
             bone_palette_count: 0,
-            _skin_pad: 0,
+            section_index: 0,
         }
     }
 

@@ -252,7 +252,10 @@ fn ready_placed_enabled_instances_become_active_with_derived_flags() {
     // ready, 4: component disabled, 5: asset unknown, 7: not placed.
     assert_eq!(rows.len(), 4, "{rows:?}");
 
-    let defaults = INST_ENABLED | INST_SHADOW_CASTER | INST_LOD_SUPPRESS | INST_CONE_CULL;
+    // Every instance has one section (`section_handles`), carried in the flags.
+    let one_section = 1 << helio_vg_format::INST_SECTION_SHIFT;
+    let defaults =
+        INST_ENABLED | INST_SHADOW_CASTER | INST_LOD_SUPPRESS | INST_CONE_CULL | one_section;
     assert_eq!(
         rows[0],
         GpuVgInstance {
@@ -268,7 +271,8 @@ fn ready_placed_enabled_instances_become_active_with_derived_flags() {
         | INST_FORCE_ROOT_ONLY
         | INST_LOD_SUPPRESS
         | INST_CONE_CULL
-        | ((TierLock::SwRaster as u32) << INST_TIER_SHIFT);
+        | ((TierLock::SwRaster as u32) << INST_TIER_SHIFT)
+        | one_section;
     assert_eq!(
         rows[1],
         GpuVgInstance {

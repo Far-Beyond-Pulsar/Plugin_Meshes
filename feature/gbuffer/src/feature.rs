@@ -1,6 +1,7 @@
-//! The meshes' G-buffer drawer: it opens the frame's G-buffer phase (clears
-//! the layout, `helio_frame_api::gbuffer`) and draws the culled opaque
-//! batches into it.
+//! The meshes' G-buffer drawers: the opener (it opens the frame's G-buffer
+//! phase, clearing the layout, `helio_frame_api::gbuffer`, and draws the
+//! culled opaque batches into it) and the same program drawing the meshes'
+//! occurrences through the frame's portal chains (`helio_portal_api`).
 
 use helio_feature_api::{pass_node, Feature, FeatureRegistrar};
 use helio_frame_api::{FrameNode, Phase};
@@ -44,6 +45,25 @@ impl Feature for GBufferDrawers {
                 },
             )
             .opens(Phase::GBuffer, 0),
+        );
+        registrar.node(
+            pass_node(
+                "gbuffer_portal_occurrences",
+                "Geometry: GBuffer Through Portals",
+                "Passes: Geometry",
+                "The meshes again through the frame's portal chains (helio_portal_api): each occurrence mapped by its chain, clipped to what the chain shows, with the G-buffer program's own occurrence entry points. A member only while the frame has portal chains.",
+                |build| {
+                    let mut pass = GBufferPass::new(build.env.device)
+                        .with_view(helio_frame_api::view::view_of(build.env))
+                        .portal_occurrences(build.env.device);
+                    if let Some(templates) = build.env.setting::<helio_mats::MaterialTemplates>() {
+                        pass = pass.with_template_registry(templates.opaque.clone());
+                    }
+                    build.graph.add_pass(Box::new(pass));
+                    Ok(())
+                },
+            )
+            .drawer(Phase::GBuffer, helio_portal_api::OCCURRENCE_ORDER),
         );
     }
 }

@@ -5,8 +5,9 @@ use helio_pass_vg_raster::shaders;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
 fn validate(label: &str, src: &str, caps: Capabilities) -> Result<naga::Module, String> {
-    // What the device compiles: the prelude expanded.
-    let src = &*helio_core::shader::resolve(src);
+    // What the device compiles: the prelude and the chain clip's snippet
+    // expanded.
+    let src = &*helio_core::shader::resolve_with(src, &[helio_portal_api::PORTAL_CHAIN_SNIPPET]);
     let module = naga::front::wgsl::parse_str(src)
         .map_err(|e| format!("{label}: parse: {}", e.emit_to_string(src)))?;
     Validator::new(ValidationFlags::all(), caps)
@@ -32,14 +33,16 @@ fn modules_without_int64_validate_with_no_extra_capabilities() {
 
 #[test]
 fn sw_raster_requires_exactly_the_int64_min_max_capabilities() {
-    let src = shaders::sw_raster_source();
-    // Not valid without the capabilities...
-    assert!(validate("sw", &src, base_caps()).is_err());
-    // ...valid with MIN_MAX only (no ALL_OPS: the atomicMax result is unused).
-    let caps = Capabilities::SHADER_INT64 | Capabilities::SHADER_INT64_ATOMIC_MIN_MAX;
-    validate("sw", &src, caps).unwrap_or_else(|e| panic!("{e}"));
-    // And with everything.
-    validate("sw", &src, Capabilities::all()).unwrap_or_else(|e| panic!("{e}"));
+    for clip in [false, true] {
+        let src = shaders::sw_raster_source(clip);
+        // Not valid without the capabilities...
+        assert!(validate("sw", &src, base_caps()).is_err());
+        // ...valid with MIN_MAX only (no ALL_OPS: the atomicMax result is unused).
+        let caps = Capabilities::SHADER_INT64 | Capabilities::SHADER_INT64_ATOMIC_MIN_MAX;
+        validate("sw", &src, caps).unwrap_or_else(|e| panic!("{e}"));
+        // And with everything.
+        validate("sw", &src, Capabilities::all()).unwrap_or_else(|e| panic!("{e}"));
+    }
 }
 
 #[test]
@@ -77,7 +80,9 @@ fn entry_points_exist() {
     for (label, src) in shaders::all_sources() {
         let m = validate(label, &src, Capabilities::all()).unwrap();
         let names: Vec<_> = m.entry_points.iter().map(|e| e.name.as_str()).collect();
-        for want in &expect.iter().find(|(l, _)| *l == label).unwrap().1 {
+        // A chain-clipped variant has its module's entry points.
+        let module = label.trim_end_matches(" (chain clip)");
+        for want in &expect.iter().find(|(l, _)| *l == module).unwrap().1 {
             assert!(names.contains(want), "{label} lacks {want}: {names:?}");
         }
     }

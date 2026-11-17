@@ -19,6 +19,20 @@ pub const HW_RASTER_MASKED: &str = include_str!("../shaders/vg_hw_raster_masked.
 pub const SW_RASTER_MASKED: &str = include_str!("../shaders/vg_sw_raster_masked.wgsl");
 /// `vg_tri_cover_at`: coverage plus barycentrics (masked software kernel only).
 pub const TRI_COVER: &str = include_str!("../shaders/vg_tri_cover.wgsl");
+/// `vg_chain_clipped` of a run drawn through another space (group 3,
+/// `//!use portal_chain`; `VgRasterConfig::chain_clip`).
+pub const CHAIN_CLIP: &str = include_str!("../shaders/vg_chain_clip.wgsl");
+/// `vg_chain_clipped` of a run drawn where its instances are: never clipped
+/// (no bindings, compiled away).
+pub const CHAIN_CLIP_NONE: &str = "fn vg_chain_clipped(instance: u32, world: vec3<f32>, pixel: vec2<i32>) -> bool {\n    return false;\n}\n";
+
+fn chain_clip(enabled: bool) -> &'static str {
+    if enabled {
+        CHAIN_CLIP
+    } else {
+        CHAIN_CLIP_NONE
+    }
+}
 
 /// Group 0 bindings 1 (page pool) and 2 (asset quant) read by [`DECODE`].
 pub fn decode_bindings() -> String {
@@ -29,31 +43,32 @@ fn join(parts: &[&str]) -> String {
     parts.join("\n")
 }
 
-fn scene(extra: &[&str]) -> String {
+fn scene(extra: &[&str], clip: bool) -> String {
     let db = decode_bindings();
-    let mut parts: Vec<&str> = vec![FORMAT, BINDINGS, &db, DECODE];
+    let mut parts: Vec<&str> = vec![FORMAT, BINDINGS, &db, DECODE, chain_clip(clip)];
     parts.extend_from_slice(extra);
     join(&parts)
 }
 
-/// Tier 1 vertex + fragment module.
-pub fn hw_raster_source() -> String {
-    scene(&[HW_RASTER])
+/// Tier 1 vertex + fragment module (`clip`: a run drawn through another
+/// space, [`CHAIN_CLIP`]).
+pub fn hw_raster_source(clip: bool) -> String {
+    scene(&[HW_RASTER], clip)
 }
 /// Tier 2 with 64-bit atomics (`sw_raster_main`).
-pub fn sw_raster_source() -> String {
-    scene(&[RASTER_COMMON, SW_RASTER])
+pub fn sw_raster_source(clip: bool) -> String {
+    scene(&[RASTER_COMMON, SW_RASTER], clip)
 }
-/// Tier 2 fallback binner (`sw_bin_main`).
+/// Tier 2 fallback binner (`sw_bin_main`; bins triangles, writes no pixel).
 pub fn sw_bin_source() -> String {
-    scene(&[RASTER_COMMON, SW_BIN])
+    scene(&[RASTER_COMMON, SW_BIN], false)
 }
 /// Tiled raster kernel (`tile_raster_main`).
-pub fn tile_raster_source() -> String {
-    scene(&[RASTER_COMMON, TILE_RASTER])
+pub fn tile_raster_source(clip: bool) -> String {
+    scene(&[RASTER_COMMON, TILE_RASTER], clip)
 }
 /// Tier 1 masked module; the alpha bindings are group 1 starting at binding 0.
-pub fn hw_masked_source(binding: helio_mats::MaterialBindingConfig) -> String {
+pub fn hw_masked_source(binding: helio_mats::MaterialBindingConfig, clip: bool) -> String {
     let db = decode_bindings();
     let alpha = helio_mats::vg_alpha::bindings_wgsl(binding, 1, 0);
     format!(
@@ -64,6 +79,7 @@ pub fn hw_masked_source(binding: helio_mats::MaterialBindingConfig) -> String {
             BINDINGS,
             &db,
             DECODE,
+            chain_clip(clip),
             &alpha,
             helio_mats::vg_alpha::WGSL,
             helio_mats::vg_alpha::UV_WGSL,
@@ -72,7 +88,7 @@ pub fn hw_masked_source(binding: helio_mats::MaterialBindingConfig) -> String {
     )
 }
 /// Tier 2 masked module (64-bit atomics); the alpha bindings are group 2 starting at binding 0.
-pub fn sw_masked_source(binding: helio_mats::MaterialBindingConfig) -> String {
+pub fn sw_masked_source(binding: helio_mats::MaterialBindingConfig, clip: bool) -> String {
     let db = decode_bindings();
     let alpha = helio_mats::vg_alpha::bindings_wgsl(binding, 2, 0);
     format!(
@@ -83,6 +99,7 @@ pub fn sw_masked_source(binding: helio_mats::MaterialBindingConfig) -> String {
             BINDINGS,
             &db,
             DECODE,
+            chain_clip(clip),
             RASTER_COMMON,
             TRI_COVER,
             &alpha,
@@ -108,15 +125,34 @@ pub fn all_sources() -> Vec<(&'static str, String)> {
         mode: helio_mats::MaterialBindingMode::Expanded,
         max_textures: 11,
     };
-    vec![
-        ("vg_hw_raster_masked (bindless)", hw_masked_source(bindless)),
-        ("vg_hw_raster_masked (expanded)", hw_masked_source(expanded)),
-        ("vg_sw_raster_masked (bindless)", sw_masked_source(bindless)),
-        ("vg_sw_raster_masked (expanded)", sw_masked_source(expanded)),
-        ("vg_hw_raster", hw_raster_source()),
-        ("vg_sw_raster", sw_raster_source()),
+    let mut sources = vec![
         ("vg_sw_bin", sw_bin_source()),
-        ("vg_tile_raster", tile_raster_source()),
         ("vg_tile_classify", tile_classify_source()),
-    ]
+    ];
+    for (clip, suffix) in [(false, ""), (true, " (chain clip)")] {
+        let label =
+            |name: &str| -> &'static str { Box::leak(format!("{name}{suffix}").into_boxed_str()) };
+        sources.extend([
+            (
+                label("vg_hw_raster_masked (bindless)"),
+                hw_masked_source(bindless, clip),
+            ),
+            (
+                label("vg_hw_raster_masked (expanded)"),
+                hw_masked_source(expanded, clip),
+            ),
+            (
+                label("vg_sw_raster_masked (bindless)"),
+                sw_masked_source(bindless, clip),
+            ),
+            (
+                label("vg_sw_raster_masked (expanded)"),
+                sw_masked_source(expanded, clip),
+            ),
+            (label("vg_hw_raster"), hw_raster_source(clip)),
+            (label("vg_sw_raster"), sw_raster_source(clip)),
+            (label("vg_tile_raster"), tile_raster_source(clip)),
+        ]);
+    }
+    sources
 }

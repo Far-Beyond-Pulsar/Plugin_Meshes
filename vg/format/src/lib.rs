@@ -180,6 +180,8 @@ pub fn decode_bindings_wgsl(group: u32, pool_binding: u32, quant_binding: u32) -
 }
 
 pub mod debug_view;
+pub mod run;
+pub use run::{VgInstanceSource, VgRun, VgRunGate, VgRunNames, VgRunTree, NO_REMAP};
 pub mod testing;
 
 /// `.vgeo` / page identification.
@@ -442,6 +444,11 @@ pub const INST_FORCE_ROOT_ONLY: u32 = 4;
 pub const INST_LOD_SUPPRESS: u32 = 8;
 pub const INST_CONE_CULL: u32 = 16;
 pub const INST_TIER_SHIFT: u32 = 8;
+/// The instance's material sections (`static_objects` rows from `object_row`,
+/// one per section), in `flags >> INST_SECTION_SHIFT & INST_SECTION_MASK`:
+/// what a copy of the instance copies.
+pub const INST_SECTION_SHIFT: u32 = 16;
+pub const INST_SECTION_MASK: u32 = 0x7fff;
 pub const INST_TIER_MASK: u32 = 3;
 
 /// One row per VG-active instance. 16 bytes.

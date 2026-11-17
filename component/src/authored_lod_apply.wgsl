@@ -19,27 +19,7 @@ struct Section {
     index_count: u32,
 }
 
-struct StaticObjectRow {
-    mesh_slot: u32,
-    mesh_generation: u32,
-    material_slot: u32,
-    material_generation: u32,
-    transform: array<array<f32, 4>, 4>,
-    prev_transform: array<array<f32, 4>, 4>,
-    normal_mat: array<array<f32, 4>, 3>,
-    bounds: array<f32, 4>,
-    index_count: u32,
-    first_index: u32,
-    vertex_offset: i32,
-    material_class: u32,
-    graph_hash_lo: u32,
-    graph_hash_hi: u32,
-    flags: u32,
-    skin_vertex_offset: u32,
-    bone_palette_offset: u32,
-    bone_palette_count: u32,
-    section_index: u32,
-}
+// `StaticObjectRow`: prepended (`helio_mesh_api::OBJECT_ROW_SNIPPET`).
 
 struct Uniforms {
     object_rows: u32,

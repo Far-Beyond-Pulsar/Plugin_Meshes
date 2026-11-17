@@ -48,29 +48,9 @@ struct BvhInstance {
     object_row: u32,
 }
 
-/// `helio_pass_gbuffer::StaticObjectComponent`, byte for byte (see
-/// `object_batch.wgsl`). Only `mesh_generation` and `bounds` are read.
-struct StaticObjectRow {
-    mesh_slot: u32,
-    mesh_generation: u32,
-    material_slot: u32,
-    material_generation: u32,
-    transform: array<array<f32, 4>, 4>,
-    prev_transform: array<array<f32, 4>, 4>,
-    normal_mat: array<array<f32, 4>, 3>,
-    bounds: array<f32, 4>,
-    index_count: u32,
-    first_index: u32,
-    vertex_offset: i32,
-    material_class: u32,
-    graph_hash_lo: u32,
-    graph_hash_hi: u32,
-    flags: u32,
-    skin_vertex_offset: u32,
-    bone_palette_offset: u32,
-    bone_palette_count: u32,
-    _skin_pad: u32,
-}
+// `StaticObjectRow`: `//!use mesh_object_row` (the meshes' api). Only
+// `mesh_generation` and `bounds` are read.
+//!use mesh_object_row
 
 /// A row is in the tree when its instance is enabled, its object row exists,
 /// is alive, and its world bounding sphere (centre xyz, radius w) is finite.

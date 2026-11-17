@@ -41,7 +41,6 @@ pub use feature::{GBufferDrawers, SelectionDrawers};
 pub mod selection;
 
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
 
 pub mod depth_material;
 use helio_mats::radiant::{RadiantShaderCache, RadiantShaderKey};
@@ -88,9 +87,12 @@ pub struct GBufferPass {
     pipelines: HashMap<RadiantShaderKey, wgpu::RenderPipeline>,
     /// Device supports `POLYGON_MODE_LINE`, so the wireframe debug view is offered.
     wireframe_supported: bool,
-    /// The view the pass draws (`helio_core::view`): its winding, its clip,
-    /// and whether the G-buffer is already open (an inline view loads it).
+    /// The view the pass draws (`helio_core::view`): its winding and clip.
     view: helio_core::ViewDescription,
+    /// Draws the meshes' occurrences through the frame's portal chains
+    /// instead of the culled instances (`Self::portal_occurrences`): loads
+    /// the G-buffer the phase's opener cleared.
+    occurrences: Option<Occurrences>,
     shader_cache: RadiantShaderCache,
     /// The materials' opaque templates (`helio_mats::MaterialTemplates`),
     /// shared, never deep-cloned (see `SharedTemplateRegistry`). `None`: the
@@ -134,30 +136,11 @@ pub struct GBufferPass {
     /// Whether the graph requested baked lighting's lightmap UV as the
     /// G-buffer's surface payload (`LIGHTMAP_PAYLOAD` in gbuffer.wgsl).
     lightmap_payload: bool,
-    /// Portal/sublevel-local transforms, indexed by an instance's `space_id`.
-    /// Pass-owned (not `Renderer`-owned): every consumer of `"coordinate_
-    /// spaces"` (`OcclusionCullPass`, `IndirectDispatchPass`, `ShadowPass`,
-    /// both portal passes) needs `space_id 0` to always
-    /// resolve to identity even when nothing authors portal/sublevel content,
-    /// and `GBufferPass` is the one pass guaranteed present in every graph --
-    /// see `helio_core::CoordinateSpacesFrameData`'s doc for the
-    /// still-pending real fix (a SceneDB-driven portal/sublevel component).
-    coordinate_spaces: wgpu::Buffer,
-    coordinate_spaces_prev: wgpu::Buffer,
     /// Zeroed sentinel storage for scenes without skeletal assets.
     fallback_skeletal_storage: wgpu::Buffer,
     /// What the material bind group holds without the materials plugin's
     /// texture table or material rows (default grey PBR), made on first use.
     stand_in: Option<helio_mats::MaterialStandIn>,
-    /// CPU-side projection input staged by the generic graph interface and
-    /// uploaded during `prepare()` with the current frame queue.
-    pending_coordinate_spaces: Option<Vec<glam::Mat4>>,
-    /// The table last uploaded (`COORDINATE_SPACE_SLOTS * 16` words), which becomes
-    /// the previous-frame table when the next one arrives.
-    last_coordinate_words: Option<Vec<f32>>,
-    /// `coordinate_spaces_prev` differs from `coordinate_spaces` and must be
-    /// brought level next frame (a table that stops changing has no motion).
-    coordinate_prev_stale: bool,
 }
 
 /// The meshes' G-buffer program (`shaders/gbuffer.wgsl`): the vertex
@@ -167,33 +150,82 @@ pub struct GBufferPass {
 pub const GBUFFER_PROGRAM: &str = include_str!("../shaders/gbuffer.wgsl");
 /// The snippets [`GBUFFER_PROGRAM`] composes with: the meshes' draw rows and
 /// the frame's G-buffer output.
-pub const GBUFFER_PROGRAM_SNIPPETS: [helio_core::shader::ShaderSnippet; 3] = [
+pub const GBUFFER_PROGRAM_SNIPPETS: [helio_core::shader::ShaderSnippet; 4] = [
     helio_mesh_api::DRAW_ROWS_SNIPPET,
     helio_frame_api::gbuffer::OUTPUT_SNIPPET,
     helio_bake_api::LIGHTMAP_REGIONS_SNIPPET,
+    helio_portal_api::PORTAL_CHAIN_SNIPPET,
 ];
 
-/// Coordinate-space slots backed by GPU storage (slot 0 is the identity). An
-/// instance carries its space id in 8 bits of its flags, so 256 is the most.
-pub const COORDINATE_SPACE_SLOTS: usize = 256;
-
-/// The table as GPU words: slot 0 identity, then `spaces` (the non-identity
-/// tail) from slot 1.
-fn coordinate_space_words(spaces: &[glam::Mat4]) -> Vec<f32> {
-    let mut words = vec![0.0f32; COORDINATE_SPACE_SLOTS * 16];
-    words[..16].copy_from_slice(&glam::Mat4::IDENTITY.to_cols_array());
-    for (slot, space) in spaces.iter().take(COORDINATE_SPACE_SLOTS - 1).enumerate() {
-        words[(slot + 1) * 16..(slot + 2) * 16].copy_from_slice(&space.to_cols_array());
-    }
-    words
+/// What the occurrence mode adds (`GBufferPass::portal_occurrences`): the
+/// layout of group 3 (per occurrence its chain, the chains, their stages,
+/// the aperture mask), the pipeline layout with it, and the group.
+struct Occurrences {
+    layout: wgpu::BindGroupLayout,
+    pipeline_layout: wgpu::PipelineLayout,
+    group: helio_core::CachedBindGroup,
+    /// Whether the frame publishes portal chains (a member only then).
+    live: bool,
 }
 
 impl GBufferPass {
     /// Draws `view` (`helio_frame_api::view::view_of`): a mirrored view's
-    /// winding, a clipped view's plane, and an inline view's G-buffer loaded
-    /// rather than cleared.
+    /// winding and a clipped view's plane.
     pub fn with_view(mut self, view: helio_core::ViewDescription) -> Self {
         self.view = view;
+        self
+    }
+
+    /// Draws the meshes again through the frame's portal chains
+    /// (`helio_portal_api`): the occurrences the occlusion cull's portal pass
+    /// found (`helio_mesh_api::PortalOccurrenceFrameData`), with the same
+    /// program's occurrence entry points, after the portals' aperture mask
+    /// (`helio_portal_api::OCCURRENCE_ORDER`), into the open G-buffer.
+    pub fn portal_occurrences(mut self, device: &wgpu::Device) -> Self {
+        let storage = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("GBuffer Occurrences BGL 3"),
+            entries: &[
+                storage(0, wgpu::ShaderStages::VERTEX),
+                storage(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                storage(2, wgpu::ShaderStages::FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("GBuffer Occurrences PL"),
+            bind_group_layouts: &[
+                Some(&self.bind_group_layout_0),
+                Some(&self.bind_group_layout_1),
+                Some(&self.uv_grid_bind_group_layout),
+                Some(&layout),
+            ],
+            immediate_size: 0,
+        });
+        self.occurrences = Some(Occurrences {
+            layout,
+            pipeline_layout,
+            group: helio_core::CachedBindGroup::default(),
+            live: false,
+        });
         self
     }
 
@@ -361,18 +393,6 @@ impl GBufferPass {
             mapped_at_creation: false,
         });
 
-        let mut coordinate_space_words = vec![0.0f32; COORDINATE_SPACE_SLOTS * 16];
-        coordinate_space_words[..16].copy_from_slice(&glam::Mat4::IDENTITY.to_cols_array());
-        let coordinate_spaces = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Coordinate Spaces (space_id 0 = identity)"),
-            contents: bytemuck::cast_slice(&coordinate_space_words),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-        let coordinate_spaces_prev = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Coordinate Spaces Prev (space_id 0 = identity)"),
-            contents: bytemuck::cast_slice(&coordinate_space_words),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
         Self {
             draw_slots: DrawSlots::default(),
             timing_query: None,
@@ -382,6 +402,7 @@ impl GBufferPass {
                 .features()
                 .contains(wgpu::Features::POLYGON_MODE_LINE),
             view: helio_core::ViewDescription::PRIMARY,
+            occurrences: None,
             shader_cache: RadiantShaderCache::new(),
             template_registry: None,
             last_template_keys: Vec::new(),
@@ -405,22 +426,9 @@ impl GBufferPass {
             debug_mode: 0,
             no_lightmap_regions,
             lightmap_payload: false,
-            coordinate_spaces,
-            coordinate_spaces_prev,
             fallback_skeletal_storage,
             stand_in: None,
-            pending_coordinate_spaces: None,
-            last_coordinate_words: None,
-            coordinate_prev_stale: false,
         }
-    }
-
-    /// Portal/sublevel-local transform buffer (`space_id 0` = identity).
-    /// Exposed so `Renderer::render` can publish `"coordinate_spaces"` into
-    /// the frame's `ResourceRegistry` before the graph executes -- the same
-    /// `find_pass`-based reach-in `Renderer` already uses for `PostProcessPass`.
-    pub fn coordinate_spaces_buffer(&self) -> &wgpu::Buffer {
-        &self.coordinate_spaces
     }
 
     /// Optional GPU timestamps around rasterizing the GBuffer.
@@ -439,24 +447,6 @@ impl GBufferPass {
     pub fn timing_query(&self) -> Option<&wgpu::QuerySet> {
         self.timing_query.as_ref()
     }
-
-    /// See [`Self::coordinate_spaces_buffer`].
-    pub fn coordinate_spaces_prev_buffer(&self) -> &wgpu::Buffer {
-        &self.coordinate_spaces_prev
-    }
-
-    /// Upload the current portal/sublevel coordinate-space table. Slot zero is
-    /// always world space; additional slots map authored target geometry into
-    /// the source portal that displays it.
-    pub fn set_coordinate_spaces(&self, queue: &wgpu::Queue, spaces: &[glam::Mat4]) {
-        let words = coordinate_space_words(spaces);
-        queue.write_buffer(&self.coordinate_spaces, 0, bytemuck::cast_slice(&words));
-        queue.write_buffer(
-            &self.coordinate_spaces_prev,
-            0,
-            bytemuck::cast_slice(&words),
-        );
-    }
 }
 
 impl RenderPass for GBufferPass {
@@ -473,36 +463,35 @@ impl RenderPass for GBufferPass {
     }
 
     fn name(&self) -> &'static str {
-        "GBuffer"
+        if self.occurrences.is_some() {
+            "GBufferPortalOccurrences"
+        } else {
+            "GBuffer"
+        }
     }
 
-    fn set_frame_inputs(&mut self, inputs: &helio_core::RenderFrameInputs<'_>) {
-        self.pending_coordinate_spaces = Some(inputs.coordinate_spaces.to_vec());
-    }
-
-    fn publish_frame_inputs<'a>(
-        &self,
-        _camera: &helio_core::GpuCameraUniforms,
-        frame: &mut helio_core::ResourceRegistry<'a>,
-    ) {
-        // SAFETY: these buffers are owned by the GBuffer pass, which is owned
-        // by the RenderGraph for longer than the current frame registry.
-        let coordinate_spaces: &'a wgpu::Buffer =
-            unsafe { std::mem::transmute(&self.coordinate_spaces) };
-        let coordinate_spaces_prev: &'a wgpu::Buffer =
-            unsafe { std::mem::transmute(&self.coordinate_spaces_prev) };
-        frame.write(
-            helio_core::resource_keys::coordinate_spaces(),
-            helio_core::CoordinateSpacesFrameData {
-                coordinate_spaces,
-                coordinate_spaces_prev,
-            },
-            "GBuffer",
-        );
+    /// The occurrence mode is a member while the frame publishes portal
+    /// chains; the direct draw always.
+    fn is_member(&mut self, scene: &mut helio_core::SceneContent<'_>) -> bool {
+        let Some(occurrences) = self.occurrences.as_mut() else {
+            return true;
+        };
+        if let Some(buffers) = scene.scene_buffers() {
+            occurrences.live = helio_portal_api::portal_chain_set(buffers).is_some();
+        }
+        occurrences.live
     }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
         builder.read("object_batch");
+        if self.occurrences.is_some() {
+            // The opener's G-buffer, loaded (a second writer would allocate a
+            // second set), the occurrences and the aperture mask.
+            builder.read(helio_frame_api::gbuffer::GROUP);
+            builder.read(helio_mesh_api::PORTAL_OCCURRENCES);
+            builder.read(helio_portal_api::PORTAL_MASK);
+            return;
+        }
         builder.read("culled_batch");
         // The 4 bundled G-buffer targets consumed together downstream as one
         // `Tracked<GBufferViews>` (see `publish_group` below) — declared as a
@@ -603,11 +592,11 @@ impl RenderPass for GBufferPass {
             helio_core::ResourceKey::new(helio_frame_api::gbuffer::VELOCITY),
             "GBuffer",
         )?;
-        // An inline view draws into its requester's G-buffer (and its own
-        // masked depth): it loads what the phase's opener would clear.
-        let inline = self.view.kind == helio_core::ViewKind::Inline;
+        // The occurrences draw into the G-buffer the phase's opener cleared
+        // (and its depth, cleared behind the openings by the portals' mask).
+        let loads = self.occurrences.is_some();
         let open = |clear: wgpu::Color| {
-            if inline {
+            if loads {
                 wgpu::LoadOp::Load
             } else {
                 wgpu::LoadOp::Clear(clear)
@@ -689,12 +678,16 @@ impl RenderPass for GBufferPass {
                 }),
             ]));
         Some(wgpu::RenderPassDescriptor {
-            label: Some("GBuffer"),
+            label: Some(if loads {
+                "GBuffer Portal Occurrences"
+            } else {
+                "GBuffer"
+            }),
             color_attachments,
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth,
                 depth_ops: Some(wgpu::Operations {
-                    load: if inline {
+                    load: if loads {
                         wgpu::LoadOp::Load
                     } else {
                         wgpu::LoadOp::Clear(helio_core::depth::CLEAR)
@@ -752,28 +745,6 @@ impl RenderPass for GBufferPass {
             self.uv_grid_uploaded = true;
             self.uv_grid_pixels = Vec::new();
         }
-        if let Some(pending_coordinate_spaces) = self.pending_coordinate_spaces.take() {
-            let words = coordinate_space_words(&pending_coordinate_spaces);
-            // The previous frame's table is what was uploaded before this one
-            // (the first upload has no history: still frames).
-            let previous = self.last_coordinate_words.as_deref().unwrap_or(&words);
-            ctx.queue
-                .write_buffer(&self.coordinate_spaces, 0, bytemuck::cast_slice(&words));
-            ctx.write_buffer(
-                &self.coordinate_spaces_prev,
-                0,
-                bytemuck::cast_slice(previous),
-            );
-            self.coordinate_prev_stale = previous != words.as_slice();
-            self.last_coordinate_words = Some(words);
-        } else if self.coordinate_prev_stale {
-            // The table held still since the last upload: a space that stopped
-            // moving has no motion, so the history catches up.
-            if let Some(words) = self.last_coordinate_words.as_ref() {
-                ctx.write_buffer(&self.coordinate_spaces_prev, 0, bytemuck::cast_slice(words));
-            }
-            self.coordinate_prev_stale = false;
-        }
         // Read per-scene values from the frame registry so the GBuffer globals match
         // what the renderer configured (ambient light).
         let (ambient_color, ambient_intensity) = if let Some(ref environment) = ctx
@@ -822,12 +793,68 @@ impl RenderPass for GBufferPass {
         else {
             return Ok(());
         };
-        let Some(culled) = ctx
-            .registry
-            .get::<crate::CulledBatchFrameData<'_>>(helio_core::ResourceKey::new("culled_batch"))
-        else {
-            return Ok(());
-        };
+        // What to draw: the culled instances, or their occurrences through
+        // the portal chains (with the chains' group).
+        let (compacted_indices, indirect, segments, occurrence_group) =
+            if let Some(occurrences) = self.occurrences.as_mut() {
+                let Some(found) = ctx
+                    .registry
+                    .get::<helio_mesh_api::PortalOccurrenceFrameData<'_>>(
+                        helio_core::ResourceKey::new(helio_mesh_api::PORTAL_OCCURRENCES),
+                    )
+                else {
+                    return Ok(());
+                };
+                let (Some(chains), Some(stages), Some(mask)) = (
+                    ctx.registry.buffer_binding(helio_portal_api::PORTAL_CHAINS),
+                    ctx.registry.buffer_binding(helio_portal_api::PORTAL_STAGES),
+                    ctx.registry
+                        .texture_view(helio_core::ResourceKey::new(helio_portal_api::PORTAL_MASK)),
+                ) else {
+                    return Ok(());
+                };
+                let group = occurrences
+                    .group
+                    .get_or_create(
+                        &ctx.device,
+                        &wgpu::BindGroupDescriptor {
+                            label: Some("GBuffer Occurrences BG 3"),
+                            layout: &occurrences.layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: found.chains.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: chains.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: stages.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: wgpu::BindingResource::TextureView(mask),
+                                },
+                            ],
+                        },
+                    )
+                    .clone();
+                (found.instances, found.indirect, found.segments, Some(group))
+            } else {
+                let Some(culled) = ctx.registry.get::<crate::CulledBatchFrameData<'_>>(
+                    helio_core::ResourceKey::new("culled_batch"),
+                ) else {
+                    return Ok(());
+                };
+                (
+                    culled.compacted_indices,
+                    culled.indirect,
+                    culled.segments,
+                    None,
+                )
+            };
         let (max_draws, draw_count) = batch.all_draws();
         if max_draws == 0 {
             return Ok(());
@@ -879,7 +906,7 @@ impl RenderPass for GBufferPass {
             ctx.camera.clone(),
             batch.instances.clone(),
             lightmap_regions.clone(),
-            culled.compacted_indices.clone(),
+            compacted_indices.clone(),
             coordinate_spaces_buf.clone(),
             coordinate_spaces_prev_buf.clone(),
             skin_buf.clone(),
@@ -909,7 +936,7 @@ impl RenderPass for GBufferPass {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: culled.compacted_indices.as_entire_binding(),
+                        resource: compacted_indices.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
@@ -971,27 +998,25 @@ impl RenderPass for GBufferPass {
             self.bind_group_1_version = Some((material_textures.version, materials_epoch));
         }
 
-        let indirect = culled.indirect;
         // The slot indexes `compacted_indices`.
         let slots = self
             .draw_slots
-            .buffer(
-                &ctx.device,
-                DrawSlots::len_of(culled.compacted_indices.size(), 4),
-            )
+            .buffer(&ctx.device, DrawSlots::len_of(compacted_indices.size(), 4))
             .clone();
 
         let mut pass = ctx.render_cmds().unwrap();
         pass.set_bind_group(0, self.bind_group_0.as_ref().unwrap(), &[]);
         pass.set_bind_group(1, self.bind_group_1.as_ref().unwrap(), &[]);
         pass.set_bind_group(2, &self.uv_grid_bind_group, &[]);
+        if let Some(group) = occurrence_group.as_ref() {
+            pass.set_bind_group(3, group, &[]);
+        }
         pass.set_vertex_buffer(0, vertices.slice(..));
         pass.set_vertex_buffer(1, slots.slice(..));
         pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
 
         // One draw per material segment, at its fixed offset with this
         // frame's GPU count (see `DrawSegments`).
-        let segments = culled.segments;
         if segments.is_empty() {
             // No material key read back yet (the first frames): draw every
             // group with the default PBR pipeline.
@@ -1147,6 +1172,14 @@ impl GBufferPass {
                     .get(0)
                     .expect("Default PBR template (class 0) missing")
             };
+            let (layout, vertex_entry, fragment_entry) = match self.occurrences.as_ref() {
+                Some(occurrences) => (
+                    &occurrences.pipeline_layout,
+                    "vs_occurrence",
+                    "fs_occurrence",
+                ),
+                None => (&self.pipeline_layout, "vs_main", "fs_main"),
+            };
             let module = self.shader_cache.get_or_compile(
                 device,
                 key,
@@ -1161,10 +1194,10 @@ impl GBufferPass {
                 &device,
                 wgpu::RenderPipelineDescriptor {
                     label: Some("GBuffer Pipeline"),
-                    layout: Some(&self.pipeline_layout),
+                    layout: Some(layout),
                     vertex: wgpu::VertexState {
                         module,
-                        entry_point: Some("vs_main"),
+                        entry_point: Some(vertex_entry),
                         compilation_options: wgpu::PipelineCompilationOptions {
                             constants: &[(
                                 "LIGHTMAP_PAYLOAD",
@@ -1221,7 +1254,7 @@ impl GBufferPass {
                     },
                     fragment: Some(wgpu::FragmentState {
                         module,
-                        entry_point: Some("fs_main"),
+                        entry_point: Some(fragment_entry),
                         compilation_options: wgpu::PipelineCompilationOptions {
                             constants: &[(
                                 helio_frame_api::view::CLIP_CONSTANT,

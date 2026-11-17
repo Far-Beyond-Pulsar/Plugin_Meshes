@@ -71,6 +71,16 @@ fn vg_view_clipped(world_pos: vec3<f32>) -> bool {
     return helio_view_clipped(vg_cameras[vg_params.view_index], world_pos);
 }
 
+// The frame-space position of pixel (x, y) at reversed-Z depth `depth`.
+fn vg_pixel_world(x: i32, y: i32, depth: f32) -> vec3<f32> {
+    let ndc = vec2<f32>(
+        (f32(x) + 0.5) / f32(vg_params.width) * 2.0 - 1.0,
+        1.0 - (f32(y) + 0.5) / f32(vg_params.height) * 2.0,
+    );
+    let h = vg_cameras[vg_params.view_index].view_proj_inv * vec4<f32>(ndc, depth, 1.0);
+    return h.xyz / h.w;
+}
+
 // Asset-space position -> clip space.
 fn vg_to_clip(m: mat4x4<f32>, p: vec3<f32>) -> vec4<f32> {
     return vg_cameras[vg_params.view_index].view_proj * (m * vec4<f32>(p, 1.0));

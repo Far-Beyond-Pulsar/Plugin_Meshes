@@ -16,6 +16,8 @@ const VG_INST_LOD_SUPPRESS: u32 = 8u;
 const VG_INST_CONE_CULL: u32 = 16u;
 const VG_INST_TIER_SHIFT: u32 = 8u;
 const VG_INST_TIER_MASK: u32 = 3u;
+const VG_INST_SECTION_SHIFT: u32 = 16u;
+const VG_INST_SECTION_MASK: u32 = 0x7fffu;
 
 struct VgCluster {
     sphere: vec4<f32>,

@@ -187,7 +187,9 @@ pub mod reference;
 mod core;
 mod pass;
 
-pub use crate::core::{VgCullBuffers, VgCullConfig, VgCullCore, VgCullFrame, VgCullInputs};
+pub use crate::core::{
+    VgCullBuffers, VgCullConfig, VgCullCore, VgCullFrame, VgCullInputs, VgCullTree,
+};
 pub use crate::pass::{
     VgCullDynamic, VgCullEarlyPass, VgCullFrameData, VgCullLatePass, VgCullSettingsSource,
     VgTileEstimate,
@@ -197,21 +199,20 @@ use helio_vg_format::{GpuCluster, VgMode};
 
 // ── Registry keys ──────────────────────────────────────────────────────────
 
+// The frame's own run's keys ([`helio_vg_format::VgRun::DIRECT`], the one
+// owner of every run's keys; a pass of another run reads its run's).
+
 /// `VgCullInputs` published by the integration (T10) before the early pass.
-pub const KEY_INPUTS: &str = "vg_cull_inputs";
+pub const KEY_INPUTS: &str = helio_vg_format::VgRun::DIRECT.inputs;
 /// Hi-Z texture view of the previous frame (helio-pass-hiz output).
-pub const KEY_HIZ_EARLY: &str = "hiz";
+pub const KEY_HIZ_EARLY: &str = helio_vg_format::VgRun::DIRECT.hiz_early;
 /// Hi-Z texture view built from the phase-0 depth (a second Hi-Z build,
 /// placed between the passes). Optional.
-pub const KEY_HIZ_LATE: &str = "vg_hiz_late";
+pub const KEY_HIZ_LATE: &str = helio_vg_format::VgRun::DIRECT.hiz_late;
 /// [`VgCullFrameData`] after phase 0.
-pub const KEY_CULL_EARLY: &str = "vg_cull_early";
+pub const KEY_CULL_EARLY: &str = helio_vg_format::VgRun::DIRECT.cull_early;
 /// [`VgCullFrameData`] after phase 1 (final).
-pub const KEY_CULL: &str = "vg_cull";
-/// Scene-sourced buffer keys (documented names for the integration).
-pub const KEY_GCBVH_NODES: &str = "vg_gcbvh_nodes";
-pub const KEY_GCBVH_HEADER: &str = "vg_gcbvh_header";
-pub const KEY_INSTANCES: &str = "vg_instances";
+pub const KEY_CULL: &str = helio_vg_format::VgRun::DIRECT.cull;
 
 // ── Bins ───────────────────────────────────────────────────────────────────
 
@@ -495,6 +496,10 @@ pub const FLAG_MASKED: u32 = 8;
 pub const FLAG_SW_MASKED: u32 = 16;
 /// Set = the per-instance root early-out is OFF (A/B and equivalence tests).
 pub const FLAG_NO_ROOT_SHORTCUT: u32 = 32;
+/// The early Hi-Z is this frame's (the depth the drawers before the run left,
+/// [`crate::VgCullConfig::current_hiz`]): one exact occlusion phase against it,
+/// with this frame's view-projection; occluded work is dropped, none deferred.
+pub const FLAG_CURRENT_HIZ: u32 = 64;
 
 // ── Shader assembly ────────────────────────────────────────────────────────
 
@@ -532,6 +537,7 @@ pub fn wgsl_constants() -> String {
     u("VGC_FLAG_MASKED", FLAG_MASKED);
     u("VGC_FLAG_SW_MASKED", FLAG_SW_MASKED);
     u("VGC_FLAG_NO_ROOT_SHORTCUT", FLAG_NO_ROOT_SHORTCUT);
+    u("VGC_FLAG_CURRENT_HIZ", FLAG_CURRENT_HIZ);
     u("VGC_CLUSTER_FLAG_LEAF", GpuCluster::FLAG_LEAF);
     for (name, v) in [
         ("JOBS", stats::JOBS),
@@ -583,10 +589,13 @@ pub fn shader_source() -> String {
 {}
 {}
 {}
+{}
 {}",
         wgsl_constants(),
         // The material row's words and flags (the materials' snippet).
         helio_mats::MATERIAL_ROW_SNIPPET.source,
+        // The scene join's object row (the meshes' snippet).
+        helio_mesh_api::OBJECT_ROW_SNIPPET.source,
         helio_vg_format::WGSL,
         helio_vg_stream::bindings_wgsl(0, 4, true),
         helio_vg_stream::WGSL,

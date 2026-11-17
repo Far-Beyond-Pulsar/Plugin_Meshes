@@ -42,6 +42,8 @@ async fn create_pass() -> Option<OcclusionCullPass> {
     }));
     let stats = helio_core::FrameStats::new(&device);
 
+    // The occurrences through portal chains compile on the same device.
+    let _occurrences = helio_pass_occlusion_cull::PortalOccurrencePass::new(&device);
     Some(OcclusionCullPass::new(
         &device,
         hiz_sampler,

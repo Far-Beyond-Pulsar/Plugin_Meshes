@@ -23,7 +23,11 @@ fn naga_module(src: &str) -> naga::Module {
 
 #[test]
 fn build_shader_validates() {
-    let src = format!("{NODES_WGSL}\n{BUILD_WGSL}");
+    // The object row resolved as the pass resolves it.
+    let src = format!(
+        "{NODES_WGSL}\n{}\n{BUILD_WGSL}",
+        helio_mesh_api::OBJECT_ROW_SNIPPET.source
+    );
     let module = naga_module(&src);
     let entries: Vec<&str> = module
         .entry_points

@@ -391,6 +391,7 @@ fn run(g: &Gpu, s: &Scene, alpha: &Alpha, software: bool) -> Run {
             sw_meta_offset_words: 2,
             sw_dispatch_offset: 16,
         }),
+        clip: None,
     };
     let mut enc = g.device.create_command_encoder(&Default::default());
     raster.encode(&g.device, &g.queue, &mut enc, &mut targets, &inputs);

@@ -67,9 +67,13 @@ pub fn mesh_join_source() -> String {
     join_wgsl(include_str!("../shaders/scene_join_meshes.wgsl"))
 }
 
-/// A join shader as compiled: the shared join declarations.
+/// A join shader as compiled: the shared join declarations and the object
+/// row (`helio_mesh_api::OBJECT_ROW_SNIPPET`).
 fn join_wgsl(source: &str) -> String {
-    join_source(source)
+    join_source(&format!(
+        "{}\n{source}",
+        helio_mesh_api::OBJECT_ROW_SNIPPET.source
+    ))
 }
 
 /// Where the frontend's authored rows live. See the module doc for what
@@ -269,7 +273,7 @@ impl MovedJoin {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Scene Join Moved"),
             source: wgpu::ShaderSource::Wgsl(
-                join_source(include_str!("../shaders/scene_join_moved.wgsl")).into(),
+                join_wgsl(include_str!("../shaders/scene_join_moved.wgsl")).into(),
             ),
         });
         let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {

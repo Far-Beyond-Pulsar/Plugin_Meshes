@@ -12,13 +12,33 @@ fn compute_shaders_compile_under_fxc() {
         return;
     };
     let sources: Vec<(&str, String)> = vec![
-        ("scene_join_meshes", helio_pass_object_batch::scene_join::mesh_join_source()),
-        ("object_batch", format!("{}
-{}", include_str!("../shaders/object_batch.wgsl"), helio_mats::MATERIAL_ROW_SNIPPET.source)),
+        (
+            "scene_join_meshes",
+            helio_pass_object_batch::scene_join::mesh_join_source(),
+        ),
+        (
+            "object_batch",
+            format!(
+                "{}
+{}
+{}",
+                include_str!("../shaders/object_batch.wgsl"),
+                helio_mats::MATERIAL_ROW_SNIPPET.source,
+                helio_mesh_api::OBJECT_ROW_SNIPPET.source
+            ),
+        ),
     ];
     let mut failures = Vec::new();
     for (name, src) in sources {
-        failures.extend(fxc::fxc_failures(&fxc_exe, name, &helio_core::shader::resolve(&src)));
+        failures.extend(fxc::fxc_failures(
+            &fxc_exe,
+            name,
+            &helio_core::shader::resolve(&src),
+        ));
     }
-    assert!(failures.is_empty(), "FXC rejected:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "FXC rejected:\n{}",
+        failures.join("\n")
+    );
 }

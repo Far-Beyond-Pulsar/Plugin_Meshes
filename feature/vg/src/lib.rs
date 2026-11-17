@@ -22,8 +22,22 @@
 //!  VgStreamEnd     records the page-request readback
 //!  VgDense         Tier 3 over dense tiles (3-NonRT depth peel, or 3-RT ray queries when ready)
 //!  VgShade         vis resolve, material bin, shade -> G-buffer, final depth
+//! portal mask, classic occurrences (`helio_portal_api`)
+//!  VgPortalInstances  per live chain, the instances it may show, placed
+//!  VgInputsSecondary ... VgShadeSecondary  the second run over them (no tree:
+//!                  its cull seeds each instance)
 //! foliage / decals / deferred light: unchanged
 //! ```
+//!
+//! The second run ([`VgRun::SECONDARY`], [`add_portal_virtual_geometry_passes`])
+//! draws virtual geometry through portal chains: its instances are the ones
+//! [`VgPortalInstancesPass`] places per chain, its early cull tests one exact
+//! phase against a Hi-Z of the frame's depth after the mask and the classic
+//! occurrences (its own, never the direct run's), every pixel is clipped to
+//! its chain, and its surfaces carry the chain's remap. It shares the one
+//! cluster store: its page requests join the frame's feedback, read back with
+//! the next frame's. Its passes are members only while the frame has live
+//! chains and the scene VG instances.
 //!
 //! Every pass of the chain records nothing in a frame where `VgInputs` did not
 //! publish `vg_cull_inputs` (virtual geometry off, no asset ready, or the
@@ -41,9 +55,11 @@ use helio_pass_vg_cull::{
     VgCullConfig, VgCullDynamic, VgCullEarlyPass, VgCullInputs, KEY_CULL, KEY_INPUTS,
 };
 use helio_pass_vg_dense::VgDensePass;
-use helio_pass_vg_raster::{VgRasterConfig, VgRasterPasses, VgRasterShared, KEY_RASTER};
+use helio_pass_vg_raster::{
+    VgHizPass, VgHizSource, VgRasterConfig, VgRasterPasses, VgRasterShared, KEY_RASTER,
+};
 use helio_pass_vg_shade::VgShadePass;
-use helio_vg_format::VgMode;
+use helio_vg_format::{VgInstanceSource, VgMode, VgRun, VgRunGate};
 use helio_vg_stream::{VgRuntime, VgStreamBuffers};
 
 /// Ordering marker written by [`VgStreamBeginPass`].
@@ -115,10 +131,10 @@ impl RenderPass for VgStreamBeginPass {
 struct InputsSnapshot {
     instances: wgpu::Buffer,
     objects: wgpu::Buffer,
+    remaps: Option<wgpu::Buffer>,
     stream: StreamSnapshot,
-    nodes: wgpu::Buffer,
-    header: wgpu::Buffer,
-    items: wgpu::Buffer,
+    /// The run's instance BVH (nodes, header, items), if it has one.
+    tree: Option<[wgpu::Buffer; 3]>,
     dense_mask: Option<wgpu::Buffer>,
     materials: Option<wgpu::Buffer>,
     instance_count: u32,
@@ -132,19 +148,32 @@ pub struct VgInputsPass {
     raster: VgRasterShared,
     dense_enabled: bool,
     snapshot: Option<InputsSnapshot>,
+    run: &'static VgRun,
+    gate: Option<helio_vg_format::VgRunGate>,
 }
 
 impl RenderPass for VgInputsPass {
+    /// A gated run's pass is a member only while its gate is open.
+    fn is_member(&mut self, _scene: &mut helio_core::SceneContent<'_>) -> bool {
+        self.gate.as_ref().is_none_or(|gate| gate.is_open())
+    }
+
     fn name(&self) -> &'static str {
-        "VgInputs"
+        self.run.names.inputs
     }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
-        builder.read(KEY_STREAM);
-        builder.read(bvh_keys::NODES);
-        builder.read(bvh_keys::HEADER);
-        builder.read(bvh_keys::ITEMS);
-        builder.write_buffer(KEY_INPUTS);
+        // The frame's run services the stream first; a later run reads what
+        // it streamed.
+        if !self.run.remapped() {
+            builder.read(KEY_STREAM);
+        }
+        if let Some(tree) = self.run.tree {
+            builder.read(tree.nodes);
+            builder.read(tree.header);
+            builder.read(tree.items);
+        }
+        builder.write_buffer(self.run.inputs);
     }
 
     fn prepare(&mut self, ctx: &PrepareContext) -> HelioResult<()> {
@@ -161,23 +190,48 @@ impl RenderPass for VgInputsPass {
             }
             return Ok(());
         }
-        let (Some(instances), Some(objects)) = (
-            ctx.scene_buffers.get(BufferKey::of(bvh_keys::INSTANCES)),
-            ctx.scene_buffers
-                .get(BufferKey::of(bvh_keys::STATIC_OBJECTS)),
-        ) else {
-            if debug {
-                eprintln!("VgInputs: vg_instances / static_objects not published");
-            }
-            return Ok(());
-        };
         let reg = ctx.registry;
-        let (Some(nodes), Some(header), Some(items)) = (
-            reg.buffer(ResourceKey::new(bvh_keys::NODES)),
-            reg.buffer(ResourceKey::new(bvh_keys::HEADER)),
-            reg.buffer(ResourceKey::new(bvh_keys::ITEMS)),
-        ) else {
-            return Ok(());
+        let (instances, objects, remaps) = match self.run.instances {
+            VgInstanceSource::Scene => {
+                let (Some(instances), Some(objects)) = (
+                    ctx.scene_buffers.get(BufferKey::of(bvh_keys::INSTANCES)),
+                    ctx.scene_buffers
+                        .get(BufferKey::of(bvh_keys::STATIC_OBJECTS)),
+                ) else {
+                    if debug {
+                        eprintln!("VgInputs: vg_instances / static_objects not published");
+                    }
+                    return Ok(());
+                };
+                (&instances.buffer, &objects.buffer, None)
+            }
+            VgInstanceSource::Registry {
+                instances,
+                objects,
+                remaps,
+            } => {
+                let (Some(instances), Some(objects), Some(remaps)) = (
+                    reg.buffer(ResourceKey::new(instances)),
+                    reg.buffer(ResourceKey::new(objects)),
+                    reg.buffer(ResourceKey::new(remaps)),
+                ) else {
+                    return Ok(());
+                };
+                (instances, objects, Some(remaps))
+            }
+        };
+        let tree = match self.run.tree {
+            Some(keys) => {
+                let (Some(nodes), Some(header), Some(items)) = (
+                    reg.buffer(ResourceKey::new(keys.nodes)),
+                    reg.buffer(ResourceKey::new(keys.header)),
+                    reg.buffer(ResourceKey::new(keys.items)),
+                ) else {
+                    return Ok(());
+                };
+                Some([nodes.clone(), header.clone(), items.clone()])
+            }
+            None => None,
         };
         let Some(stream) = self.runtime.with_store(|store| {
             let b = store.stream_buffers();
@@ -202,20 +256,20 @@ impl RenderPass for VgInputsPass {
         };
         if debug {
             eprintln!(
-                "VgInputs: ACTIVE, instance rows {}",
-                instances.buffer.size() / 16
+                "{}: ACTIVE, instance rows {}",
+                self.run.names.inputs,
+                instances.size() / 16
             );
         }
         self.snapshot = Some(InputsSnapshot {
-            instance_count: (instances.buffer.size()
+            instance_count: (instances.size()
                 / std::mem::size_of::<helio_vg_format::GpuVgInstance>() as u64)
                 as u32,
-            instances: instances.buffer.clone(),
-            objects: objects.buffer.clone(),
+            instances: instances.clone(),
+            objects: objects.clone(),
+            remaps: remaps.cloned(),
             stream,
-            nodes: nodes.clone(),
-            header: header.clone(),
-            items: items.clone(),
+            tree,
             dense_mask,
             materials: ctx
                 .scene_buffers
@@ -240,16 +294,25 @@ impl RenderPass for VgInputsPass {
                 instances: &s.instances,
                 objects: &s.objects,
                 stream: lock_free_stream(&s.stream),
-                gcbvh_nodes: &s.nodes,
-                gcbvh_header: &s.header,
-                gcbvh_items: &s.items,
+                tree: s.tree.as_ref().map(|[nodes, header, items]| {
+                    helio_pass_vg_cull::VgCullTree {
+                        nodes,
+                        header,
+                        items,
+                    }
+                }),
                 dense_mask: s.dense_mask.as_ref(),
                 materials: s.materials.as_ref(),
                 instance_count: s.instance_count,
                 dense_tiles: s.dense_tiles,
+                remaps: s.remaps.as_ref(),
             })
         };
-        frame.write(ResourceKey::new(KEY_INPUTS), inputs, "VgInputs");
+        frame.write(
+            ResourceKey::new(self.run.inputs),
+            inputs,
+            self.run.names.inputs,
+        );
     }
 }
 
@@ -336,86 +399,161 @@ pub fn add_virtual_geometry_passes(
         return false;
     }
 
+    add_run(graph, device, runtime, view, &VgRun::DIRECT, None);
+    true
+}
+
+/// Adds the second virtual-geometry run ([`VgRun::SECONDARY`]): virtual
+/// geometry through the frame's portal chains, after the mask and the classic
+/// occurrences. Returns whether it was added (as [`add_virtual_geometry_passes`]).
+pub fn add_portal_virtual_geometry_passes(
+    graph: &mut RenderGraph,
+    device: &Arc<wgpu::Device>,
+    settings: &helio_vg_stream::VgSettings,
+    view: helio_core::ViewDescription,
+) -> bool {
+    // A view other than the frame's draws no portal chains.
+    if !view.is_primary() {
+        return false;
+    }
+    let Some(runtime) = settings.runtime.and_then(VgRuntime::from_handle_id) else {
+        return false;
+    };
+    if !virtual_geometry_supported(device) {
+        return false;
+    }
+    let gate = VgRunGate::default();
+    graph.add_pass(Box::new(VgPortalInstancesPass::new(device, gate.clone())));
+    add_run(graph, device, runtime, view, &VgRun::SECONDARY, Some(gate));
+    true
+}
+
+/// The passes of `run`: the frame's own run streams (on the frame's view);
+/// a run over published instances ([`VgRun::remapped`]) culls one exact phase
+/// against the depth it is drawn over, clips to its chains, has no Tier 3,
+/// and is scheduled only while `gate` is open.
+fn add_run(
+    graph: &mut RenderGraph,
+    device: &Arc<wgpu::Device>,
+    runtime: VgRuntime,
+    view: helio_core::ViewDescription,
+    run: &'static VgRun,
+    gate: Option<VgRunGate>,
+) {
+    let secondary = run.remapped();
     let raster = VgRasterPasses::new(
         device,
         VgRasterConfig {
             clip: view.clipped,
+            chain_clip: secondary,
             ..VgRasterConfig::default()
         },
+        run,
     );
     let raster_shared = raster.shared.clone();
     let tile_fallback = raster.shared.uses_tile_fallback();
-    runtime.update_tier3_stats(|s| s.tier2_tile_fallback = tile_fallback);
+    if !secondary {
+        runtime.update_tier3_stats(|s| s.tier2_tile_fallback = tile_fallback);
+    }
 
     let source_runtime = runtime.clone();
     let cull_config = VgCullConfig {
         sw_masked: !raster.shared.uses_tile_fallback(),
+        current_hiz: run.builds_hiz_early,
+        seeds_instances: run.tree.is_none(),
         ..VgCullConfig::default()
     };
-    let (cull_early, cull_late) = VgCullEarlyPass::pair(device, cull_config);
+    let (cull_early, cull_late) = VgCullEarlyPass::pair_for(device, cull_config, run);
     let cull_early =
         cull_early.with_settings_source(Arc::new(move || cull_settings(&source_runtime)));
 
     let mode_runtime = runtime.clone();
     // Tier 3 is opt-in (`VgRuntimeSettings::tier3`): with it off the dense pass
     // sees `Off` and records nothing, and the cull never routes clusters to it.
-    let dense = match VgDensePass::new(
-        device,
-        Box::new(move || {
-            let settings = mode_runtime.settings();
-            if settings.tier3 {
-                settings.mode
-            } else {
-                VgMode::Off
+    // A later run leaves dense tiles to Tier 1/2.
+    let dense = if secondary {
+        None
+    } else {
+        match VgDensePass::new(
+            device,
+            Box::new(move || {
+                let settings = mode_runtime.settings();
+                if settings.tier3 {
+                    settings.mode
+                } else {
+                    VgMode::Off
+                }
+            }),
+        ) {
+            // The runtime gives Tier 3 the stream store (proxy sources, page
+            // residency) so it can use the ray-traced backend where supported.
+            Ok(dense) => Some(dense.with_runtime(runtime.clone())),
+            Err(error) => {
+                log::warn!(
+                    "virtual geometry: Tier 3 unavailable ({error}); dense tiles stay on Tier 1/2"
+                );
+                None
             }
-        }),
-    ) {
-        // The runtime gives Tier 3 the stream store (proxy sources, page
-        // residency) so it can use the ray-traced backend where supported.
-        Ok(dense) => Some(dense.with_runtime(runtime.clone())),
-        Err(error) => {
-            log::warn!(
-                "virtual geometry: Tier 3 unavailable ({error}); dense tiles stay on Tier 1/2"
-            );
-            None
         }
     };
 
-    let streams = view.is_primary();
+    let streams = !secondary && view.is_primary();
     if streams {
         graph.add_pass(Box::new(VgStreamBeginPass {
             runtime: runtime.clone(),
         }));
     }
-    graph.add_pass(Box::new(VgBvhPass::new(device)));
-    graph.add_pass(Box::new(VgInputsPass {
+    let inputs = VgInputsPass {
         runtime: runtime.clone(),
         raster: raster_shared,
         dense_enabled: dense.is_some(),
         snapshot: None,
-    }));
-    graph.add_pass(Box::new(cull_early));
-    graph.add_pass(Box::new(raster.early));
-    graph.add_pass(Box::new(raster.hiz_late));
-    graph.add_pass(Box::new(cull_late));
-    graph.add_pass(Box::new(raster.late));
+        run,
+        gate: gate.clone(),
+    };
     let tau_runtime = runtime.clone();
-    if streams {
-        graph.add_pass(Box::new(VgStreamEndPass { runtime }));
+    let shade = VgShadePass::for_run(device, dense.is_some(), run)
+        .with_tau_source(Arc::new(move || tau_runtime.settings().tau_px));
+    match gate {
+        None => {
+            graph.add_pass(Box::new(VgBvhPass::new(device)));
+            graph.add_pass(Box::new(inputs));
+            graph.add_pass(Box::new(cull_early));
+            graph.add_pass(Box::new(raster.early));
+            graph.add_pass(Box::new(raster.hiz_late));
+            graph.add_pass(Box::new(cull_late));
+            graph.add_pass(Box::new(raster.late));
+            if streams {
+                graph.add_pass(Box::new(VgStreamEndPass { runtime }));
+            }
+            if let Some(dense) = dense {
+                graph.add_pass(Box::new(dense));
+            }
+            graph.add_pass(Box::new(shade));
+        }
+        Some(gate) => {
+            // Its instances are what the producer's spatial query found: no
+            // tree (the cull seeds each), one exact phase against this
+            // frame's depth, no phase-0 Hi-Z.
+            graph.add_pass(Box::new(inputs));
+            if run.builds_hiz_early {
+                graph.add_pass(Box::new(
+                    VgHizPass::new(device, run, VgHizSource::FrameDepth).with_gate(gate.clone()),
+                ));
+            }
+            graph.add_pass(Box::new(cull_early.with_gate(gate.clone())));
+            graph.add_pass(Box::new(raster.early.with_gate(gate.clone())));
+            graph.add_pass(Box::new(cull_late.with_gate(gate.clone())));
+            graph.add_pass(Box::new(raster.late.with_gate(gate.clone())));
+            graph.add_pass(Box::new(shade.with_gate(gate)));
+        }
     }
-    let has_dense = dense.is_some();
-    if let Some(dense) = dense {
-        graph.add_pass(Box::new(dense));
-    }
-    graph.add_pass(Box::new(
-        VgShadePass::new(device, has_dense)
-            .with_tau_source(Arc::new(move || tau_runtime.settings().tau_px)),
-    ));
-    true
 }
 
 mod feature;
+mod portal_instances;
 pub use feature::VgFeature;
+pub use portal_instances::VgPortalInstancesPass;
 
 /// `config` building the virtual-geometry passes for `runtime` (when the
 /// device supports them). `VG_DEBUG_VIEW` selects a virtual-geometry debug
