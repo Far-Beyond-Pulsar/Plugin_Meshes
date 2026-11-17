@@ -58,6 +58,8 @@ pub const MATERIAL_ROW_BYTES: u64 = 4;
 pub const MATERIAL_KEY_ROW_BYTES: u64 = 16;
 
 const OBJECT_ROW_BYTES: u64 = 252;
+/// A row of [`helio_mesh_api::STATIC_OBJECT_OWNERS`].
+const OWNER_OUT_ROW_BYTES: u64 = helio_core::BufferContract::<u32>::ROW_BYTES;
 const WORKGROUP: u32 = 64;
 
 /// The mesh join's shader as compiled (shader validation without a device).
@@ -200,6 +202,10 @@ pub struct SceneJoin {
     /// Bound in place of an optional input that is not registered yet.
     empty: wgpu::Buffer,
     objects: Output,
+    /// Each object row's owner entity plus one
+    /// ([`helio_mesh_api::STATIC_OBJECT_OWNERS`]), written by the full join
+    /// with the rows' structure.
+    owners: Output,
     /// Signatures of the mesh join's inputs at its last run, split into the
     /// structure and the placement (see `derive`).
     last_structure_inputs: Option<u64>,
@@ -475,6 +481,7 @@ impl SceneJoin {
                 mapped_at_creation: false,
             }),
             objects: Output::new(device, "Scene Join Objects", OBJECT_ROW_BYTES),
+            owners: Output::new(device, "Scene Join Object Owners", OWNER_OUT_ROW_BYTES),
             last_structure_inputs: None,
             last_placement_inputs: None,
             structure_generation: 0,
@@ -708,6 +715,7 @@ impl SceneDerivation for SceneJoin {
         let instance_rows = section_handles.map_or(0, |h| rows_of(h, HANDLE_ROW_BYTES));
         let output_rows = sections.map_or(0, |h| rows_of(h, MESH_SECTION_ROW_BYTES));
         let grew = self.objects.ensure(ctx.device, output_rows);
+        let grew = self.owners.ensure(ctx.device, output_rows) || grew;
         // What the join's rows are made of splits in two. The *structure*
         // (which objects exist, their meshes, materials, flags, visibility)
         // changes rarely and decides how the object batch sorts and groups
@@ -809,6 +817,7 @@ impl SceneDerivation for SceneJoin {
                 encoder.clear_buffer(&self.moved.link, 0, None);
                 encoder.clear_buffer(&self.moved.lists[self.moved.current], 0, Some(8));
                 encoder.clear_buffer(&self.objects.buffer, 0, None);
+                encoder.clear_buffer(&self.owners.buffer, 0, None);
                 if let (
                     Some(owners),
                     Some(generations),
@@ -858,6 +867,7 @@ impl SceneDerivation for SceneJoin {
                         spaces.map_or(&self.empty, |h| &h.buffer),
                         material_row_handles.map_or(&self.empty, |h| &h.buffer),
                         material_rows.map_or(&self.empty, |h| &h.buffer),
+                        &self.owners.buffer,
                     ];
                     let reusable = self.mesh_bind.as_ref().is_some_and(|(buffers, _)| {
                         buffers.iter().zip(bound).all(|(cached, now)| cached == now)
@@ -887,6 +897,7 @@ impl SceneDerivation for SceneJoin {
                                 entry(16, bound[15]),
                                 entry(17, bound[16]),
                                 entry(18, bound[17]),
+                                entry(19, bound[18]),
                             ],
                         });
                         self.mesh_bind =
@@ -918,12 +929,18 @@ impl SceneDerivation for SceneJoin {
             }
             if structure_changed {
                 self.structure_generation += 1;
+                // Owners follow the structure only (a full join rewrote them).
+                self.owners.content_generation = self.structure_generation;
             }
             recorded = true;
         }
 
         let mut buffers = vec![
             (OBJECTS_KEY, self.objects.handle()),
+            (
+                helio_mesh_api::STATIC_OBJECT_OWNERS.key(),
+                self.owners.handle(),
+            ),
             (
                 OBJECTS_MOVED_KEY,
                 BufferHandle {

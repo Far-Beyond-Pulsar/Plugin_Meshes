@@ -162,6 +162,15 @@ pub const OBJECTS_MOVED: helio_core::BufferContract<()> =
 pub const CLASSIC_SUPPRESSED: helio_core::BufferContract<u32> =
     helio_core::BufferContract::new("classic_suppressed");
 
+/// One `u32` per [`STATIC_OBJECTS`] row: the entity index of the object the
+/// row's mesh instance is attached to, plus one (zero for a row no object
+/// placed). Written by the scene join with the rows' structure, so it changes
+/// when meshes are added, removed or reattached, never when objects move or
+/// the selection changes. Per-object data a mesh pass needs is joined through
+/// it (the editor's selection, `helio_frame_api::selection::OBJECT_SELECTED`).
+pub const STATIC_OBJECT_OWNERS: helio_core::BufferContract<u32> =
+    helio_core::BufferContract::new("static_object_owners");
+
 /// The buffer the renderer reads [`StaticObjectRow`]s from. Engines produce it
 /// (a SceneDB component stored under this key, or a scene derivation).
 pub const STATIC_OBJECTS: helio_core::BufferContract<StaticObjectRow> =

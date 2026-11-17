@@ -37,7 +37,8 @@
 //! buffer (slot 0) and index buffer before this pass executes.
 
 pub mod feature;
-pub use feature::GBufferDrawers;
+pub use feature::{GBufferDrawers, SelectionDrawers};
+pub mod selection;
 
 use bytemuck::{Pod, Zeroable};
 

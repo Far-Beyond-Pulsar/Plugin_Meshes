@@ -15,6 +15,10 @@ mod tests {
             ),
             ("shadow", include_str!("../../shadow/shaders/shadow.wgsl")),
             (
+                "selection mask",
+                include_str!("../shaders/selection_mask.wgsl"),
+            ),
+            (
                 "shadow transmittance",
                 include_str!("../../shadow/shaders/shadow_transmittance.wgsl"),
             ),

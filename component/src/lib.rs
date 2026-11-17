@@ -50,6 +50,7 @@ pub fn render_features() -> helio_feature_api::FeatureSet {
         .with(helio_pass_object_batch::ObjectBatchFeature)
         .with(helio_pass_occlusion_cull::MeshCulling)
         .with(helio_pass_gbuffer::GBufferDrawers)
+        .with(helio_pass_gbuffer::SelectionDrawers)
         .with(helio_pass_shadow::ShadowDrawers)
         .with(helio_pass_forward_lit::ForwardDrawers)
         .with(helio_pass_transparent::TransparentDrawers)

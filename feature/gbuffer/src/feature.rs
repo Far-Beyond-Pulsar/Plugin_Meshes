@@ -67,3 +67,75 @@ impl Feature for GBufferDrawers {
         );
     }
 }
+
+/// The selected meshes in the editor's selection mask
+/// ([`crate::selection`]): which culled draws are selected, then their
+/// depth.
+pub struct SelectionDrawers;
+
+/// The two selection passes' shared draws, one per graph.
+fn selection_draws(
+    env: &mut helio_feature_api::BuildEnv<'_>,
+) -> std::sync::Arc<std::sync::Mutex<crate::selection::SelectionDraws>> {
+    env.shared(|| {
+        crate::selection::SharedSelectionDraws(std::sync::Arc::default())
+    })
+    .0
+    .clone()
+}
+
+impl Feature for SelectionDrawers {
+    fn id(&self) -> &'static str {
+        "helio.mesh.selection"
+    }
+
+    fn register(&self, registrar: &mut FeatureRegistrar<'_>) {
+        registrar.consumes(helio_mesh_api::STATIC_OBJECT_OWNERS);
+        registrar.consumes(helio_frame_api::selection::OBJECT_SELECTED);
+        registrar.consumes(helio_mesh_api::MESH_INDICES);
+        registrar.consumes(helio_mesh_api::MESH_VERTICES);
+        registrar.consumes(helio_mesh_api::BONE_PALETTE);
+        registrar.consumes(helio_mesh_api::SKIN_VERTICES);
+        {
+            use helio_core::graph::type_name_of as name;
+            registrar.swap_group(&[
+                name::<crate::selection::SelectionSelectPass>(),
+                name::<crate::selection::SelectionMaskPass>(),
+            ]);
+        }
+        registrar.node(
+            pass_node(
+                "mesh_selection_select",
+                "Selection: Selected Meshes",
+                "Passes: Output",
+                "Picks this frame's visible draws of selected objects for the selection mask. Editor only.",
+                |build| {
+                    let shared = selection_draws(build.env);
+                    build.graph.add_pass(Box::new(crate::selection::SelectionSelectPass::new(
+                        build.env.device,
+                        shared,
+                    )));
+                    Ok(())
+                },
+            )
+            .before_phase(Phase::SelectionMask, 0),
+        );
+        registrar.node(
+            pass_node(
+                "mesh_selection_mask",
+                "Selection: Mesh Mask",
+                "Passes: Output",
+                "Draws the selected meshes' depth into the selection mask, for the outline. Editor only.",
+                |build| {
+                    let shared = selection_draws(build.env);
+                    build.graph.add_pass(Box::new(crate::selection::SelectionMaskPass::new(
+                        build.env.device,
+                        shared,
+                    )));
+                    Ok(())
+                },
+            )
+            .drawer(Phase::SelectionMask, 0),
+        );
+    }
+}

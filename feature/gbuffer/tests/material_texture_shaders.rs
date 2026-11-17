@@ -90,9 +90,16 @@ fn every_material_class_composes_into_every_mesh_program() {
 fn depth_cutouts_validate_for_native_and_expanded_texture_bindings() {
     let material = include_str!("../shaders/depth_material.wgsl");
     for geometry in [include_str!("../../shadow/shaders/shadow.wgsl")] {
-        // The casters read the lights' shadow views (`//!use shadow_atlas`).
-        let geometry =
-            helio_core::shader::resolve_with(geometry, &[helio_light_api::SHADOW_ATLAS_SNIPPET]);
+        // The casters read the lights' shadow views (`//!use shadow_atlas`)
+        // and skin with the meshes' snippet (`//!use mesh_skinning`), as
+        // `helio_pass_shadow::caster_geometry` resolves them.
+        let geometry = helio_core::shader::resolve_with(
+            geometry,
+            &[
+                helio_light_api::SHADOW_ATLAS_SNIPPET,
+                helio_mesh_api::SKINNING_SNIPPET,
+            ],
+        );
         let native = helio_core::shader::resolve_with(
             &format!("{material}\n{geometry}"),
             &helio_mats::MATERIAL_SNIPPETS,

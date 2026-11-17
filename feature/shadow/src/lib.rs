@@ -73,7 +73,10 @@ fn face_count_offset(region: usize, face: usize) -> u64 {
 pub fn caster_geometry() -> String {
     helio_core::shader::resolve_with(
         include_str!("../shaders/shadow.wgsl"),
-        &[helio_light_api::SHADOW_ATLAS_SNIPPET],
+        &[
+            helio_light_api::SHADOW_ATLAS_SNIPPET,
+            helio_mesh_api::SKINNING_SNIPPET,
+        ],
     )
     .into_owned()
 }

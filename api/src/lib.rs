@@ -39,7 +39,8 @@ pub use portal_occurrence_frame_data::{PortalOccurrenceFrameData, PORTAL_OCCURRE
 pub use rows::{
     RenderGroupRow, SkinVertex, StaticObjectRow, BONE_PALETTE, CLASSIC_SUPPRESSED, MESH_INDICES,
     MESH_VERTICES, OBJECTS_MOVED, OBJECTS_STRUCTURE, RENDER_GROUPS, SKELETAL_BONE_PALETTE,
-    SKELETAL_SKIN_VERTICES, SKIN_VERTICES, STATIC_OBJECTS, VG_INSTANCES, VG_INSTANCE_ROWS,
+    SKELETAL_SKIN_VERTICES, SKIN_VERTICES, STATIC_OBJECTS, STATIC_OBJECT_OWNERS, VG_INSTANCES,
+    VG_INSTANCE_ROWS,
 };
 
 /// The meshes' surfaces as rays see them, for a tracer's WGSL
@@ -66,6 +67,14 @@ pub const DRAW_ROWS_SNIPPET: helio_core::shader::ShaderSnippet =
 /// the GPU.
 pub const OBJECT_ROW_SNIPPET: helio_core::shader::ShaderSnippet =
     helio_core::wgsl_snippet!("//!use mesh_object_row", "shaders/object_row.wgsl");
+
+/// The meshes' skinning in WGSL (`//!use mesh_skinning`): `SkinVertex` and
+/// `mesh_skinned_position`, a skinned instance's vertex position blended from
+/// the palette. The includer binds `skin_vertices` ([`SKIN_VERTICES`]) and
+/// `bone_palette` ([`BONE_PALETTE`]) and declares `GpuInstanceData`
+/// ([`DRAW_ROWS_SNIPPET`]).
+pub const SKINNING_SNIPPET: helio_core::shader::ShaderSnippet =
+    helio_core::wgsl_snippet!("//!use mesh_skinning", "shaders/skinning.wgsl");
 
 /// Graph key of the rows that follow the frame's TLAS instance order, a
 /// [`RayInstance`] an instance.
