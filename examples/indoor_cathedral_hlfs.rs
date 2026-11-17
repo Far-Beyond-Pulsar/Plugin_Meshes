@@ -26,16 +26,13 @@
 //! has no sky and no GI probes; the background colour and the ambient
 //! light stand in.
 
-mod architectural_mesh;
+use meshes_examples::architectural_mesh;
 mod cathedral_detail;
 mod cathedral_large;
-mod hlfs_capture;
-mod v3_demo_common;
+use meshes_examples::hlfs_capture;
+use meshes_examples::v3_demo_common;
 
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera,
-    HelioAction, HelioCommandBridge, Renderer, RendererBuilder, RendererConfig,
-};
+use helio::{Camera, HelioAction, HelioCommandBridge, Renderer, RendererBuilder, RendererConfig};
 use helio_pass_perf_overlay::PerfOverlayMode;
 use pulsar_scenedb::{Entity, SceneDb, World};
 use v3_demo_common::{
@@ -221,7 +218,6 @@ impl ApplicationHandler for App {
         let device = graphics.device.clone();
         let queue = graphics.queue.clone();
         let format = graphics.surface_config.format;
-        let surface_format = format;
 
         let config = RendererConfig::new(size.width, size.height, format)
             .with_tsr_quality(helio_pass_tsr::TsrQuality::Native)
@@ -725,7 +721,7 @@ fn haze_light(mut light: helio_light_api::GpuLight) -> helio_light_api::GpuLight
 }
 
 fn large_cathedral_camera(t: f32, aspect: f32) -> Camera {
-    let mut camera = Camera::perspective_look_at(
+    let camera = Camera::perspective_look_at(
         glam::Vec3::new(4.0 * t, 2.3, 67.0 - 29.0 * t),
         glam::Vec3::new(0.0, 10.0, -68.0),
         glam::Vec3::Y,

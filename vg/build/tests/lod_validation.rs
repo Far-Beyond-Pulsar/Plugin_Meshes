@@ -787,33 +787,6 @@ fn rebuilt_tree(dir: &std::path::Path, _scratch: &std::path::Path, name: &str) -
     std::fs::read(dir.join(format!("{name}.vgeo"))).unwrap()
 }
 
-/// Frustum-visible instances of a forest of the demo's tree assets, seen from the
-/// ground: (asset index, eye in the asset's space, distance to its sphere's
-/// nearest point). The demo scatters about 2,000 trees of about one tree radius
-/// (6 m) over 250 m: a 42 x 42 tree-radius field that the camera walks into.
-fn forest_view(
-    radius: f32,
-    assets: usize,
-    w: u32,
-    h: u32,
-    cam: [f32; 3],
-    n: usize,
-) -> Vec<(usize, [f32; 3])> {
-    let mut rng = Rng(5);
-    let tan_h = (60f32.to_radians() * 0.5).tan() * w as f32 / h as f32;
-    let mut out = Vec::new();
-    for i in 0..n {
-        let x = (rng.f() - 0.5) * 42.0 * radius;
-        let z = (rng.f() - 0.5) * 42.0 * radius;
-        let rel = [x - cam[0], -cam[1], z - cam[2]];
-        if rel[2] < 1.0 || (rel[0] / rel[2]).abs() > tan_h * 1.05 {
-            continue;
-        }
-        out.push((i % assets, [cam[0] - x, cam[1], cam[2] - z]));
-    }
-    out
-}
-
 #[test]
 #[ignore = "diagnostic: what makes a forest frame expensive"]
 fn forest_spike_anatomy() {

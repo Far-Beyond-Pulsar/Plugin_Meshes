@@ -98,10 +98,6 @@ pub struct GBufferPass {
     /// shared, never deep-cloned (see `SharedTemplateRegistry`). `None`: the
     /// built-in templates.
     template_registry: Option<helio_mats::radiant::SharedTemplateRegistry>,
-    /// Key set as of the last sync, to detect content changes cheaply
-    /// (registry identity is stable, so `Arc::ptr_eq` can't detect a
-    /// template being re-registered under an existing id).
-    last_template_keys: Vec<u32>,
     pipeline_layout: wgpu::PipelineLayout,
     bind_group_layout_0: wgpu::BindGroupLayout,
     bind_group_layout_1: wgpu::BindGroupLayout,
@@ -405,7 +401,6 @@ impl GBufferPass {
             occurrences: None,
             shader_cache: RadiantShaderCache::new(),
             template_registry: None,
-            last_template_keys: Vec::new(),
             pipeline_layout,
             bind_group_layout_0,
             bind_group_layout_1,

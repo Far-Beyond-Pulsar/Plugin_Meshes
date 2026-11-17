@@ -473,7 +473,7 @@ fn nonrt_clamp_and_overflow_counters() {
 
 mod rt {
     use super::*;
-    use glam::{Mat4, Vec3};
+    use glam::Vec3;
     use helio_core::acceleration::{BlasManager, TlasManager};
     use helio_vg_format::{bary_unpack, vis_cluster, vis_tri};
 
@@ -519,7 +519,8 @@ mod rt {
 
         let viewport = [64u32, 48];
         let (near, fov) = (0.1f32, 1.0f32);
-        let proj = Mat4::perspective_infinite_reverse_rh(fov, 64.0 / 48.0, near);
+        let proj =
+            glam::camera::rh::proj::directx::perspective_infinite_reverse(fov, 64.0 / 48.0, near);
         let frame = DenseFrame {
             view_proj: proj.to_cols_array_2d(),
             inv_view_proj: proj.inverse().to_cols_array_2d(),
@@ -700,7 +701,8 @@ mod rt {
 
         let viewport = [64u32, 48];
         let (near, fov) = (0.1f32, 1.0f32);
-        let proj = Mat4::perspective_infinite_reverse_rh(fov, 64.0 / 48.0, near);
+        let proj =
+            glam::camera::rh::proj::directx::perspective_infinite_reverse(fov, 64.0 / 48.0, near);
         let frame = DenseFrame {
             view_proj: proj.to_cols_array_2d(),
             inv_view_proj: proj.inverse().to_cols_array_2d(),
@@ -783,7 +785,8 @@ mod rt {
             },
         )
         .unwrap();
-        let proj = Mat4::perspective_infinite_reverse_rh(1.0, 64.0 / 48.0, 0.1);
+        let proj =
+            glam::camera::rh::proj::directx::perspective_infinite_reverse(1.0, 64.0 / 48.0, 0.1);
         let frame = DenseFrame {
             view_proj: proj.to_cols_array_2d(),
             inv_view_proj: proj.inverse().to_cols_array_2d(),

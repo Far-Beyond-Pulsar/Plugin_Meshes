@@ -1,9 +1,9 @@
 //! Monumental stone arch: interactive orbit viewer or deterministic captures.
-mod architectural_mesh;
-mod hlfs_capture;
+use meshes_examples::architectural_mesh;
+use meshes_examples::hlfs_capture;
 mod hlfs_viewer;
 mod monumental_arch;
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 pub(crate) fn main() {
     env_logger::init();
     let mut args = std::env::args().skip(1);

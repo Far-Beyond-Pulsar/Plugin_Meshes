@@ -935,7 +935,7 @@ impl SceneDerivation for SceneJoin {
             recorded = true;
         }
 
-        let mut buffers = vec![
+        let buffers = vec![
             (OBJECTS_KEY, self.objects.handle()),
             (
                 helio_mesh_api::STATIC_OBJECT_OWNERS.key(),

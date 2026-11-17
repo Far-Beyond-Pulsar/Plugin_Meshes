@@ -9,17 +9,14 @@
 //!   +/-                  — adjust shape count and restart round (auto-reset 2s after end)
 //!   Escape               — release cursor / exit
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 use v3_demo_common::{
     box_mesh, cube_mesh, despawn_object, make_material, new_scene_db_with_gpu_mirror, plane_mesh,
     point_light, scene_db_handle, spawn_light, spawn_material, spawn_mesh, spawn_object,
     spawn_object_with_movability, update_object_transform,
 };
 
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera, Renderer,
-    RendererBuilder, RendererConfig,
-};
+use helio::{Camera, Renderer, RendererBuilder, RendererConfig};
 use pulsar_scenedb::{Entity, SceneDb};
 use rapier3d::prelude::*;
 use std::collections::HashSet;
@@ -62,7 +59,6 @@ struct AppState {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
     surface_format: wgpu::TextureFormat,
     renderer: Renderer,
     scene_db: SceneDb,
@@ -141,7 +137,6 @@ impl ApplicationHandler for App {
         let device = graphics.device.clone();
         let queue = graphics.queue.clone();
         let format = graphics.surface_config.format;
-        let surface_format = format;
         let fmt = format;
 
         let config = RendererConfig::new(size.width, size.height, fmt);
@@ -227,7 +222,6 @@ impl ApplicationHandler for App {
             window,
             surface,
             device,
-            queue,
             surface_format: fmt,
             renderer,
             scene_db,
@@ -589,7 +583,7 @@ impl AppState {
             let offset = dir * 0.2;
             let pos = position + offset;
             let mesh = spawn_mesh(&mut self.scene_db.world, cube_mesh([0.0, 0.0, 0.0], 0.12));
-            let mat = self.mats[(i % self.mats.len())];
+            let mat = self.mats[i % self.mats.len()];
             let obj = spawn_object_with_movability(
                 &mut self.scene_db.world,
                 mesh,

@@ -2,7 +2,7 @@
 //! and device-specific texture binding representation; the cut-out test is
 //! the materials' (`material_cut_out`, `helio_mats::MATERIAL_SURFACE_SNIPPET`),
 //! and without the materials plugin the stand-in is bound (nothing cut out).
-use helio_core::{BufferKey, PassContext};
+use helio_core::PassContext;
 
 pub struct DepthMaterialBindings {
     pub layout: wgpu::BindGroupLayout,

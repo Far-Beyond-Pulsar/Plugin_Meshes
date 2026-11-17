@@ -23,21 +23,21 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use helio_core::{BufferKey, SceneDerivation, SceneDerivationContext, SceneDerivationOutput};
 use helio_mesh_api::PackedVertex;
-use helio_vg_format::{VgAssetReadyRow, FORMAT_VERSION};
-use helio_vg_stream::{content_words, VgRuntime, VgRuntimeSettings, VgeoBytes, VgeoSource};
+use helio_vg_format::{FORMAT_VERSION, VgAssetReadyRow};
+use helio_vg_stream::{VgRuntime, VgRuntimeSettings, VgeoBytes, VgeoSource, content_words};
 use pulsar_scenedb::gpu::GpuMirrorHandle;
 use pulsar_scenedb::handle_ledger::HandleId;
 use pulsar_scenedb::{Entity, World};
 
 use crate::components::{MeshAssetPath, StaticMeshComponent, VirtualGeometryComponent};
 use crate::virtual_geometry_instances::{
-    Output, VgInstanceControl, VgInstanceKeys, VirtualGeometryInstances, VG_ASSET_READY_KEY,
-    VG_ASSET_READY_ROW_BYTES,
+    Output, VG_ASSET_READY_KEY, VG_ASSET_READY_ROW_BYTES, VgInstanceControl, VgInstanceKeys,
+    VirtualGeometryInstances,
 };
 
 /// How often (in `sync` calls) the world is rescanned when no build is in

@@ -6,12 +6,9 @@
 //!   Mouse drag  — look around (click to grab cursor)
 //!   Escape      — release cursor / exit
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera, Renderer,
-    RendererBuilder, RendererConfig,
-};
+use helio::{Camera, Renderer, RendererBuilder, RendererConfig};
 use helio_light_host::LightComponent;
 use pulsar_scenedb::SceneDb;
 use v3_demo_common::{
@@ -67,7 +64,6 @@ struct AppState {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
     surface_format: wgpu::TextureFormat,
     renderer: Renderer,
     last_frame: std::time::Instant,
@@ -127,7 +123,7 @@ impl ApplicationHandler for App {
 
         let config = RendererConfig::new(size.width, size.height, surface_format);
         let mut scene_db = new_scene_db_with_gpu_mirror(&device, &queue);
-        let mut renderer = RendererBuilder::new(config, scene_db_handle(&scene_db))
+        let renderer = RendererBuilder::new(config, scene_db_handle(&scene_db))
             .with_editor_mode(true)
             .with_pass_build_context(Box::new(helio_mesh_host::presets::deferred))
             .build_with_graphics_context(&mut graphics)
@@ -190,7 +186,6 @@ impl ApplicationHandler for App {
             window,
             surface,
             device,
-            queue,
             surface_format,
             renderer,
             last_frame: std::time::Instant::now(),

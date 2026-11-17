@@ -10,12 +10,9 @@
 //! does not animate transforms or deform vertices every frame. All frames are
 //! logged; frame_context.is_sample selects baseline/checkpoint measurements.
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera,
-    Movability, Renderer, RendererConfig,
-};
+use helio::{Camera, Movability, Renderer, RendererConfig};
 use pulsar_scenedb::{Entity, SceneDb};
 use rusqlite::{params, Connection};
 use std::{

@@ -5,9 +5,7 @@
 //! not from the empty depth of the frames before the first draws arrive, and
 //! not from depth drawn before the last scene change.
 
-#[path = "../v3_demo_common.rs"]
-#[allow(dead_code)]
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 use glam::{Mat4, Vec3};
 use helio::{Camera, RendererBuilder, RendererConfig};

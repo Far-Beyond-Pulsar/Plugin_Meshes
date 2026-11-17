@@ -1527,9 +1527,12 @@ mod tests {
 
     // ── CPU reference of the barycentric reconstruction ──────────────────
 
-    #[allow(deprecated)]
     fn camera(width: f32, height: f32) -> (Mat4, Mat4) {
-        let view = Mat4::look_at_rh(Vec3::new(0.3, 0.2, 2.0), Vec3::new(0.1, 0.0, -3.0), Vec3::Y);
+        let view = glam::camera::rh::view::look_at_mat4(
+            Vec3::new(0.3, 0.2, 2.0),
+            Vec3::new(0.1, 0.0, -3.0),
+            Vec3::Y,
+        );
         (
             view,
             helio_core::depth::perspective(60f32.to_radians(), width / height, 0.1),

@@ -11,7 +11,7 @@
 //   Mouse       — look (click to grab)
 //   Escape      — release cursor / quit
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -47,7 +47,6 @@ struct AppState {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
     adapter: wgpu::Adapter,
     surface_format: wgpu::TextureFormat,
     renderer: Renderer,
@@ -277,7 +276,6 @@ impl ApplicationHandler for App {
             window,
             surface,
             device,
-            queue,
             adapter,
             surface_format,
             renderer,

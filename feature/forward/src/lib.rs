@@ -8,8 +8,6 @@ use helio_core::graph::{ResourceBuilder, ResourceSize};
 use helio_core::{PassContext, PrepareContext, RenderPass, Result as HelioResult};
 use helio_mats::radiant::{RadiantShaderCache, RadiantShaderKey};
 
-use helio_light_api::{GpuLight, MAX_LIGHTS, SCENE_LIGHTS};
-
 /// The meshes' forward program (`shaders/forward_lit.wgsl`): the vertex
 /// layout and instance rows, lit by the lights' forward function; a
 /// template's surface function is composed after it.
@@ -52,8 +50,6 @@ pub struct ForwardLitPass {
     /// User-registered custom templates (from `FIRST_CUSTOM_MATERIAL_CLASS` up), shared with the renderer
     /// and other passes — never deep-cloned (see `SharedTemplateRegistry`).
     shared_registry: Option<helio_mats::radiant::SharedTemplateRegistry>,
-    /// Key set as of the last sync, to detect content changes cheaply.
-    last_shared_keys: Vec<u32>,
     pipeline_layout: wgpu::PipelineLayout,
     bind_group_layout_0: wgpu::BindGroupLayout,
     bind_group_layout_1: wgpu::BindGroupLayout,
@@ -203,7 +199,6 @@ impl ForwardLitPass {
             local_templates: helio_mats::RadiantTemplateRegistry::new(),
             stand_in: None,
             shared_registry: None,
-            last_shared_keys: Vec::new(),
             pipeline_layout,
             bind_group_layout_0,
             bind_group_layout_1,

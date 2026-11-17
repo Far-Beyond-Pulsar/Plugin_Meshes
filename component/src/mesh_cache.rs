@@ -43,7 +43,7 @@ use std::sync::{Mutex, OnceLock};
 pub use asset_import::options::{FieldConstraints, ImportField, OptionsSchema};
 use bytemuck::Zeroable;
 use helio_mesh_api::{MeshUpload, PackedVertex};
-use pulsar_reflection::{RuntimeTypeInfo, TypeStructure, RUNTIME_TYPE_REGISTRY};
+use pulsar_reflection::{RUNTIME_TYPE_REGISTRY, RuntimeTypeInfo, TypeStructure};
 
 const MAGIC: &[u8; 4] = b"PMSH";
 /// Current WRITE version — every fresh `encode` call produces this.

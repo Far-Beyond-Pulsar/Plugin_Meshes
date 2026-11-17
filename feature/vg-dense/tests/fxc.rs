@@ -22,7 +22,13 @@ fn dense_shaders_compile_under_fxc() {
         }
         failures.extend(fxc::fxc_failures(&fxc_exe, name, &src));
     }
-    assert!(failures.is_empty(), "FXC rejected:
-{}", failures.join("
-"));
+    assert!(
+        failures.is_empty(),
+        "FXC rejected:
+{}",
+        failures.join(
+            "
+"
+        )
+    );
 }

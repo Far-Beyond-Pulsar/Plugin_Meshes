@@ -14,12 +14,9 @@
 //! has no sky and no GI probes; the background colour and the ambient
 //! light stand in.
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera,
-    Movability, RendererBuilder, RendererConfig,
-};
+use helio::{Camera, Movability, RendererBuilder, RendererConfig};
 use pulsar_scenedb::{Entity, SceneDb};
 use v3_demo_common::{
     box_mesh, cube_mesh, make_material, new_scene_db_with_gpu_mirror, plane_mesh, point_light,
@@ -118,7 +115,7 @@ impl ApplicationHandler for App {
         let config = RendererConfig::new(w, h, surface_format);
         let mut scene_db = new_scene_db_with_gpu_mirror(&device, &queue);
         let graph_scene_db = scene_db_handle(&scene_db);
-        let mut renderer = RendererBuilder::new(config, graph_scene_db.clone())
+        let renderer = RendererBuilder::new(config, graph_scene_db.clone())
             .with_editor_mode(true)
             .with_pass_build_context(Box::new(helio_mesh_host::presets::deferred))
             .build_with_graphics_context(&mut graphics)

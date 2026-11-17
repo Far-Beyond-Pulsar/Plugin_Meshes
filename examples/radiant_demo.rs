@@ -12,10 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{EulerRot, Mat4, Quat, Vec3};
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera, Renderer,
-    RendererBuilder, RendererConfig,
-};
+use helio::{Camera, Renderer, RendererBuilder, RendererConfig};
 use helio_mats::host_rows::MaterialComponent;
 use helio_mats::{
     GpuMaterial, MATERIAL_CLASS_ANISOTROPIC, MATERIAL_CLASS_CLEAR_COAT, MATERIAL_CLASS_SKIN,
@@ -36,7 +33,7 @@ use winit::{
     window::{CursorGrabMode, Window, WindowId},
 };
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 const LOOK_SENS: f32 = 0.002;
 const FLY_SPEED: f32 = 10.0;
@@ -66,7 +63,6 @@ struct AppState {
     animated_iri_id: Entity,
     crystal_mat_id: Entity,
     aniso_mat_id: Entity,
-    sun_light_id: Entity,
     key_light_id: Entity,
     /// `HELIO_CAPTURE`: save a frame and exit (`v3_demo_common::SurfaceCapture`).
     capture: v3_demo_common::SurfaceCapture,
@@ -271,7 +267,7 @@ impl ApplicationHandler for App {
         // Tier 3: Iridescent static
         let mut iri = make_mat([0.6, 0.6, 0.8, 1.0], 0.12, 0.8, [0.0; 3], 0.0);
         iri.material_class = iridescent_class;
-        let iri_mat = spawn_material(&mut scene_db.world, iri);
+        spawn_material(&mut scene_db.world, iri);
 
         // Tier 3: Iridescent animated
         let mut anim_iri = make_mat([0.5, 0.5, 0.6, 1.0], 0.15, 0.7, [0.0; 3], 0.0);
@@ -467,8 +463,8 @@ impl ApplicationHandler for App {
             directional_light([-0.3, -0.5, -0.4], [0.3, 0.35, 0.4], 0.5),
         );
 
-        // Sun (orbits)
-        let sun_id = spawn_light(
+        // Sun
+        spawn_light(
             &mut scene_db.world,
             directional_light([0.4, -0.8, 0.3], [1.0, 0.9, 0.75], 2.0),
         );
@@ -520,7 +516,6 @@ impl ApplicationHandler for App {
             animated_iri_id: anim_iri_mat,
             crystal_mat_id: crystal_mat,
             aniso_mat_id: aniso2_mat,
-            sun_light_id: sun_id,
             key_light_id: key_id,
             capture,
         });

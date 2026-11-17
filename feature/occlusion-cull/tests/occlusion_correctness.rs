@@ -275,7 +275,7 @@ fn front_object_survives_behind_object_culled_always_visible_overrides() {
         let device = Arc::new(device);
         let queue = Arc::new(queue);
 
-        let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y);
+        let view = glam::camera::rh::view::look_at_mat4(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y);
         let proj =
             helio_core::depth::perspective(60f32.to_radians(), WIDTH as f32 / HEIGHT as f32, 0.1);
         let view_proj = proj * view;
@@ -416,8 +416,7 @@ fn front_object_survives_behind_object_culled_always_visible_overrides() {
         let hiz_pass = HiZBuildPass::new(&device, &queue, WIDTH, HEIGHT);
         let hiz_sampler = Arc::clone(&hiz_pass.hiz_sampler);
         let stats = helio_core::FrameStats::new(&device);
-        let occlusion_pass =
-            OcclusionCullPass::new(&device, hiz_sampler, WIDTH, HEIGHT, &stats);
+        let occlusion_pass = OcclusionCullPass::new(&device, hiz_sampler, WIDTH, HEIGHT, &stats);
 
         let mut graph = RenderGraph::new(&device, &queue);
         graph.add_pass(Box::new(injector));

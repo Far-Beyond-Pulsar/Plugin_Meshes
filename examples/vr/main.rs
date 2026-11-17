@@ -31,8 +31,7 @@
 
 mod input;
 mod scene;
-#[path = "../v3_demo_common.rs"]
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -96,7 +95,6 @@ impl App {
 struct AppState {
     window: Arc<Window>,
     graphics: HelioGraphicsContext<'static>,
-    device: Arc<wgpu::Device>,
     renderer: Renderer,
     scene_db: SceneDb,
     input: FreeCam,
@@ -247,7 +245,6 @@ impl ApplicationHandler for App {
         let state = AppState {
             window,
             graphics,
-            device,
             renderer,
             scene_db,
             input: FreeCam::new(),

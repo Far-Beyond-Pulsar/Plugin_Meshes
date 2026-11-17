@@ -11,12 +11,9 @@
 //! has no sky and no GI probes; the background colour and the ambient
 //! light stand in.
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera,
-    RenderMode, Renderer, RendererConfig,
-};
+use helio::{Camera, RenderMode, Renderer, RendererConfig};
 use pulsar_scenedb::{Entity, SceneDb};
 use v3_demo_common::{
     build_default_renderer_with_context, cube_mesh, make_material, new_scene_db_with_gpu_mirror,

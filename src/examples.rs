@@ -35,7 +35,7 @@ pub(crate) fn provider(origin: &'static str) -> engine_fs::FileProvider {
 mod tests {
     use std::path::Path;
 
-    use asset_import::{importer_for, OptionValues, Previous};
+    use asset_import::{OptionValues, Previous, importer_for};
 
     use super::*;
 

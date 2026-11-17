@@ -1,3 +1,5 @@
+// Shared with the other tests: this one uses only `request_test_device`.
+#[allow(dead_code)]
 mod support;
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {

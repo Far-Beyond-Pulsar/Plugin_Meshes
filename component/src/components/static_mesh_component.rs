@@ -653,7 +653,7 @@ impl gpui::Render for MeshAssetEditor {
     ) -> impl gpui::IntoElement {
         use gpui::prelude::*;
         use ui::button::{Button, ButtonVariants as _};
-        use ui::{h_flex, popover::Popover, ActiveTheme, Sizable};
+        use ui::{ActiveTheme, Sizable, h_flex, popover::Popover};
 
         let display = if self.path.is_empty() {
             "No mesh selected".to_string()
@@ -978,7 +978,7 @@ impl gpui::Render for StaticMeshMaterialSlotsEditor {
     ) -> impl gpui::IntoElement {
         use gpui::prelude::*;
         use ui::button::{Button, ButtonVariants as _};
-        use ui::{h_flex, popover::Popover, v_flex, ActiveTheme, Sizable};
+        use ui::{ActiveTheme, Sizable, h_flex, popover::Popover, v_flex};
 
         let mut rows = v_flex().w_full().gap_1().child(
             gpui::div()

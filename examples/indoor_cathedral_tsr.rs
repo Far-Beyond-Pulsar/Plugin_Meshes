@@ -23,12 +23,9 @@
 //! has no sky and no GI probes; the background colour and the ambient
 //! light stand in.
 
-mod v3_demo_common;
+use meshes_examples::v3_demo_common;
 
-use helio::{
-    required_experimental_features, required_wgpu_features, required_wgpu_limits, Camera,
-    HelioAction, HelioCommandBridge, Renderer, RendererBuilder, RendererConfig,
-};
+use helio::{Camera, HelioAction, HelioCommandBridge, Renderer, RendererBuilder, RendererConfig};
 use helio_bake::BakeConfig;
 use helio_pass_perf_overlay::PerfOverlayMode;
 use helio_pass_tsr::TsrQuality;
@@ -108,7 +105,6 @@ struct AppState {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
     surface_format: wgpu::TextureFormat,
     renderer: Arc<Mutex<Renderer>>,
     action_rx: Receiver<HelioAction>,
@@ -197,7 +193,6 @@ impl ApplicationHandler for App {
         let device = graphics.device.clone();
         let queue = graphics.queue.clone();
         let format = graphics.surface_config.format;
-        let surface_format = format;
 
         let config = RendererConfig::new(size.width, size.height, format)
             .with_feature(helio_light_api::ShadowSettings {
@@ -571,7 +566,6 @@ impl ApplicationHandler for App {
             window,
             surface,
             device,
-            queue,
             surface_format: format,
             renderer,
             action_rx,

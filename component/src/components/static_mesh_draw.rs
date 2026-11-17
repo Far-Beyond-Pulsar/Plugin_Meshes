@@ -130,7 +130,6 @@ pulsar_scenedb::pulsar_reflection::inventory::submit! {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn a_slot_inherits_the_mesh_default_until_it_assigns_its_own() {

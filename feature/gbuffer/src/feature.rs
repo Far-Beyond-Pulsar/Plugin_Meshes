@@ -77,11 +77,9 @@ pub struct SelectionDrawers;
 fn selection_draws(
     env: &mut helio_feature_api::BuildEnv<'_>,
 ) -> std::sync::Arc<std::sync::Mutex<crate::selection::SelectionDraws>> {
-    env.shared(|| {
-        crate::selection::SharedSelectionDraws(std::sync::Arc::default())
-    })
-    .0
-    .clone()
+    env.shared(|| crate::selection::SharedSelectionDraws(std::sync::Arc::default()))
+        .0
+        .clone()
 }
 
 impl Feature for SelectionDrawers {

@@ -129,14 +129,6 @@ impl SceneRays {
         self
     }
 
-    /// The virtual-geometry proxies' counters.
-    pub fn vg_stats(&self) -> helio_mesh_host::ray_proxies::VgRayStats {
-        self.projection
-            .as_ref()
-            .map(|p| p.vg_stats())
-            .unwrap_or_default()
-    }
-
     /// Publishes this frame's to `renderer`: after flushing SceneDB, before
     /// rendering.
     pub fn publish(&mut self, world: &World, renderer: &mut Renderer) {
@@ -815,99 +807,4 @@ pub fn volumetric_light(mut light: GpuLight, shadow_base: u32) -> GpuLight {
     light.god_rays_exposure = 1.0;
     light.god_rays_decay = 1.0;
     light
-}
-
-// ── Headless capture (`--probe` modes) ──────────────────────────────────────
-
-/// A GPU device with the renderer's required features and no window.
-pub fn headless_gpu() -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
-    let instance = wgpu::Instance::new(helio_core::wgpu_instance_descriptor().with_env());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        ..Default::default()
-    }))
-    .expect("GPU adapter");
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("Headless probe"),
-        required_features: helio::required_wgpu_features(adapter.features()),
-        required_limits: helio::required_wgpu_limits(adapter.limits()),
-        experimental_features: helio::required_experimental_features(adapter.features()),
-        ..Default::default()
-    }))
-    .expect("GPU device");
-    device.on_uncaptured_error(Arc::new(|e: wgpu::Error| {
-        panic!("[GPU UNCAPTURED ERROR] {e:?}")
-    }));
-    (Arc::new(device), Arc::new(queue))
-}
-
-/// Render `frames` frames of `camera` offscreen (temporal effects settle) and
-/// save the last as `path`. Returns the mean sRGB value of the image, 0..255.
-pub fn capture_png(
-    scene_db: &pulsar_scenedb::SceneDb,
-    renderer: &mut Renderer,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    camera: &helio::Camera,
-    size: (u32, u32),
-    frames: u32,
-    path: &str,
-) -> f64 {
-    let (width, height) = size;
-    let target = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("Probe target"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let view = target.create_view(&Default::default());
-    for _ in 0..frames {
-        flush_scene_db(scene_db, queue);
-        renderer.render(camera, &view).expect("probe frame");
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    }
-    let row = width * 4;
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Probe readback"),
-        size: u64::from(row * height),
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut encoder = device.create_command_encoder(&Default::default());
-    encoder.copy_texture_to_buffer(
-        target.as_image_copy(),
-        wgpu::TexelCopyBufferInfo {
-            buffer: &readback,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(row),
-                rows_per_image: Some(height),
-            },
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    queue.submit([encoder.finish()]);
-    readback
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, |r| r.unwrap());
-    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    let pixels = readback.slice(..).get_mapped_range().unwrap().to_vec();
-    image::save_buffer(path, &pixels, width, height, image::ColorType::Rgba8).unwrap();
-    pixels
-        .chunks_exact(4)
-        .map(|p| (p[0] as f64 + p[1] as f64 + p[2] as f64) / 3.0)
-        .sum::<f64>()
-        / (width * height) as f64
 }

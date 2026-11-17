@@ -18,6 +18,8 @@ use std::sync::Arc;
 use helio_core::RenderGraph;
 use helio_pass_occlusion_cull::OcclusionCullPass;
 
+// Shared with the other tests: this one never moves the camera.
+#[allow(dead_code)]
 mod support;
 
 #[test]
