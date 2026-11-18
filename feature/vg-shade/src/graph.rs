@@ -237,6 +237,9 @@ impl RenderPass for VgShadePass {
         if self.has_dense {
             builder.read(self.run.dense);
         }
+        if self.run.remapped() {
+            builder.read_optional(helio_frame_api::lighting::VIEW_REMAPS);
+        }
     }
 
     fn set_debug_mode(&mut self, mode: u32) {
@@ -375,6 +378,7 @@ impl RenderPass for VgShadePass {
             rt: None,
             rt_visible: dense.and_then(|d| d.rt_visible),
             remaps: cull_inputs.remaps,
+            view_remaps: reg.buffer_binding(helio_frame_api::lighting::VIEW_REMAPS),
             dense_mask: dense.map(|d| d.tile_mask),
             dense_merge: dense.is_some_and(|d| d.merge),
             // `from_active_id`, not `from_id`: the renderer-wide "Ray Trace vs Raster"

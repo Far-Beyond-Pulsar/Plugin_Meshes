@@ -50,6 +50,10 @@ struct VertexOutput {
 // Per bin: [offset, count, cursor, _].
 @group(0) @binding(11) var<storage, read> bins: array<vec4<u32>>;
 @group(0) @binding(12) var<storage, read> rt_visible: array<VgVisibleCluster>;
+@group(0) @binding(13) var<storage, read> instance_remaps: array<u32>;
+@group(0) @binding(14) var<uniform> view_remaps: HelioViewRemaps;
+
+const FLAG_CONTENT_REMAPS: u32 = 32u;
 
 @group(1) @binding(0) var<storage, read>    materials:          array<GpuMaterial>;
 @group(1) @binding(1) var<storage, read>    material_textures:  array<MaterialTextureData>;
@@ -185,16 +189,32 @@ fn vg_shade(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_inde
 
     let material = material_at(input.material_id);
     let material_tex = material_texture_data(material, input.material_id);
-    let surface = radiant_eval_surface(material, material_tex, MaterialInput(
+    var material_input = MaterialInput(
         input.clip_position, input.world_position, input.world_normal,
         input.world_tangent, input.bitangent_sign, input.tex_coords,
-        cameras[0].position_near.xyz, globals.frame,
-    ));
+        cam.position_near.xyz, globals.frame,
+    );
+    var content_to_drawn = mat3x3<f32>(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.0, 1.0));
+    if (params.flags & FLAG_CONTENT_REMAPS) != 0u {
+        let remap = instance_remaps[vis.instance];
+        if remap < 1024u {
+            let unmap = view_remaps[remap];
+            let turn = mat3x3<f32>(unmap[0].xyz, unmap[1].xyz, unmap[2].xyz);
+            material_input.world_position = (unmap * vec4f(input.world_position, 1.0)).xyz;
+            material_input.world_normal = turn * input.world_normal;
+            material_input.world_tangent = turn * input.world_tangent;
+            material_input.view_position = (unmap * vec4f(cam.position_near.xyz, 1.0)).xyz;
+            vg_dn_dx = turn * vg_dn_dx;
+            vg_dn_dy = turn * vg_dn_dy;
+            content_to_drawn = transpose(turn);
+        }
+    }
+    let surface = radiant_eval_surface(material, material_tex, material_input);
 
     // Debug views (cluster/triangle ids included) are written by `vg_debug.wgsl`
     // after this pass, only while one is selected.
     textureStore(out_albedo, px, vec4<f32>(surface.albedo.rgb, surface.alpha));
-    textureStore(out_normal, px, vec4<f32>(surface.normal, surface.specular_f0.r));
+    textureStore(out_normal, px, vec4<f32>(content_to_drawn * surface.normal, surface.specular_f0.r));
     textureStore(out_orm, px, vec4<f32>(surface.ao, surface.roughness, surface.metallic, surface.specular_f0.g));
     textureStore(out_emissive, px, vec4<f32>(surface.emissive, surface.specular_f0.b));
     textureStore(out_sss, px, vec4<f32>(surface.subsurface_color, surface.subsurface_radius));

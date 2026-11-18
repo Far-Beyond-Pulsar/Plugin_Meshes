@@ -132,8 +132,13 @@ fn visit_leaf(node: VgBvhNode, volume: GpuPortalVolume, chain: GpuPortalChain) {
         if (inst.flags & VG_INST_ENABLED) == 0u || inst.object_row >= arrayLength(&objects) {
             continue;
         }
-        let b = objects[inst.object_row].bounds;
-        let space = coordinate_spaces[space_of(objects[inst.object_row].flags)];
+        let object = objects[inst.object_row];
+        let slot = space_of(object.flags);
+        if slot != chain.destination_space {
+            continue;
+        }
+        let b = object.bounds;
+        let space = coordinate_spaces[slot];
         let center = (space * vec4<f32>(b[0], b[1], b[2], 1.0)).xyz;
         if portal_volume_holds_sphere(volume, center, b[3]) {
             emit(row, chain);
