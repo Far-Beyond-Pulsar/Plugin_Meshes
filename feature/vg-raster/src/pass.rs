@@ -97,7 +97,7 @@ pub struct VgRasterInputs<'a> {
     pub visible: &'a wgpu::Buffer,
     /// `GpuVgInstance` rows.
     pub vg_instances: &'a wgpu::Buffer,
-    /// The scene join's `static_objects` rows (`abi::OBJECT_STRIDE` = 252 B stride).
+    /// The scene join's `static_objects` rows (`abi::OBJECT_STRIDE` = 240 B stride).
     pub objects: &'a wgpu::Buffer,
     /// 4 x `DrawIndirectArgs` (one per `abi::HW_BIN_CAPS`), at this byte offset.
     pub hw_indirect: &'a wgpu::Buffer,

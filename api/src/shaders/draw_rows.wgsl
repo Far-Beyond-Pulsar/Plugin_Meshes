@@ -3,7 +3,7 @@
 // instance's row, a draw group, the indirect draw a group is issued as, and
 // the instance flags.
 
-// `helio_mesh_api::GpuInstanceData` (224 bytes).
+// `helio_mesh_api::GpuInstanceData` (208 bytes).
 struct GpuInstanceData {
     transform:      mat4x4<f32>,
     normal_mat_0:   vec4<f32>,
@@ -19,10 +19,6 @@ struct GpuInstanceData {
     flags:          u32,
     // The object's `static_objects` row (`GpuInstanceData::object_row`).
     object_row: u32,
-    skin_vertex_offset: u32,
-    bone_palette_offset: u32,
-    bone_palette_count: u32,
-    _skin_pad: u32,
 }
 
 // `helio_mesh_api::GpuDrawCall`: a draw group, its instances contiguous.
@@ -49,6 +45,7 @@ const INSTANCE_FLAG_RECEIVES_SHADOW: u32 = 2u;
 const INSTANCE_FLAG_ALWAYS_VISIBLE: u32 = 4u;
 const INSTANCE_FLAG_MOVABLE: u32 = 8u;
 const INSTANCE_FLAG_CLASSIC_SUPPRESSED: u32 = 16u;
+const INSTANCE_FLAG_SKINNED: u32 = 32u;
 // `helio_mesh_api::INSTANCE_COORDINATE_SPACE_SHIFT`.
 const INSTANCE_COORDINATE_SPACE_SHIFT: u32 = 8u;
 

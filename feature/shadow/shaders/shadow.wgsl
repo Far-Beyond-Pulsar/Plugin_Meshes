@@ -1,6 +1,7 @@
 //!use shadow_atlas
 //!use mesh_draw_rows
 //!use mesh_skinning
+//!use frame_ray_stream
 // Shadow caster pass — depth-only, GPU-driven.
 //
 // Vertex shader projects world-space geometry into each light's clip space using

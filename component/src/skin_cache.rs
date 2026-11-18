@@ -13,9 +13,12 @@
 //! - **What a frame costs.** The journal of [`SkeletalMeshComponent`] says
 //!   which instances changed; one whose palette is bitwise the one it was
 //!   posed with costs nothing (an animator showing the same pose each frame).
-//!   A posed instance is skinned once (its previous positions are what the
-//!   cache held: motion vectors from the last pose, not a second blend), and
-//!   on the frame after its last pose settled once (previous = current, so a
+//!   A posed instance is skinned once: its current palette and the palette
+//!   shown before it (both mirrored by the component) are blended in the same
+//!   pass, so previous positions for motion vectors cost no read of the cache
+//!   (that read was a third of the pass, which is memory-bound), and
+//!   on the frame after its last pose its row is marked settled (previous =
+//!   current, a row write and no pass over its vertices, so a
 //!   stopped pose stops moving in the velocity buffer). A frame with no
 //!   change records nothing; no buffer or bind group is made unless the
 //!   cache or a pool grows.
@@ -50,8 +53,13 @@ use crate::components::SkeletalMeshComponent;
 const LANES: u32 = 64;
 /// Workgroups a dispatch row holds (the device limit every backend has).
 const GROUPS_X: u32 = 65_535;
-/// Vertices the cache holds before its first growth.
+/// Vertices the cache holds before its first growth, and the least it
+/// shrinks to.
 const INITIAL_VERTICES: u32 = 1 << 14;
+/// Frames an instance stays resident while nothing wants it (off-screen and
+/// outside the traced range): a character that turns out of view and back
+/// keeps its range; one left behind gives it back.
+const EVICT_FRAMES: u32 = 300;
 const VERTEX_BYTES: u64 = std::mem::size_of::<SkinnedVertex>() as u64;
 const ROW_BYTES: u64 = std::mem::size_of::<SkinCacheRow>() as u64;
 
@@ -79,10 +87,9 @@ struct SkinFrame {
     _pad: u32,
 }
 
-/// `SKIN_FRESH`, `SKIN_POSE`, `SKIN_SETTLE` in `skin_cache.wgsl`.
+/// `SKIN_FRESH`, `SKIN_POSE` in `skin_cache.wgsl`.
 const FRESH: u32 = 0;
 const POSE: u32 = 1;
-const SETTLE: u32 = 2;
 
 /// A resident skinned instance as the ray-traced scene reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +113,8 @@ struct Entry {
     revision: u64,
     /// The frame it was last posed in.
     posed: u64,
+    /// Its pose stopped: its row says previous = current.
+    settled: bool,
 }
 
 /// First-fit ranges of the cache's vertices.
@@ -142,6 +151,55 @@ impl Ranges {
     }
 }
 
+/// What the frame sees: the cache skins only the instances it wants (in the
+/// camera's frustum, or within the ray-traced scene's culling criterion).
+#[derive(Clone, Copy, Debug)]
+pub struct SkinView {
+    /// The eye, in world space.
+    pub eye: glam::DVec3,
+    /// The camera's view-projection relative to the eye
+    /// (`helio::Camera::view_proj_in(eye)`).
+    pub view_proj: glam::Mat4,
+    /// The ray-traced scene's culling criterion.
+    pub rays: helio_mesh_api::RayTracingSettings,
+}
+
+impl SkinView {
+    /// Whether a skinned instance whose world bounding sphere is `center`,
+    /// `radius` is drawn or traced this frame: inside the frustum's four side
+    /// planes (a sphere behind the eye fails one), or traced by the
+    /// ray-tracing culling (which covers the shadow casters near the eye).
+    pub fn wants(&self, center: glam::DVec3, radius: f64) -> bool {
+        let distance = center.distance(self.eye);
+        if self.rays.traces(distance, radius, 1.0) {
+            return true;
+        }
+        let c = (center - self.eye).as_vec3().extend(1.0);
+        let m = self.view_proj;
+        let row = |i: usize| glam::Vec4::new(m.x_axis[i], m.y_axis[i], m.z_axis[i], m.w_axis[i]);
+        let (x, y, w) = (row(0), row(1), row(3));
+        [w + x, w - x, w + y, w - y].iter().all(|plane| {
+            let n = plane.truncate().length();
+            plane.dot(c) >= -(radius as f32) * n
+        })
+    }
+}
+
+/// A skinned instance the cache knows, resident or not.
+#[derive(Default)]
+struct Known {
+    /// Its component changed and it is not posed from it yet (it was not
+    /// wanted, or its mesh was not mirrored).
+    pending: bool,
+    /// Its pose changed while nothing wanted it: posed fresh (no motion)
+    /// when it is wanted, its previous pose being stale.
+    missed: bool,
+    /// Frames nothing has wanted it.
+    unwanted: u32,
+    /// It has no mesh to skin (until its component changes).
+    idle: bool,
+}
+
 /// What the cache did this frame, for the ray-traced scene.
 #[derive(Default)]
 pub struct SkinCacheFrame {
@@ -172,10 +230,11 @@ pub struct SkinCache {
     entries: HashMap<Entity, Entry>,
     cursor: Option<ChangeCursor>,
     changes: Vec<ComponentChange>,
-    /// Instances whose mesh is not mirrored yet: retried each frame.
-    waiting: HashSet<Entity>,
     /// Instances posed last frame.
     posed_last: Vec<Entity>,
+    /// Every skinned instance the journal has shown, resident or not.
+    known: HashMap<Entity, Known>,
+    /// Instances skinned this frame and not wanted (zero with a view).
     jobs: Vec<SkinJob>,
     bind_group: Option<([wgpu::Buffer; 5], wgpu::BindGroup)>,
     frame: u64,
@@ -214,10 +273,11 @@ impl SkinCache {
         let module = helio_core::shader::module_with(
             &device,
             "Skin cache",
-            include_str!("skin_cache.wgsl"),
+            helio_core::include_wgsl!("skin_cache.wgsl"),
             &[
                 helio_mesh_api::DRAW_ROWS_SNIPPET,
                 helio_mesh_api::SKINNING_SNIPPET,
+                helio_frame_api::rays::stream::SNIPPET,
             ],
         );
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -291,8 +351,8 @@ impl SkinCache {
             entries: HashMap::new(),
             cursor: None,
             changes: Vec::new(),
-            waiting: HashSet::new(),
             posed_last: Vec::new(),
+            known: HashMap::new(),
             jobs: Vec::new(),
             bind_group: None,
             frame: 0,
@@ -344,10 +404,15 @@ impl SkinCache {
 
     /// Bring the cache up to date with `world` (after the GPU mirror's
     /// flush): skin the instances whose pose changed into `encoder`, settle
-    /// those posed last frame and not this one.
+    /// those posed last frame and not this one. With a `view`, only the
+    /// instances it wants are skinned ([`SkinView::wants`]): one posed while
+    /// unwanted is skinned the frame it is wanted again (with no motion that
+    /// frame: its previous pose is stale), and one unwanted for
+    /// [`EVICT_FRAMES`] gives its range back. Without one every instance is.
     pub fn update(
         &mut self,
         world: &World,
+        view: Option<&SkinView>,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
     ) -> SkinCacheFrame {
@@ -360,7 +425,7 @@ impl SkinCache {
             return out;
         };
         let store = mirror.store();
-        let mut dirty = std::mem::take(&mut self.waiting);
+        let mut dirty = HashSet::new();
         let complete = match self.cursor.as_mut() {
             Some(cursor) => {
                 self.changes.clear();
@@ -373,6 +438,7 @@ impl SkinCache {
             for change in &changes {
                 match change.kind {
                     ComponentChangeKind::Removed => {
+                        self.known.remove(&change.entity);
                         if self.free(change.entity, queue) {
                             out.moved.push(change.entity);
                         }
@@ -400,11 +466,48 @@ impl SkinCache {
                 self.free(entity, queue);
                 out.moved.push(entity);
             }
+            self.known.retain(|entity, _| alive.contains(entity));
             dirty.extend(alive);
         }
+        for entity in &dirty {
+            let known = self.known.entry(*entity).or_default();
+            known.pending = true;
+            known.idle = false;
+        }
+        // Which instances the frame wants: every one it knows, a sphere test
+        // each (a skinned instance costs its animation's CPU a frame anyway).
+        let mut wanted = Vec::new();
+        let mut evict = Vec::new();
+        for (entity, known) in &mut self.known {
+            let wants = view.is_none_or(|view| {
+                world_sphere(world, *entity).is_none_or(|(c, r)| view.wants(c, r))
+            });
+            let resident = self.entries.contains_key(entity);
+            if wants {
+                known.unwanted = 0;
+                if known.pending || (!known.idle && !resident) {
+                    wanted.push((*entity, known.missed && resident));
+                    known.pending = false;
+                    known.missed = false;
+                }
+            } else {
+                known.missed |= known.pending;
+                known.unwanted = known.unwanted.saturating_add(1);
+                if known.unwanted > EVICT_FRAMES && self.entries.contains_key(entity) {
+                    evict.push(*entity);
+                }
+            }
+        }
+        for entity in evict {
+            if self.free(entity, queue) {
+                out.moved.push(entity);
+            }
+        }
         let mut posed = Vec::new();
-        for entity in dirty {
-            match self.pose(world, store, entity, encoder, queue) {
+        for (entity, missed) in wanted {
+            // A pose that changed while unwanted has no previous pose to move
+            // from: it is posed fresh.
+            match self.pose(world, store, entity, encoder, queue, missed) {
                 Pose::Unchanged => {}
                 Pose::Posed { moved } => {
                     posed.push(entity);
@@ -413,32 +516,40 @@ impl SkinCache {
                     }
                 }
                 Pose::Waiting => {
-                    self.waiting.insert(entity);
+                    if let Some(known) = self.known.get_mut(&entity) {
+                        known.pending = true;
+                    }
                 }
                 Pose::Gone => {
+                    if let Some(known) = self.known.get_mut(&entity) {
+                        known.idle = true;
+                    }
                     if self.free(entity, queue) {
                         out.moved.push(entity);
                     }
                 }
             }
         }
-        // Posed last frame and not this one: settle once.
+        // Posed last frame and not this one: settled (its row says the
+        // previous position is the current one; no pass over its vertices).
         let posed_now: HashSet<Entity> = posed.iter().copied().collect();
         for entity in std::mem::take(&mut self.posed_last) {
             if posed_now.contains(&entity) {
                 continue;
             }
-            if let Some(e) = self.entries.get(&entity) {
-                self.jobs.push(SkinJob {
-                    cache: e.cache,
-                    count: e.count,
-                    mode: SETTLE,
-                    ..Default::default()
-                });
-                self.vertices += u64::from(e.count);
+            if let Some(e) = self.entries.get_mut(&entity) {
+                e.settled = true;
+                let row = SkinCacheRow {
+                    offset: e.cache.wrapping_sub(e.mesh_vertex),
+                    resident: 1,
+                    pose: e.revision as u32,
+                    settled: 1,
+                };
+                self.write_row(queue, encoder, entity.index(), row);
             }
         }
         self.posed_last = posed;
+        self.shrink(queue, encoder, &mut out);
         self.dispatch(store, queue, encoder);
         self.publish();
         out
@@ -452,6 +563,7 @@ impl SkinCache {
         entity: Entity,
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
+        fresh: bool,
     ) -> Pose {
         let Some(mesh) = world.get::<SkeletalMeshComponent>(entity) else {
             return Pose::Gone;
@@ -463,14 +575,15 @@ impl SkinCache {
         let (Some(vertices), Some(skin), Some(palette)) = (
             SkeletalMeshComponent::vertices_gpu_handle(store, row),
             SkeletalMeshComponent::skin_vertices_gpu_handle(store, row),
-            SkeletalMeshComponent::bone_palette_gpu_handle(store, row),
+            SkeletalMeshComponent::gpu_bone_palettes_gpu_handle(store, row),
         ) else {
             return Pose::Waiting;
         };
         let count = mesh.vertices.len() as u32;
         if vertices.count != count
             || skin.count != count
-            || palette.count as usize != mesh.bone_palette.len()
+            // The current palette then the previous one.
+            || palette.count as usize != 2 * mesh.bone_palette.len()
         {
             return Pose::Waiting;
         }
@@ -489,14 +602,17 @@ impl SkinCache {
             {
                 return Pose::Unchanged;
             }
-            Some(e) if e.count == count => (e.mesh_vertex != vertices.offset, POSE),
+            Some(e) if e.count == count => (
+                e.mesh_vertex != vertices.offset,
+                if fresh { FRESH } else { POSE },
+            ),
             Some(_) => {
                 self.free(entity, queue);
                 (true, FRESH)
             }
             None => (true, FRESH),
         };
-        if mode == FRESH {
+        if !self.entries.contains_key(&entity) {
             let Some(cache) = self.allocate(count, encoder) else {
                 tracing::warn!("Meshes: the skin cache cannot hold {count} more vertices");
                 return Pose::Waiting;
@@ -512,6 +628,7 @@ impl SkinCache {
                     palette_hash: hash,
                     revision: 0,
                     posed: 0,
+                    settled: false,
                 },
             );
         }
@@ -523,12 +640,13 @@ impl SkinCache {
         e.palette_hash = hash;
         e.revision += 1;
         e.posed = frame;
+        e.settled = false;
         let (cache, count, mesh_vertex) = (e.cache, e.count, e.mesh_vertex);
         self.jobs.push(SkinJob {
             mesh_vertex,
             skin_vertex: skin.offset,
             palette: palette.offset,
-            joints: palette.count,
+            joints: palette.count / 2,
             cache,
             count,
             mode,
@@ -536,25 +654,92 @@ impl SkinCache {
         });
         self.updated += 1;
         self.vertices += u64::from(count);
-        if moved {
-            self.write_row(
-                queue,
-                encoder,
-                row,
-                SkinCacheRow {
-                    offset: cache.wrapping_sub(mesh_vertex),
-                    resident: 1,
-                },
-            );
-        }
+        // The row on every pose: its `pose` is what caches of rendered
+        // results (shadow pages) key a skinned caster on.
+        let pose = self.entries[&entity].revision as u32;
+        self.write_row(
+            queue,
+            encoder,
+            row,
+            SkinCacheRow {
+                offset: cache.wrapping_sub(mesh_vertex),
+                resident: 1,
+                pose,
+                settled: 0,
+            },
+        );
         Pose::Posed { moved }
+    }
+
+    /// Repack the cache into a smaller buffer once a quarter of it is used
+    /// (never below [`INITIAL_VERTICES`]): every resident range moves (its
+    /// rows are rewritten and the ray-traced scene follows, `out.moved`).
+    fn shrink(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        out: &mut SkinCacheFrame,
+    ) {
+        if self.capacity <= INITIAL_VERTICES || self.used.saturating_mul(4) >= self.capacity {
+            return;
+        }
+        let capacity = (self.used.max(1) * 2)
+            .next_power_of_two()
+            .max(INITIAL_VERTICES);
+        if capacity >= self.capacity {
+            return;
+        }
+        let packed = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Skin cache"),
+            size: u64::from(capacity) * VERTEX_BYTES,
+            usage: self.cache_usage,
+            mapped_at_creation: false,
+        });
+        let mut order: Vec<Entity> = self.entries.keys().copied().collect();
+        order.sort_by_key(|e| self.entries[e].cache);
+        let mut at = 0u32;
+        let mut rows = Vec::new();
+        for entity in order {
+            let e = self.entries.get_mut(&entity).expect("listed");
+            encoder.copy_buffer_to_buffer(
+                &self.cache,
+                u64::from(e.cache) * VERTEX_BYTES,
+                &packed,
+                u64::from(at) * VERTEX_BYTES,
+                u64::from(e.count) * VERTEX_BYTES,
+            );
+            e.cache = at;
+            e.revision += 1;
+            rows.push((
+                entity.index(),
+                SkinCacheRow {
+                    offset: at.wrapping_sub(e.mesh_vertex),
+                    resident: 1,
+                    pose: e.revision as u32,
+                    settled: u32::from(e.settled),
+                },
+            ));
+            at += e.count;
+            out.moved.push(entity);
+        }
+        for (row, value) in rows {
+            self.write_row(queue, encoder, row, value);
+        }
+        self.cache = packed;
+        self.capacity = capacity;
+        self.ranges = Ranges {
+            free: (at < capacity)
+                .then_some((at, capacity - at))
+                .into_iter()
+                .collect(),
+        };
+        self.epoch += 1;
     }
 
     /// Drop `entity`'s range; whether it held one. Its row is cleared now
     /// (queue writes land in call order: a later instance at the same row
     /// writes over it).
     fn free(&mut self, entity: Entity, queue: &wgpu::Queue) -> bool {
-        self.waiting.remove(&entity);
         let Some(e) = self.entries.remove(&entity) else {
             return false;
         };
@@ -743,10 +928,39 @@ impl SkinCache {
         stats.add_named(stats::SKIN_CACHE_VERTICES, self.vertices);
     }
 
-    /// Instances posed this frame, and vertices written (posed and settled).
+    /// Instances posed this frame, and vertices the pass wrote.
     pub fn frame_counts(&self) -> (u64, u64) {
         (self.updated, self.vertices)
     }
+
+    /// Vertices the cache holds room for, and how many are in use.
+    pub fn capacity(&self) -> (u32, u32) {
+        (self.capacity, self.used)
+    }
+}
+
+/// `entity`'s world bounding sphere: its mesh's local sphere through its
+/// owner's world matrix (`None` without a mesh; its local sphere without an
+/// owner).
+fn world_sphere(world: &World, entity: Entity) -> Option<(glam::DVec3, f64)> {
+    let mesh = world.get::<SkeletalMeshComponent>(entity)?;
+    let [x, y, z, r] = mesh.bounds_local.map(f64::from);
+    let matrix = world
+        .get::<pulsar_scene_model::attachments::ComponentOwner>(entity)
+        .and_then(|link| {
+            pulsar_scene_model::hierarchy_transform::world_matrix_of(world, link.entity())
+        })
+        .unwrap_or(glam::DMat4::IDENTITY);
+    let scale = matrix
+        .x_axis
+        .truncate()
+        .length()
+        .max(matrix.y_axis.truncate().length())
+        .max(matrix.z_axis.truncate().length());
+    Some((
+        matrix.transform_point3(glam::DVec3::new(x, y, z)),
+        r * scale,
+    ))
 }
 
 enum Pose {
@@ -809,6 +1023,7 @@ mod tests {
             &[
                 helio_mesh_api::DRAW_ROWS_SNIPPET,
                 helio_mesh_api::SKINNING_SNIPPET,
+                helio_frame_api::rays::stream::SNIPPET,
             ],
         );
         let module = naga::front::wgsl::parse_str(&source)

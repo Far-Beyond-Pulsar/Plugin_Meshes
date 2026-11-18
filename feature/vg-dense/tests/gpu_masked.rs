@@ -197,7 +197,7 @@ fn run(s: &Setup, double_sided: bool, flip_front: bool, with_tables: bool) -> Ve
     };
     let instances = buf(device, "instances", cast_slice(&[inst]));
     queue.write_buffer(&instances, 0, cast_slice(&[inst]));
-    let mut object = [0f32; 63];
+    let mut object = [0f32; 60];
     object[4..20].copy_from_slice(cast_slice(&IDENTITY));
     let objects = buf(device, "objects", cast_slice(&object));
     queue.write_buffer(&objects, 0, cast_slice(&object));

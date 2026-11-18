@@ -33,7 +33,7 @@ const RAY_INSTANCE_TWO_SIDED: u32 = 4u;
 // cache at `skinned_vertex`.
 const RAY_INSTANCE_SKINNED: u32 = 8u;
 // `helio_mesh_api::SkinnedVertex` in `u32` words: position (words 0-2), the
-// snorm8x4 normal (3).
+// octahedral normal (3, `scene_pack_unit`: the reader has `frame_ray_stream`).
 const SKINNED_VERTEX_WORDS: u32 = 8u;
 // `helio_mesh_api::PackedVertex` in `u32` words: position (words 0-2), UV0
 // (4-5), the snorm8x4 normal (8).
@@ -62,7 +62,7 @@ fn skinned_vertex_position(v: u32) -> vec3<f32> {
 }
 
 fn skinned_vertex_normal(v: u32) -> vec3<f32> {
-    return unpack4x8snorm(skinned_vertices[v * SKINNED_VERTEX_WORDS + 3u]).xyz;
+    return scene_unpack_unit(skinned_vertices[v * SKINNED_VERTEX_WORDS + 3u]);
 }
 
 fn ray_proxy_position(v: u32) -> vec3<f32> {

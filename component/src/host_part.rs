@@ -211,7 +211,7 @@ impl RenderHostPart for MeshesHostPart {
         &mut self,
         scene: &SharedScene,
         renderer: &mut helio::Renderer,
-        eye: glam::DVec3,
+        camera: Option<&helio::Camera>,
     ) {
         if matches!(self.ray_scene, RayScene::Pending) {
             self.ray_scene = match crate::ray_scene::WorldRayScene::new(
@@ -237,18 +237,26 @@ impl RenderHostPart for MeshesHostPart {
             label: Some("Meshes: skin cache and ray-traced scene"),
         });
         let scene = scene.read();
-        let skin_frame = skins.update(&scene.world, &queue, &mut encoder);
+        let settings = {
+            use engine_backend::subsystems::render::helio_renderer::project_settings;
+            helio_mesh_api::RayTracingSettings::from_settings(&project_settings::resolved(
+                &helio_mesh_api::RAY_TRACING,
+            ))
+        };
+        // Skinned only where the frame draws or traces them.
+        let view = camera.map(|camera| crate::skin_cache::SkinView {
+            eye: camera.eye,
+            view_proj: camera.view_proj_in(camera.eye),
+            rays: settings,
+        });
+        let skin_frame = skins.update(&scene.world, view.as_ref(), &queue, &mut encoder);
         let stats = renderer.frame_stats().clone();
         skins.report(&stats);
         if let RayScene::Ready(rays) = &mut self.ray_scene {
-            use engine_backend::subsystems::render::helio_renderer::project_settings;
-            let settings = helio_mesh_api::RayTracingSettings::from_settings(
-                &project_settings::resolved(&helio_mesh_api::RAY_TRACING),
-            );
             rays.prepare(
                 &scene.world,
                 renderer.world_origin(),
-                eye,
+                camera.map_or(renderer.world_origin(), |camera| camera.eye),
                 settings,
                 skins,
                 &skin_frame,

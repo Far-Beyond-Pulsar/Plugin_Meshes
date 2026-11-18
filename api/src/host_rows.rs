@@ -108,20 +108,11 @@ pub struct StaticObjectComponent {
     /// See `crate::GpuInstanceData::flags`.
     #[gpu]
     pub flags: u32,
-    /// Base vertex in the parallel four-influence skin stream (zero for rigid meshes).
-    #[gpu]
-    pub skin_vertex_offset: u32,
-    /// Base joint matrix in the shared palette pool (zero for rigid meshes).
-    #[gpu]
-    pub bone_palette_offset: u32,
-    /// Number of valid joint matrices for this instance.
-    #[gpu]
-    pub bone_palette_count: u32,
     /// Which section of its mesh the row draws ([`crate::StaticObjectRow::section_index`]).
     #[gpu]
     pub section_index: u32,
 }
-same_layout!(StaticObjectComponent, crate::StaticObjectRow, crate::STATIC_OBJECTS, "static_objects"; mesh_slot, mesh_generation, material_slot, material_generation, transform, prev_transform, normal_mat, bounds, index_count, first_index, vertex_offset, material_class, graph_hash_lo, graph_hash_hi, flags, skin_vertex_offset, bone_palette_offset, bone_palette_count, section_index);
+same_layout!(StaticObjectComponent, crate::StaticObjectRow, crate::STATIC_OBJECTS, "static_objects"; mesh_slot, mesh_generation, material_slot, material_generation, transform, prev_transform, normal_mat, bounds, index_count, first_index, vertex_offset, material_class, graph_hash_lo, graph_hash_hi, flags, section_index);
 
 // ---- row builders, returning the component (see builders.py note) ----
 

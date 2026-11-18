@@ -281,6 +281,7 @@ impl SelectionMaskPass {
             &[
                 helio_mesh_api::DRAW_ROWS_SNIPPET,
                 helio_mesh_api::SKINNING_SNIPPET,
+                helio_frame_api::rays::stream::SNIPPET,
             ],
         );
         let pipeline = helio_core::shader::create_render_pipeline(

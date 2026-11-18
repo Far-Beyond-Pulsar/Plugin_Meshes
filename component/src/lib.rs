@@ -108,8 +108,6 @@ pub fn scene_join_keys(context: &ObjectJoinContext) -> SceneJoinKeys {
         mesh_bounds: BufferKey::of(MESH_BOUNDS_BUFFER),
         mesh_flags: BufferKey::of(MESH_FLAGS_BUFFER),
         section_handles: BufferKey::of("static_mesh_draw_sections::handles"),
-        skin_handles: BufferKey::of(SKELETAL_SKIN_HANDLES_BUFFER),
-        palette_handles: BufferKey::of(SKELETAL_PALETTE_HANDLES_BUFFER),
         mesh_sections: BufferKey::of(MESH_SECTIONS_BUFFER),
         material_row_handles: BufferKey::of("mesh_material_rows::handles"),
         material_rows: BufferKey::of(mesh_materials::MESH_MATERIAL_ROWS_BUFFER),

@@ -314,7 +314,7 @@ fn attr_rows(uv: [[u16; 2]; 3]) -> Vec<[u8; 16]> {
 }
 
 fn object_row(material_slot: u32) -> Vec<u32> {
-    let mut row = vec![0u32; 63];
+    let mut row = vec![0u32; 60];
     row[2] = material_slot;
     let identity = Mat4::IDENTITY.to_cols_array();
     for i in 0..16 {

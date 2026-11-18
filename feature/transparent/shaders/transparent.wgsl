@@ -7,6 +7,7 @@
 //!use material_surface
 //!use mesh_draw_rows
 //!use mesh_skinning
+//!use frame_ray_stream
 enable wgpu_binding_array;
 
 // The meshes' transparent program: the vertex layout and instance rows,

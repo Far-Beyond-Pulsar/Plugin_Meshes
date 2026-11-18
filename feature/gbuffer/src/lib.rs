@@ -146,9 +146,10 @@ pub struct GBufferPass {
 pub const GBUFFER_PROGRAM: &str = include_str!("../shaders/gbuffer.wgsl");
 /// The snippets [`GBUFFER_PROGRAM`] composes with: the meshes' draw rows and
 /// skin cache, and the frame's G-buffer output.
-pub const GBUFFER_PROGRAM_SNIPPETS: [helio_core::shader::ShaderSnippet; 5] = [
+pub const GBUFFER_PROGRAM_SNIPPETS: [helio_core::shader::ShaderSnippet; 6] = [
     helio_mesh_api::DRAW_ROWS_SNIPPET,
     helio_mesh_api::SKINNING_SNIPPET,
+    helio_frame_api::rays::stream::SNIPPET,
     helio_frame_api::gbuffer::OUTPUT_SNIPPET,
     helio_bake_api::LIGHTMAP_REGIONS_SNIPPET,
     helio_portal_api::PORTAL_CHAIN_SNIPPET,

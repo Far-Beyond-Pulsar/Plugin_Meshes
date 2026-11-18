@@ -9,7 +9,7 @@
 //   vg_page_pool     helio-vg-stream page pool        (binding 3, decode_bindings_wgsl)
 //   vg_asset_quant   helio-vg-stream lattice per asset (binding 4)
 //   vg_instances     GpuVgInstance rows (asset_slot, object_row)
-//   vg_objects       scene-join `static_objects`, 252-byte rows (transform = words 4..20)
+//   vg_objects       scene-join `static_objects`, 240-byte rows (transform = words 4..20)
 //
 // All tiers' clusters are binned, not just the dense bin: a dense tile
 // REPLACES whatever Tier 1/2 drew there, so it must see every overlapping
@@ -21,7 +21,7 @@
 struct DenseObject {
     head:      array<u32, 4>,
     transform: array<array<f32, 4>, 4>,
-    rest:      array<u32, 43>,
+    rest:      array<u32, 40>,
 }
 @group(0) @binding(10) var<storage, read> vg_objects: array<DenseObject>;
 

@@ -1656,7 +1656,8 @@ impl AppState {
         );
 
         v3_demo_common::flush_scene_db(&self.scene_db, &self.queue);
-        self.rays.publish(&self.scene_db.world, &mut self.renderer);
+        self.rays
+            .publish(&self.scene_db.world, &mut self.renderer, &camera);
         if let Err(e) = self.renderer.render_window_frame(&camera, &self.surface) {
             log::error!("Render: {:?}", e);
             self.render_errors += 1;

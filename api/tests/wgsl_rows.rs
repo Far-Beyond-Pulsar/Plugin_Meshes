@@ -6,6 +6,7 @@ use helio_mesh_api::*;
 
 /// The storage `mesh_ray_surface` reads, as a reader declares it.
 const RAY_SURFACE_READER: &str = "//!use mesh_ray_surface
+//!use frame_ray_stream
 @group(0) @binding(0) var<storage, read> instances: array<RayInstance>;
 @group(0) @binding(1) var<storage, read> vertices: array<u32>;
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
@@ -74,7 +75,10 @@ fn constant(module: &naga::Module, name: &str) -> u32 {
 
 #[test]
 fn the_ray_surface_rows_match_the_rust() {
-    let m = module(RAY_SURFACE_READER, RAY_SURFACE_SNIPPET);
+    let m = modules(
+        RAY_SURFACE_READER,
+        &[RAY_SURFACE_SNIPPET, helio_frame_api::rays::stream::SNIPPET],
+    );
     assert_eq!(
         struct_size(&m, "RayInstance"),
         std::mem::size_of::<RayInstance>()
@@ -103,6 +107,7 @@ fn the_ray_surface_rows_match_the_rust() {
 /// The storage `mesh_skinning` reads, as a drawer declares it.
 const SKINNING_READER: &str = "//!use mesh_draw_rows
 //!use mesh_skinning
+//!use frame_ray_stream
 @group(0) @binding(0) var<storage, read> instances: array<GpuInstanceData>;
 @group(0) @binding(1) var<storage, read> skin_cache: array<SkinnedVertex>;
 @group(0) @binding(2) var<storage, read> skin_cache_rows: array<SkinCacheRow>;
@@ -115,7 +120,14 @@ fn main() {
 
 #[test]
 fn the_skin_cache_rows_match_the_rust() {
-    let m = modules(SKINNING_READER, &[DRAW_ROWS_SNIPPET, SKINNING_SNIPPET]);
+    let m = modules(
+        SKINNING_READER,
+        &[
+            DRAW_ROWS_SNIPPET,
+            SKINNING_SNIPPET,
+            helio_frame_api::rays::stream::SNIPPET,
+        ],
+    );
     assert_eq!(
         struct_size(&m, "SkinnedVertex"),
         std::mem::size_of::<SkinnedVertex>()
@@ -166,6 +178,7 @@ fn the_draw_rows_match_the_rust() {
         ),
         ("INSTANCE_FLAG_ALWAYS_VISIBLE", INSTANCE_FLAG_ALWAYS_VISIBLE),
         ("INSTANCE_FLAG_MOVABLE", INSTANCE_FLAG_MOVABLE),
+        ("INSTANCE_FLAG_SKINNED", INSTANCE_FLAG_SKINNED),
         (
             "INSTANCE_FLAG_CLASSIC_SUPPRESSED",
             INSTANCE_FLAG_CLASSIC_SUPPRESSED,

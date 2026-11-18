@@ -1,6 +1,7 @@
 //!use helio_prelude
 //!use mesh_draw_rows
 //!use mesh_skinning
+//!use frame_ray_stream
 
 // The selected meshes' depth into the selection mask
 // (`helio_frame_api::selection::MASK_DEPTH`): placed exactly as the G-buffer

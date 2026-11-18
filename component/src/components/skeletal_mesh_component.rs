@@ -101,13 +101,16 @@ pub struct SkeletalMeshComponent {
     #[serde(skip)]
     pub skin_vertices: Vec<SkinVertex>,
     /// The joint palette the pose gives: one matrix a joint, the joint's
-    /// bone in the pose times its inverse bind. The skin cache keeps the
-    /// previous frame's vertices itself, so only the current palette is
-    /// mirrored.
+    /// bone in the pose times its inverse bind.
+    #[serde(skip)]
+    pub bone_palette: Vec<[[f32; 4]; 4]>,
+    /// [`Self::bone_palette`] followed by the palette of the pose shown
+    /// before it, mirrored for the skin cache's pass: it blends both, so the
+    /// previous positions motion vectors need cost no read of the cache.
     // `helio_mesh_api::SKELETAL_BONE_PALETTE` (pinned as above).
     #[gpu(buffer = "skeletal_bone_palette")]
     #[serde(skip)]
-    pub bone_palette: Vec<[[f32; 4]; 4]>,
+    pub gpu_bone_palettes: Vec<[[f32; 4]; 4]>,
 }
 
 #[register_scene_props_applier]
@@ -158,6 +161,7 @@ impl SkeletalMeshComponent {
     fn refresh_palette(&mut self) {
         let Some(mesh) = &self.loaded_mesh else {
             self.bone_palette.clear();
+            self.gpu_bone_palettes.clear();
             return;
         };
         let world: HashMap<_, _> = self
@@ -172,10 +176,26 @@ impl SkeletalMeshComponent {
             })
             .collect();
         let palette = skeletal_assets::skinning::joint_matrices(mesh, &world);
-        self.bone_palette = palette
-            .iter()
-            .map(|m| glam::Mat4::from_cols_array(&m.0).to_cols_array_2d())
-            .collect();
+        self.set_palette(
+            palette
+                .iter()
+                .map(|m| glam::Mat4::from_cols_array(&m.0).to_cols_array_2d())
+                .collect(),
+        );
+    }
+
+    /// Show `current` (one matrix a joint) after whatever palette was shown
+    /// before it (none, or another joint count: no motion).
+    pub fn set_palette(&mut self, current: Vec<[[f32; 4]; 4]>) {
+        let previous = if self.bone_palette.len() == current.len() {
+            std::mem::take(&mut self.bone_palette)
+        } else {
+            current.clone()
+        };
+        self.bone_palette = current;
+        self.gpu_bone_palettes.clear();
+        self.gpu_bone_palettes.extend_from_slice(&self.bone_palette);
+        self.gpu_bone_palettes.extend_from_slice(&previous);
     }
 
     fn clear_mesh(&mut self) {
@@ -183,6 +203,7 @@ impl SkeletalMeshComponent {
         self.indices.clear();
         self.skin_vertices.clear();
         self.bone_palette.clear();
+        self.gpu_bone_palettes.clear();
         self.mesh_sections.clear();
         self.bounds_local = [0.0, 0.0, 0.0, 0.5];
         self.geometry_key = MeshGeometryKey::NONE;
@@ -445,7 +466,7 @@ fn skeletal_mesh_draw_dispatch(
         .collect::<Vec<_>>();
     let draw = StaticMeshDraw {
         bounds_local: component.bounds_local,
-        flags: helio_mesh_api::INSTANCE_FLAG_MOVABLE,
+        flags: helio_mesh_api::INSTANCE_FLAG_MOVABLE | helio_mesh_api::INSTANCE_FLAG_SKINNED,
         sections,
     };
     pulsar_scenedb::gpu::write_derived_row(mirror, row, &draw, is_new_insert);
@@ -607,5 +628,10 @@ mod authority_tests {
         );
         assert_eq!(mesh.bone_palette[1], translate(0.0, 2.0).to_cols_array_2d());
         assert_eq!(mesh.bone_palette.len(), 2, "one matrix a joint");
+        assert_eq!(
+            mesh.gpu_bone_palettes[2..],
+            [identity, identity],
+            "then the previous pose's"
+        );
     }
 }

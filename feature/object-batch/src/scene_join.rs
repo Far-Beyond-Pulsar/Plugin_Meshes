@@ -57,7 +57,7 @@ pub const MATERIAL_ROW_BYTES: u64 = 4;
 /// A material instance's key row (`helio_mats::instance::MaterialKeyComponent`).
 pub const MATERIAL_KEY_ROW_BYTES: u64 = 16;
 
-const OBJECT_ROW_BYTES: u64 = 252;
+const OBJECT_ROW_BYTES: u64 = std::mem::size_of::<helio_mesh_api::StaticObjectRow>() as u64;
 /// A row of [`helio_mesh_api::STATIC_OBJECT_OWNERS`].
 const OWNER_OUT_ROW_BYTES: u64 = helio_core::BufferContract::<u32>::ROW_BYTES;
 const WORKGROUP: u32 = 64;
@@ -96,9 +96,6 @@ pub struct SceneJoinKeys {
     pub mesh_flags: BufferKey,
     /// Mesh instances' section ranges (handle table of `mesh_sections`).
     pub section_handles: BufferKey,
-    /// Optional per-instance four-influence skin stream and bone palette ranges.
-    pub skin_handles: BufferKey,
-    pub palette_handles: BufferKey,
     /// The section pool; one output object row per pool slot.
     pub mesh_sections: BufferKey,
     /// Mesh instances' slot material rows (handle table of `material_rows`).
@@ -686,8 +683,6 @@ impl SceneDerivation for SceneJoin {
         let mesh_bounds = self.input(inputs, keys.mesh_bounds, OWNER_BOUNDS_ROW_BYTES);
         let mesh_flags = self.input(inputs, keys.mesh_flags, MESH_FLAGS_ROW_BYTES);
         let section_handles = self.input(inputs, keys.section_handles, HANDLE_ROW_BYTES);
-        let skin_handles = self.input(inputs, keys.skin_handles, HANDLE_ROW_BYTES);
-        let palette_handles = self.input(inputs, keys.palette_handles, HANDLE_ROW_BYTES);
         let sections = self.input(inputs, keys.mesh_sections, MESH_SECTION_ROW_BYTES);
         let material_row_handles = self.input(inputs, keys.material_row_handles, HANDLE_ROW_BYTES);
         let material_rows = self.input(inputs, keys.material_rows, MATERIAL_ROW_BYTES);
@@ -733,8 +728,6 @@ impl SceneDerivation for SceneJoin {
             mesh_bounds,
             mesh_flags,
             section_handles,
-            skin_handles,
-            palette_handles,
             sections,
             spaces,
             // A slot that names another material, or a material that changes
@@ -858,8 +851,6 @@ impl SceneDerivation for SceneJoin {
                         mesh_bounds.map_or(&self.empty, |h| &h.buffer),
                         mesh_flags.map_or(&self.empty, |h| &h.buffer),
                         &section_handles.buffer,
-                        skin_handles.map_or(&self.empty, |h| &h.buffer),
-                        palette_handles.map_or(&self.empty, |h| &h.buffer),
                         &sections.buffer,
                         &self.objects.buffer,
                         material_keys.map_or(&self.empty, |h| &h.buffer),
@@ -896,8 +887,6 @@ impl SceneDerivation for SceneJoin {
                                 entry(15, bound[14]),
                                 entry(16, bound[15]),
                                 entry(17, bound[16]),
-                                entry(18, bound[17]),
-                                entry(19, bound[18]),
                             ],
                         });
                         self.mesh_bind =

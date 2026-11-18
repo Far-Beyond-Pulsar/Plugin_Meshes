@@ -43,9 +43,6 @@ pub fn object(center: [f32; 3], radius: f32) -> StaticObjectRow {
         graph_hash_lo: 0,
         graph_hash_hi: 0,
         flags: 0,
-        skin_vertex_offset: 0,
-        bone_palette_offset: 0,
-        bone_palette_count: 0,
         section_index: 0,
     }
 }

@@ -7,6 +7,7 @@
 //!use material_surface
 //!use mesh_draw_rows
 //!use mesh_skinning
+//!use frame_ray_stream
 
 // The meshes' forward program: lit in its drawer by the lights' forward
 // function. A material class's template (its surface function) is composed

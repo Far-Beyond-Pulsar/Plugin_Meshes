@@ -238,10 +238,6 @@ struct GpuInstanceDataOut {
     material_id: u32,
     flags: u32,
     object_row: u32,
-    skin_vertex_offset: u32,
-    bone_palette_offset: u32,
-    bone_palette_count: u32,
-    _skin_pad: u32,
 }
 // Layout mirrors `GpuAabb` in indirect_dispatch.wgsl (32 bytes: min, pad, max, pad).
 struct GpuInstanceAabbOut {
@@ -286,10 +282,6 @@ fn gather_one(i: u32, src: u32) {
         row.material_slot,
         row_flags,
         src,
-        row.skin_vertex_offset,
-        row.bone_palette_offset,
-        row.bone_palette_count,
-        0u,
     );
     // Conservative world AABB: the bounding sphere's box.
     let r = row.bounds[3];

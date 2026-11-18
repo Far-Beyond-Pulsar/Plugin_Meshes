@@ -98,10 +98,10 @@ fn read_words(g: &Gpu, src: &wgpu::Buffer, words: u64) -> Vec<u32> {
     v
 }
 
-/// A `StaticObjectRow` (63 words): the cull reads `transform` (words 4..20), the
+/// A `StaticObjectRow` (60 words): the cull reads `transform` (words 4..20), the
 /// instance BVH `mesh_generation` (1) and `bounds` (48..52).
-fn object_row(m: [f32; 16], bounds: [f32; 4]) -> [u32; 63] {
-    let mut w = [0u32; 63];
+fn object_row(m: [f32; 16], bounds: [f32; 4]) -> [u32; 60] {
+    let mut w = [0u32; 60];
     w[1] = 1; // mesh_generation: live row (the instance BVH skips dead rows)
     for i in 0..4 {
         w[48 + i] = bounds[i].to_bits();

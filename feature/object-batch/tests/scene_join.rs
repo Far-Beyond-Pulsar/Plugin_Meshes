@@ -35,8 +35,6 @@ const KEYS: SceneJoinKeys = SceneJoinKeys {
     mesh_bounds: BufferKey::of("t_bounds"),
     mesh_flags: BufferKey::of("t_flags"),
     section_handles: BufferKey::of("t_section_handles"),
-    skin_handles: BufferKey::of("t_skin_handles"),
-    palette_handles: BufferKey::of("t_palette_handles"),
     mesh_sections: BufferKey::of("t_sections"),
     material_row_handles: BufferKey::of("t_material_row_handles"),
     material_rows: BufferKey::of("t_material_rows"),

@@ -21,8 +21,8 @@ pub fn hw_bin_for_tris(tris: u32) -> usize {
 pub const VIS_EMPTY: u32 = 0xffff_ffff;
 
 /// Stride of one row of the scene join's `static_objects` buffer
-/// (`StaticObjectRow`, 63 words). Only `transform` (words 4..20) is read.
-pub const OBJECT_STRIDE: u64 = 252;
+/// (`StaticObjectRow`, 60 words). Only `transform` (words 4..20) is read.
+pub const OBJECT_STRIDE: u64 = 240;
 
 /// One `draw_indirect` argument block (wgpu `DrawIndirectArgs` layout). 16 bytes.
 #[repr(C)]
@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(sw_dispatch_args(5), [5, 1, 1]);
         assert_eq!(sw_dispatch_args(32768), [32768, 1, 1]);
         assert_eq!(sw_dispatch_args(70000), [32768, 3, 1]);
-        assert_eq!(OBJECT_STRIDE, 252);
+        assert_eq!(OBJECT_STRIDE, 240);
         assert_eq!(std::mem::size_of::<VgRasterParams>(), 32);
     }
 }

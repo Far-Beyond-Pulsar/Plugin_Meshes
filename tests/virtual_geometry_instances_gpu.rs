@@ -92,10 +92,10 @@ fn read<T: bytemuck::Pod>(
     out
 }
 
-/// A `static_objects` row (63 words): mesh slot, generation, and a model
+/// A `static_objects` row (60 words): mesh slot, generation, and a model
 /// matrix with the given axis scales.
-fn object_row(slot: u32, mesh_generation: u32, scale: [f32; 3]) -> [u32; 63] {
-    let mut row = [0u32; 63];
+fn object_row(slot: u32, mesh_generation: u32, scale: [f32; 3]) -> [u32; 60] {
+    let mut row = [0u32; 60];
     row[0] = slot;
     row[1] = mesh_generation;
     let model = [
@@ -135,7 +135,7 @@ fn scene(device: &wgpu::Device, queue: &wgpu::Queue, asset_generation: u64) -> S
     let vertex_offsets = [100u32, 200, 300, 100, 100, 999, 100, 100];
     let vertex_handles: Vec<[u32; 2]> = vertex_offsets.iter().map(|&o| [o, 24]).collect();
 
-    let mut objects: Vec<[u32; 63]> = (0..8).map(|i| object_row(i, 8, [1.0; 3])).collect();
+    let mut objects: Vec<[u32; 60]> = (0..8).map(|i| object_row(i, 8, [1.0; 3])).collect();
     objects[3] = object_row(3, 8, [-1.0, 1.0, 1.0]); // mirrored
     objects[6] = object_row(6, 8, [1.0, 2.0, 1.0]); // non-uniform
     objects[7] = object_row(7, 0, [1.0; 3]); // not placed by the join

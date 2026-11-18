@@ -901,7 +901,8 @@ impl AppState {
         // (confirmed via ObjectBatchPass reporting instance_count=0/
         // draw_count=0 even with valid StaticObjectComponent rows present).
         v3_demo_common::flush_scene_db(&self.scene_db, &self.queue);
-        self.rays.publish(&self.scene_db.world, &mut renderer);
+        self.rays
+            .publish(&self.scene_db.world, &mut renderer, &camera);
 
         if std::env::var_os("HELIO_CAPTURE").is_some() {
             let output = match self.surface.get_current_texture() {

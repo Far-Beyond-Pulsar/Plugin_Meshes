@@ -1,5 +1,6 @@
 //!use mesh_draw_rows
 //!use mesh_skinning
+//!use frame_ray_stream
 //!use shadow_atlas
 //!use material_row
 // Coloured shadow transmittance — translucent casters (stained glass).

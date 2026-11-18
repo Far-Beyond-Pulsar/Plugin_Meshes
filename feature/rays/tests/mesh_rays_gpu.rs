@@ -1322,7 +1322,7 @@ fn a_skinned_instance_is_traced_where_its_pose_puts_it() {
         rest.iter()
             .map(|&p| helio_mesh_api::SkinnedVertex {
                 position: m.transform_point3(p).to_array(),
-                normal: snorm8(n),
+                normal: stream::pack_unit(n.to_array()),
                 previous: p.to_array(),
                 tangent: 0,
             })
@@ -1425,7 +1425,7 @@ fn a_skinned_instance_is_traced_where_its_pose_puts_it() {
             );
             let got = Vec3::from(stream::unpack_unit(traced.surfaces[k].normal));
             assert!(
-                angle(got, n) < 0.02,
+                angle(got, n) < 1e-3,
                 "{what}, ray {k}: normal {got} want {n}"
             );
         }
@@ -1872,5 +1872,78 @@ mod graph {
         }
         let error = pollster::block_on(errors.pop());
         assert!(error.is_none(), "{error:?}");
+    }
+
+    /// The standalone projection (`SceneDbRayTracing`) culls by distance and
+    /// angle from the eye its host gives, and the meshes' tracer then sees
+    /// only what it holds: a 1 m box 1 km away (0.11 degrees) is left out,
+    /// a 40 m wall at the same distance (2.3 degrees) and a box near the eye
+    /// are traced; without an eye every object is.
+    #[test]
+    fn the_standalone_projection_traces_what_its_culling_keeps() {
+        let Some(gpu) = gpu() else { return };
+        let mut scene = scene_db(&gpu.device, &Arc::new(gpu.queue.clone()));
+        let world = &mut scene.world;
+        spawn_box(world, Vec3::new(0.0, 0.0, -5.0), Vec3::splat(1.0), [0.5; 3]);
+        spawn_box(
+            world,
+            Vec3::new(1000.0, 0.0, 0.0),
+            Vec3::splat(0.5),
+            [0.5; 3],
+        );
+        spawn_box(
+            world,
+            Vec3::new(0.0, 0.0, 1000.0),
+            Vec3::new(20.0, 20.0, 0.5),
+            [0.5; 3],
+        );
+        world.flush_gpu_mirror(&gpu.queue);
+        let mut projection =
+            SceneDbRayTracing::partial(gpu.device.clone(), Arc::new(gpu.queue.clone()));
+        let rays = [
+            ray(Vec3::ZERO, -Vec3::Z, 2000.0, 0.0, MASK_ALL),
+            ray(Vec3::ZERO, Vec3::X, 2000.0, 0.0, MASK_ALL),
+            ray(Vec3::ZERO, Vec3::Z, 2000.0, 0.0, MASK_ALL),
+        ];
+        let table = materials(gpu, &[material(0.5, 0.0); 4]);
+        let store = world.gpu_mirror().unwrap().store();
+        let pool = |key: helio_core::BufferKey| store.resolve_buffer_handle(key).unwrap().buffer;
+        let (vertices, indices) = (
+            pool(helio_mesh_api::MESH_VERTICES.key()),
+            pool(helio_mesh_api::MESH_INDICES.key()),
+        );
+        let shoot = |projection: &mut SceneDbRayTracing| {
+            projection.prepare(world).unwrap();
+            let scene_rays = projection.scene_rays().unwrap();
+            let scene = MeshRayScene {
+                tlas: &scene_rays.tlas,
+                instances: scene_rays.buffer(helio_mesh_api::RAY_INSTANCES).unwrap(),
+                vertices: &vertices,
+                indices: &indices,
+                proxies: None,
+                skinned: None,
+            };
+            let traced = trace_scene(gpu, &rays, scene, &table);
+            traced.hits.iter().map(|h| h.t).collect::<Vec<f32>>()
+        };
+        projection.set_view(
+            Some(glam::DVec3::ZERO),
+            helio_mesh_api::RayTracingSettings::default(),
+        );
+        let culled = shoot(&mut projection);
+        assert_eq!(projection.culled_count(), 1, "the far small box");
+        assert!((culled[0] - 4.0).abs() < 1e-3, "the near box: {culled:?}");
+        assert_eq!(culled[1], 0.0, "the far small box is culled: {culled:?}");
+        assert!(
+            (culled[2] - 999.5).abs() < 1e-2,
+            "the far wall stays: {culled:?}"
+        );
+        projection.set_view(None, helio_mesh_api::RayTracingSettings::default());
+        let all = shoot(&mut projection);
+        assert_eq!(projection.culled_count(), 0);
+        assert!(
+            (all[1] - 999.5).abs() < 1e-2,
+            "every object without an eye: {all:?}"
+        );
     }
 }

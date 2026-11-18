@@ -31,10 +31,10 @@ struct Uniforms {
 }
 
 const F32_MAX: f32 = 3.4028235e38;
-// `static_objects` rows are 252 bytes = 63 words:
+// `static_objects` rows are 240 bytes = 60 words:
 // word 0 mesh_slot, word 1 mesh_generation, words 4..20 the model matrix
 // (column-major, four columns of four).
-const OBJECT_WORDS: u32 = 63u;
+const OBJECT_WORDS: u32 = 60u;
 const NO_ASSET: u32 = 0xffffffffu;
 const ASSET_READY_BIT: u32 = 1u;
 const OVERRIDE_PRESENT: u32 = 0x80000000u;

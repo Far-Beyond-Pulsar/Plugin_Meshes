@@ -7,6 +7,7 @@ enable wgpu_binding_array;
 //!use material_surface
 //!use mesh_draw_rows
 //!use mesh_skinning
+//!use frame_ray_stream
 //!use lightmap_regions
 //!use portal_chain
 
@@ -236,7 +237,7 @@ fn mesh_vertex(
         || any(inst.prev_model[2] != inst.transform[2]) || any(inst.prev_model[3] != inst.transform[3])
         || any(space_prev[0] != space[0]) || any(space_prev[1] != space[1])
         || any(space_prev[2] != space[2]) || any(space_prev[3] != space[3]);
-    out.moving = select(0u, 1u, moved || inst.bone_palette_count > 0u);
+    out.moving = select(0u, 1u, moved || (inst.flags & INSTANCE_FLAG_SKINNED) != 0u);
     
     // The object's lightmap atlas UV, as the surface payload, when the graph
     // requested it (baked lighting's `LIGHTMAP_UV`); otherwise the plain tag.

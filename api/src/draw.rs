@@ -57,6 +57,11 @@ pub const INSTANCE_FLAG_MOVABLE: u32 = 1 << 3;
 /// `classic_suppressed` (one `u32` per `static_objects` row).
 pub const INSTANCE_FLAG_CLASSIC_SUPPRESSED: u32 = 1 << 4;
 
+/// A skinned instance: its vertices this frame are in the skin cache
+/// (`crate::SKIN_CACHE`, found by its `mesh_id` in `crate::SKIN_CACHE_ROWS`),
+/// not the mesh pool. Set by the skinned mesh's draw rows.
+pub const INSTANCE_FLAG_SKINNED: u32 = 1 << 5;
+
 /// Bit offset of the coordinate-space id within [`GpuInstanceData::flags`].
 ///
 /// # Coordinate spaces
@@ -99,7 +104,7 @@ pub const fn coordinate_space(flags: u32) -> u32 {
     (flags & INSTANCE_COORDINATE_SPACE_MASK) >> INSTANCE_COORDINATE_SPACE_SHIFT
 }
 
-/// Per-instance data for GPU-driven rendering. 224 bytes.
+/// Per-instance data for GPU-driven rendering. 208 bytes.
 ///
 /// Uploaded once when instances change (dirty tracking), then read-only on GPU.
 /// The vertex shader uses `instance_index` to look up this data from a storage buffer.
@@ -141,13 +146,6 @@ pub struct GpuInstanceData {
     /// data other kinds publish is indexed by (baked lighting's lightmap
     /// regions, `helio_bake_api::LIGHTMAP_REGIONS`).
     pub object_row: u32,
-    /// Base vertex in the skeletal four-influence stream (zero for rigid meshes).
-    pub skin_vertex_offset: u32,
-    /// Base matrix in the shared skeletal palette pool.
-    pub bone_palette_offset: u32,
-    /// Number of matrices available to this instance.
-    pub bone_palette_count: u32,
-    pub _skin_pad: u32,
 }
 
 /// Per-instance AABB in world space for GPU culling. 32 bytes.
