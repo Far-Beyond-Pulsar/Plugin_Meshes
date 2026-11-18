@@ -21,8 +21,8 @@ impl Feature for ForwardDrawers {
         registrar.consumes(helio_mesh_api::MESH_VERTICES);
         registrar.consumes(helio_mats::MATERIALS);
         registrar.consumes(helio_light_api::SCENE_LIGHTS);
-        registrar.consumes(helio_mesh_api::BONE_PALETTE);
-        registrar.consumes(helio_mesh_api::SKIN_VERTICES);
+        registrar.consumes(helio_mesh_api::SKIN_CACHE_ROWS);
+        registrar.consumes(helio_mesh_api::SKIN_CACHE);
         registrar.node(
             pass_node(
                 "forward_lit",

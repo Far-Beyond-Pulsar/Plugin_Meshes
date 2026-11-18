@@ -12,8 +12,9 @@
 @group(0) @binding(1) var<storage, read> instance_data: array<GpuInstanceData>;
 @group(0) @binding(2) var<storage, read> compacted_indices: array<u32>;
 @group(0) @binding(3) var<storage, read> coordinate_spaces: array<mat4x4<f32>>;
-@group(0) @binding(4) var<storage, read> skin_vertices: array<SkinVertex>;
-@group(0) @binding(5) var<storage, read> bone_palette: array<mat4x4<f32>>;
+// The skin cache (`helio_mesh_api::SKIN_CACHE`, `mesh_skinning`).
+@group(0) @binding(4) var<storage, read> skin_cache: array<SkinnedVertex>;
+@group(0) @binding(5) var<storage, read> skin_cache_rows: array<SkinCacheRow>;
 
 // `slot` is per-instance vertex data, offset by the draw's `first_instance`
 // on every backend (`helio_mesh_api::draw_slots`): an index into

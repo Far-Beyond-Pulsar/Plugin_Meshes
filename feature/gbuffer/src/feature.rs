@@ -21,8 +21,8 @@ impl Feature for GBufferDrawers {
         registrar.consumes(helio_mesh_api::MESH_VERTICES);
         registrar.consumes(helio_mats::MATERIALS);
         registrar.consumes(helio_light_api::SCENE_LIGHTS);
-        registrar.consumes(helio_mesh_api::BONE_PALETTE);
-        registrar.consumes(helio_mesh_api::SKIN_VERTICES);
+        registrar.consumes(helio_mesh_api::SKIN_CACHE_ROWS);
+        registrar.consumes(helio_mesh_api::SKIN_CACHE);
         registrar.node(
             pass_node(
                 helio_frame_api::gbuffer::GROUP,
@@ -92,8 +92,8 @@ impl Feature for SelectionDrawers {
         registrar.consumes(helio_frame_api::selection::OBJECT_SELECTED);
         registrar.consumes(helio_mesh_api::MESH_INDICES);
         registrar.consumes(helio_mesh_api::MESH_VERTICES);
-        registrar.consumes(helio_mesh_api::BONE_PALETTE);
-        registrar.consumes(helio_mesh_api::SKIN_VERTICES);
+        registrar.consumes(helio_mesh_api::SKIN_CACHE_ROWS);
+        registrar.consumes(helio_mesh_api::SKIN_CACHE);
         {
             use helio_core::graph::type_name_of as name;
             registrar.swap_group(&[

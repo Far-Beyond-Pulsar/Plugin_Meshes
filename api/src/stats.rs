@@ -17,3 +17,18 @@ pub const DRAWS: &str = "meshes.draws";
 pub const SHADOW_BATCHES: &str = "meshes.shadow_batches";
 /// Issued draws holding a shadow caster.
 pub const SHADOW_DRAWS: &str = "meshes.shadow_draws";
+
+/// Bytes of the skin cache: its vertices (resident skinned instances'
+/// posed vertices) and its instance table.
+pub const SKIN_CACHE_BYTES: &str = "meshes.skin_cache_bytes";
+/// Skinned instances the skin cache holds.
+pub const SKIN_CACHE_INSTANCES: &str = "meshes.skin_cache_instances";
+/// Skinned instances the skin pass posed this frame (their pose changed).
+pub const SKIN_CACHE_UPDATED: &str = "meshes.skin_cache_updated";
+/// Vertices the skin pass wrote this frame (posed and settled).
+pub const SKIN_CACHE_VERTICES: &str = "meshes.skin_cache_vertices";
+/// Instances the meshes' ray-traced scene holds this frame (its TLAS).
+pub const RAY_INSTANCES: &str = "meshes.ray_instances";
+/// Instances the ray-tracing culling left out this frame (past the culling
+/// radius and smaller than the culling angle).
+pub const RAY_INSTANCES_CULLED: &str = "meshes.ray_instances_culled";

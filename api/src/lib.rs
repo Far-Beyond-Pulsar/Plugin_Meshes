@@ -37,11 +37,14 @@ pub use indirect_draw::{multi_draw_indexed_indirect, GpuDrawCount, DRAW_INDEXED_
 pub use object_batch_frame_data::{IndirectDispatchArgs, ObjectBatchFrameData};
 pub use portal_occurrence_frame_data::{PortalOccurrenceFrameData, PORTAL_OCCURRENCES};
 pub use rows::{
-    RenderGroupRow, SkinVertex, StaticObjectRow, BONE_PALETTE, CLASSIC_SUPPRESSED, MESH_INDICES,
-    MESH_VERTICES, OBJECTS_MOVED, OBJECTS_STRUCTURE, RENDER_GROUPS, SKELETAL_BONE_PALETTE,
-    SKELETAL_SKIN_VERTICES, SKIN_VERTICES, STATIC_OBJECTS, STATIC_OBJECT_OWNERS, VG_INSTANCES,
-    VG_INSTANCE_ROWS,
+    RenderGroupRow, SkinCacheRow, SkinVertex, SkinnedVertex, StaticObjectRow, BONE_PALETTE,
+    CLASSIC_SUPPRESSED, MESH_INDICES, MESH_VERTICES, OBJECTS_MOVED, OBJECTS_STRUCTURE,
+    RENDER_GROUPS, SKELETAL_BONE_PALETTE, SKELETAL_SKIN_VERTICES, SKIN_CACHE, SKIN_CACHE_ROWS,
+    SKIN_VERTICES, STATIC_OBJECTS, STATIC_OBJECT_OWNERS, VG_INSTANCES, VG_INSTANCE_ROWS,
 };
+pub use settings::{RayTracingSettings, RAY_TRACING};
+
+mod settings;
 
 /// The meshes' surfaces as rays see them, for a tracer's WGSL
 /// (`//!use mesh_ray_surface`): the [`RayInstance`] row and its flags, the
@@ -51,7 +54,9 @@ pub use rows::{
 /// ([`RAY_INSTANCES`]), `vertices: array<u32>` and `indices: array<u32>`
 /// (the mesh pools, [`MESH_VERTICES`] / [`MESH_INDICES`]),
 /// `proxy_vertices: array<f32>` and `proxy_indices: array<u32>`
-/// ([`RAY_PROXY_VERTICES`] / [`RAY_PROXY_INDICES`]).
+/// ([`RAY_PROXY_VERTICES`] / [`RAY_PROXY_INDICES`]) and
+/// `skinned_vertices: array<u32>` (the skin cache, [`RAY_SKINNED_VERTICES`],
+/// [`SkinnedVertex`] words).
 pub const RAY_SURFACE_SNIPPET: helio_core::shader::ShaderSnippet =
     helio_core::wgsl_snippet!("//!use mesh_ray_surface", "shaders/ray_surface.wgsl");
 
@@ -68,11 +73,14 @@ pub const DRAW_ROWS_SNIPPET: helio_core::shader::ShaderSnippet =
 pub const OBJECT_ROW_SNIPPET: helio_core::shader::ShaderSnippet =
     helio_core::wgsl_snippet!("//!use mesh_object_row", "shaders/object_row.wgsl");
 
-/// The meshes' skinning in WGSL (`//!use mesh_skinning`): `SkinVertex` and
-/// `mesh_skinned_position`, a skinned instance's vertex position blended from
-/// the palette. The includer binds `skin_vertices` ([`SKIN_VERTICES`]) and
-/// `bone_palette` ([`BONE_PALETTE`]) and declares `GpuInstanceData`
-/// ([`DRAW_ROWS_SNIPPET`]).
+/// The meshes' skinning in WGSL (`//!use mesh_skinning`): the skin cache's
+/// rows ([`SkinnedVertex`], [`SkinCacheRow`]) and what a drawer reads,
+/// `mesh_skinned_vertex` / `mesh_skinned_position` (a skinned instance's
+/// vertex this frame and last, from the cache; the palette is blended only
+/// by the meshes' skin pass, which writes the cache). A drawer
+/// binds `skin_cache: array<SkinnedVertex>` ([`SKIN_CACHE`]) and
+/// `skin_cache_rows: array<SkinCacheRow>` ([`SKIN_CACHE_ROWS`]) and declares
+/// `GpuInstanceData` ([`DRAW_ROWS_SNIPPET`]).
 pub const SKINNING_SNIPPET: helio_core::shader::ShaderSnippet =
     helio_core::wgsl_snippet!("//!use mesh_skinning", "shaders/skinning.wgsl");
 
@@ -128,8 +136,23 @@ pub struct RayInstance {
     /// The radiance it gives off (RGB: colour times strength).
     pub emissive: [f32; 4],
     /// The linear RGB share of light it lets through (zero: opaque).
-    pub transmission: [f32; 4],
+    pub transmission: [f32; 3],
+    /// For a [`RAY_INSTANCE_SKINNED`] instance, its first vertex in the skin
+    /// cache ([`RAY_SKINNED_VERTICES`]): triangle corners and normals are read
+    /// there (mesh-local index plus this), UVs from the mesh pool as for any
+    /// mesh. Zero otherwise.
+    pub skinned_vertex: u32,
 }
+
+/// [`RayInstance::flags`]: a skinned instance, its positions and normals
+/// in the skin cache at [`RayInstance::skinned_vertex`] (the pose its BLAS
+/// was last refit to, a frame stale at most when the refit budget defers it).
+pub const RAY_INSTANCE_SKINNED: u32 = 8;
+
+/// Graph key of the skin cache as the frame's ray-traced scene publishes it
+/// beside its TLAS ([`SKIN_CACHE`]'s buffer): the vertices of the skinned
+/// instances it traces.
+pub const RAY_SKINNED_VERTICES: &str = "ray_skinned_vertices";
 
 /// [`RayInstance::flags`]: the instance's triangles are in the frame's proxy
 /// pool ([`RAY_PROXY_VERTICES`]), not the scene's mesh pools.

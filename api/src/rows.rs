@@ -108,8 +108,8 @@ unsafe impl pulsar_scenedb::Pod for StaticObjectRow {}
 /// The skinned meshes' per-vertex skin influences (a variable-length pool
 /// the skinned drawers read by instance range).
 pub const SKELETAL_SKIN_VERTICES: &str = "skeletal_skin_vertices";
-/// The skinned meshes' bone palettes: each instance's current palette
-/// followed by its previous frame's, in one variable-length range.
+/// The skinned meshes' bone palettes: each instance's current palette, in
+/// one variable-length range.
 pub const SKELETAL_BONE_PALETTE: &str = "skeletal_bone_palette";
 /// The virtual-geometry instance rows (`GpuVgInstance`), one per VG-active
 /// instance, which the VG host derives and the VG passes read.
@@ -131,10 +131,55 @@ unsafe impl pulsar_scenedb::page::Pod for SkinVertex {}
 pub const SKIN_VERTICES: helio_core::PoolContract<SkinVertex> =
     helio_core::PoolContract::new(SKELETAL_SKIN_VERTICES);
 
-/// [`SKELETAL_BONE_PALETTE`] as a contract: a pool of joint matrices (the
-/// current palette followed by the previous frame's, per instance).
+/// [`SKELETAL_BONE_PALETTE`] as a contract: a pool of joint matrices, each
+/// skinned instance's current palette (one matrix a joint). Read by the skin
+/// cache's pass, never by a drawer.
 pub const BONE_PALETTE: helio_core::PoolContract<[[f32; 4]; 4]> =
     helio_core::PoolContract::new(SKELETAL_BONE_PALETTE);
+
+/// A vertex of the skin cache ([`SKIN_CACHE`]): a skinned instance's vertex
+/// as its pose places it this frame, in the mesh's space. 32 bytes, the
+/// position first, so a deforming BLAS builds from the cache directly (a
+/// `Float32x3` at stride 32).
+///
+/// The normal and tangent are snorm8x4 as in [`crate::PackedVertex`] (the
+/// rest vertex's own precision, as Unreal's skin cache writes its tangent
+/// stream in the input's format); `previous` is the position the cache held
+/// before this frame's pose, for motion vectors.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SkinnedVertex {
+    pub position: [f32; 3],
+    pub normal: u32,
+    pub previous: [f32; 3],
+    pub tangent: u32,
+}
+
+/// A row of [`SKIN_CACHE_ROWS`], by mesh-instance entity row (the instance
+/// rows' `mesh_id`): where that instance's vertices are in the cache.
+/// Mesh-pool vertex `v` of the instance is cache vertex `v + offset`
+/// (wrapping, as the instance rows' offsets are); `resident` is 0 for an
+/// instance the cache does not hold (it draws its rest pose).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SkinCacheRow {
+    pub offset: u32,
+    pub resident: u32,
+}
+
+/// The skin cache: every resident skinned instance's vertices this frame
+/// ([`SkinnedVertex`]), written once a frame for the instances whose pose
+/// changed by the meshes' skin pass and read by everything that draws or
+/// traces a skinned mesh (the G-buffer, shadow, forward, transparent and
+/// selection drawers, the deforming BLASes, the meshes' tracer). One
+/// skinning path: what is rasterised is what is traced.
+pub const SKIN_CACHE: helio_core::BufferContract<SkinnedVertex> =
+    helio_core::BufferContract::new("skin_cache");
+
+/// The skin cache's instance table ([`SkinCacheRow`] by mesh-instance
+/// entity row).
+pub const SKIN_CACHE_ROWS: helio_core::BufferContract<SkinCacheRow> =
+    helio_core::BufferContract::new("skin_cache_rows");
 
 /// [`VG_INSTANCES`] as a contract: [`helio_vg_format::GpuVgInstance`] rows.
 pub const VG_INSTANCE_ROWS: helio_core::BufferContract<helio_vg_format::GpuVgInstance> =

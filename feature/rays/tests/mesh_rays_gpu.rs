@@ -143,6 +143,7 @@ impl Scene {
             vertices: &self.vertices,
             indices: &self.indices,
             proxies: self.proxies.as_ref().map(|(v, i)| (v, i)),
+            skinned: None,
         }
     }
 }
@@ -204,7 +205,8 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
             material: q.material,
             base_color: q.base_color.extend(1.0).to_array(),
             emissive: q.emissive.extend(0.0).to_array(),
-            transmission: q.transmission.extend(0.0).to_array(),
+            transmission: q.transmission.to_array(),
+            skinned_vertex: 0,
         });
     }
     // Never-empty pools (a binding each).
@@ -1264,6 +1266,244 @@ fn a_proxy_instance_is_traced_by_its_face() {
         }
     }
     assert!(proxy_hits[0] > 30 && proxy_hits[1] > 30, "{proxy_hits:?}");
+}
+
+/// A skinned instance is traced from the skin cache (`RAY_INSTANCE_SKINNED`):
+/// its hit is where its pose put it and its surface's normal the skinned
+/// one, not the rest mesh's; a new pose refits its deforming BLAS
+/// (`Movability::Dynamic`) and the next stream sees it; an unchanged pose
+/// records nothing; the policy's refit count makes the next change a
+/// rebuild.
+#[test]
+fn a_skinned_instance_is_traced_where_its_pose_puts_it() {
+    let Some(gpu) = gpu() else { return };
+    // The rest mesh: a 2 m quad at z = 0 facing +z (UVs and normal from the
+    // mesh pool), its corners in the skin cache at poses below.
+    let rest = [
+        Vec3::new(-1.0, -1.0, 0.0),
+        Vec3::new(1.0, -1.0, 0.0),
+        Vec3::new(1.0, 1.0, 0.0),
+        Vec3::new(-1.0, 1.0, 0.0),
+    ];
+    let mut vertices = Vec::<u32>::new();
+    for (p, [s, t]) in rest
+        .iter()
+        .zip([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0f32]])
+    {
+        vertices.extend_from_slice(&[
+            p.x.to_bits(),
+            p.y.to_bits(),
+            p.z.to_bits(),
+            1f32.to_bits(),
+            s.to_bits(),
+            t.to_bits(),
+            0,
+            0,
+            snorm8(Vec3::Z),
+            0,
+        ]);
+    }
+    let usage =
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::COPY_DST;
+    let init = |label, contents: &[u8], usage| {
+        gpu.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents,
+                usage,
+            })
+    };
+    let vertex_pool = init("mesh vertices", bytemuck::cast_slice(&vertices), usage);
+    let index_pool = init("mesh indices", bytemuck::cast_slice(&QUAD_INDICES), usage);
+    // A pose: the rest quad lifted to `height` and tilted about y by `tilt`.
+    let pose = |height: f32, tilt: f32| -> Vec<helio_mesh_api::SkinnedVertex> {
+        let m = Mat4::from_translation(Vec3::Z * height) * Mat4::from_rotation_y(tilt);
+        let n = m.transform_vector3(Vec3::Z).normalize();
+        rest.iter()
+            .map(|&p| helio_mesh_api::SkinnedVertex {
+                position: m.transform_point3(p).to_array(),
+                normal: snorm8(n),
+                previous: p.to_array(),
+                tangent: 0,
+            })
+            .collect()
+    };
+    let skinned = init(
+        "skin cache",
+        bytemuck::cast_slice(&pose(1.0, 0.0)),
+        usage | wgpu::BufferUsages::COPY_SRC,
+    );
+    let rows = [RayInstance {
+        first_index: 0,
+        base_vertex: 0,
+        flags: helio_mesh_api::RAY_INSTANCE_SKINNED,
+        material: 0,
+        base_color: [0.5, 0.5, 0.5, 1.0],
+        emissive: [0.0; 4],
+        transmission: [0.0; 3],
+        skinned_vertex: 0,
+    }];
+    let instances = init(
+        "ray instances",
+        bytemuck::cast_slice(&rows),
+        wgpu::BufferUsages::STORAGE,
+    );
+    let mut blas = BlasManager::new(gpu.device.clone());
+    blas.set_policy(helio_core::BlasPolicy {
+        refits_per_rebuild: 2,
+        ..Default::default()
+    });
+    let mut tlas = TlasManager::new(gpu.device.clone(), 1);
+    let instance = [TlasInstanceInput {
+        geometry_id: 0,
+        custom_data: 0,
+        transform: tlas_transform(Mat4::IDENTITY),
+    }];
+    // Build (or refit) the BLAS at `revision` from the skin cache, then the
+    // TLAS; what the BLAS manager recorded.
+    let build = |blas: &mut BlasManager, tlas: &mut TlasManager, revision: u64| {
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let work = blas
+            .build(
+                0,
+                &mut encoder,
+                vec![BlasSegment {
+                    geometry: BlasGeometry {
+                        positions_revision: revision,
+                        topology_revision: 0,
+                        vertices: &skinned,
+                        first_vertex: 0,
+                        vertex_count: 4,
+                        vertex_stride: std::mem::size_of::<helio_mesh_api::SkinnedVertex>() as u64,
+                        indices: Some(&index_pool),
+                        first_index: 0,
+                        index_count: 6,
+                    },
+                    opaque: true,
+                }],
+                helio_core::Movability::Dynamic,
+            )
+            .unwrap();
+        tlas.build_masked(&mut encoder, &instance, blas, &[MASK_MOVABLE])
+            .unwrap();
+        gpu.queue.submit([encoder.finish()]);
+        (work, blas.counters())
+    };
+    let table = materials(gpu, &[material(0.5, 0.0)]);
+    let rays: Vec<SceneRay> = (0..64)
+        .map(|k| {
+            let x = (k % 8) as f32 / 8.0 - 0.45;
+            let y = (k / 8) as f32 / 8.0 - 0.45;
+            ray(Vec3::new(x, y, 10.0), -Vec3::Z, 50.0, 0.0, MASK_ALL)
+        })
+        .collect();
+    let shoot = |tlas: &TlasManager| {
+        let scene = MeshRayScene {
+            tlas: tlas.tlas().unwrap(),
+            instances: &instances,
+            vertices: &vertex_pool,
+            indices: &index_pool,
+            proxies: None,
+            skinned: Some(&skinned),
+        };
+        trace_scene(gpu, &rays, scene, &table)
+    };
+    // Expect every ray to hit the plane through height `h` at the centre
+    // tilted by `tilt` (x within half a metre: the tilt moves it by tan).
+    let check = |traced: &Traced, height: f32, tilt: f32, what: &str| {
+        let n = Vec3::new(tilt.sin(), 0.0, tilt.cos());
+        for (k, r) in rays.iter().enumerate() {
+            let hit = &traced.hits[k];
+            let o = Vec3::from(r.origin);
+            // The plane n.(p - h z) = 0 along -z from o.
+            let t = (n.dot(o) - height * n.z) / n.z;
+            assert_eq!(hit.tracer(), MESHES, "{what}, ray {k}: {hit:?}");
+            assert!(
+                (hit.t - t).abs() < 1e-3,
+                "{what}, ray {k}: t {} want {t}",
+                hit.t
+            );
+            let got = Vec3::from(stream::unpack_unit(traced.surfaces[k].normal));
+            assert!(
+                angle(got, n) < 0.02,
+                "{what}, ray {k}: normal {got} want {n}"
+            );
+        }
+    };
+
+    let (work, first) = build(&mut blas, &mut tlas, 1);
+    assert_eq!(work, helio_core::BlasWork::Built);
+    check(&shoot(&tlas), 1.0, 0.0, "first pose");
+
+    // A new pose in the cache: a refit, and the rays see it.
+    gpu.queue
+        .write_buffer(&skinned, 0, bytemuck::cast_slice(&pose(2.0, 0.4)));
+    let (work, refit) = build(&mut blas, &mut tlas, 2);
+    assert_eq!(work, helio_core::BlasWork::Refit);
+    assert_eq!(refit.refits, first.refits + 1);
+    assert_eq!(refit.builds, first.builds);
+    check(&shoot(&tlas), 2.0, 0.4, "second pose");
+
+    // The same pose: nothing recorded.
+    let (work, unchanged) = build(&mut blas, &mut tlas, 2);
+    assert_eq!(work, helio_core::BlasWork::Unchanged);
+    assert_eq!(unchanged, refit);
+
+    // The policy's count (2 refits a rebuild): the next refit, then a
+    // rebuild.
+    let (work, _) = build(&mut blas, &mut tlas, 3);
+    assert_eq!(work, helio_core::BlasWork::Refit);
+    gpu.queue
+        .write_buffer(&skinned, 0, bytemuck::cast_slice(&pose(3.0, -0.3)));
+    let (work, rebuilt) = build(&mut blas, &mut tlas, 4);
+    assert_eq!(work, helio_core::BlasWork::Built);
+    assert_eq!(rebuilt.policy_rebuilds, 1);
+    check(&shoot(&tlas), 3.0, -0.3, "after the rebuild");
+}
+
+/// [`trace`] of a nearest-hit stream against `scene` itself (a TLAS the test
+/// built).
+fn trace_scene(
+    gpu: &Gpu,
+    rays: &[SceneRay],
+    scene: MeshRayScene<'_>,
+    materials: &Materials,
+) -> Traced {
+    let stream = Stream::new(
+        "mesh_rays_test_skinned",
+        RayClass::Nearest,
+        rays.len() as u32,
+    );
+    let buffers = StreamBuffers::new(&gpu.device, &stream);
+    gpu.queue
+        .write_buffer(&buffers.rays, 0, bytemuck::cast_slice(rays));
+    buffers.set_count(&gpu.queue, rays.len() as u32);
+    let mut tracer =
+        MeshRayTracer::new(&gpu.device, &gpu.queue, RayClass::Nearest, MESHES).unwrap();
+    tracer.write_frame(1, |buffer, bytes| gpu.queue.write_buffer(buffer, 0, bytes));
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    {
+        let mut cmds = helio_core::CommandRecorder::from_encoder(&mut encoder);
+        buffers.clear(&mut cmds);
+        let views = materials.views(gpu);
+        tracer.record(
+            &gpu.device,
+            &mut cmds,
+            StreamBindings {
+                header: &buffers.header,
+                rays: &buffers.rays,
+                hits: &buffers.hits,
+                surfaces: buffers.surfaces.as_ref(),
+            },
+            Some(scene),
+            Some(materials.bindings(&views)),
+        );
+    }
+    gpu.queue.submit([encoder.finish()]);
+    Traced {
+        hits: read(gpu, &buffers.hits),
+        surfaces: read(gpu, buffers.surfaces.as_ref().unwrap()),
+    }
 }
 
 // ── In a graph ──────────────────────────────────────────────────────────────

@@ -144,6 +144,15 @@ pub(crate) fn build(p: &mut pulsar_plugins::PluginBuilder) {
         register: meshes_component::vg_settings::register,
     });
 
+    // The project's `ray_tracing` settings group: which meshes the
+    // ray-traced scene holds, and its skinned refit budget.
+    p.add(
+        pulsar_settings::project::rendering::SettingsGroupRegistration {
+            origin: p.origin(),
+            group: &helio_mesh_api::RAY_TRACING,
+        },
+    );
+
     // ── Assets ──────────────────────────────────────────────────────────────
 
     // A mesh asset dropped in a level becomes a static mesh component.

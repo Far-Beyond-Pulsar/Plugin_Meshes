@@ -1,4 +1,5 @@
 //!use shadow_atlas
+//!use mesh_draw_rows
 //!use mesh_skinning
 // Shadow caster pass — depth-only, GPU-driven.
 //
@@ -12,23 +13,6 @@
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-// Per-instance world transform.  Must match GpuInstanceData in libhelio (224 bytes).
-struct GpuInstanceData {
-    transform:    mat4x4<f32>,   // offset   0
-    normal_mat_0: vec4<f32>,     // offset  64  (unused in shadow pass)
-    normal_mat_1: vec4<f32>,     // offset  80
-    normal_mat_2: vec4<f32>,     // offset  96
-    bounds:       vec4<f32>,     // offset 112
-    prev_model:   mat4x4<f32>,   // offset 128  (unused in shadow pass)
-    mesh_id:      u32,           // offset 192
-    material_id:  u32,           // offset 196
-    flags:        u32,           // offset 200
-    _pad:         u32,           // offset 204
-    skin_vertex_offset: u32,
-    bone_palette_offset: u32,
-    bone_palette_count: u32,
-    _skin_pad: u32,
-}
 
 // Which shadow atlas face is being rendered this pass.
 // Addressed via dynamic uniform buffer offset — one 16-byte slot per face.
@@ -96,8 +80,9 @@ fn sphere_pages(m: mat4x4f, center: vec3f, radius: f32) -> vec2u {
     }
     return vec2u(lo, hi);
 }
-@group(0) @binding(5) var<storage, read> skin_vertices: array<SkinVertex>;
-@group(0) @binding(6) var<storage, read> bone_palette: array<mat4x4<f32>>;
+// The skin cache (`helio_mesh_api::SKIN_CACHE`, `mesh_skinning`).
+@group(0) @binding(5) var<storage, read> skin_cache: array<SkinnedVertex>;
+@group(0) @binding(6) var<storage, read> skin_cache_rows: array<SkinCacheRow>;
 
 struct ShadowVertex {
     @builtin(position) position: vec4<f32>,

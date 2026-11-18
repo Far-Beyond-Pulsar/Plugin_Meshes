@@ -8,6 +8,7 @@
 //   indices: array<u32>             (`helio_mesh_api::MESH_INDICES`)
 //   proxy_vertices: array<f32>      (`helio_mesh_api::RAY_PROXY_VERTICES`)
 //   proxy_indices: array<u32>       (`helio_mesh_api::RAY_PROXY_INDICES`)
+//   skinned_vertices: array<u32>    (`helio_mesh_api::RAY_SKINNED_VERTICES`)
 
 // `helio_mesh_api::RayInstance`, by TLAS instance index.
 struct RayInstance {
@@ -17,7 +18,8 @@ struct RayInstance {
     material: u32,
     base_color: vec4<f32>,
     emissive: vec4<f32>,
-    transmission: vec4<f32>,
+    transmission: vec3<f32>,
+    skinned_vertex: u32,
 }
 
 // `helio_mesh_api::RAY_INSTANCE_PROXY`: the instance's triangles are in the
@@ -27,6 +29,12 @@ const RAY_INSTANCE_PROXY: u32 = 1u;
 const RAY_INSTANCE_MASKED: u32 = 2u;
 // `helio_mesh_api::RAY_INSTANCE_TWO_SIDED`: both faces are outside.
 const RAY_INSTANCE_TWO_SIDED: u32 = 4u;
+// `helio_mesh_api::RAY_INSTANCE_SKINNED`: positions and normals in the skin
+// cache at `skinned_vertex`.
+const RAY_INSTANCE_SKINNED: u32 = 8u;
+// `helio_mesh_api::SkinnedVertex` in `u32` words: position (words 0-2), the
+// snorm8x4 normal (3).
+const SKINNED_VERTEX_WORDS: u32 = 8u;
 // `helio_mesh_api::PackedVertex` in `u32` words: position (words 0-2), UV0
 // (4-5), the snorm8x4 normal (8).
 const MESH_VERTEX_WORDS: u32 = 10u;
@@ -48,6 +56,15 @@ fn mesh_vertex_normal(v: u32) -> vec3<f32> {
     return unpack4x8snorm(vertices[v * MESH_VERTEX_WORDS + 8u]).xyz;
 }
 
+fn skinned_vertex_position(v: u32) -> vec3<f32> {
+    let at = v * SKINNED_VERTEX_WORDS;
+    return vec3<f32>(bitcast<f32>(skinned_vertices[at]), bitcast<f32>(skinned_vertices[at + 1u]), bitcast<f32>(skinned_vertices[at + 2u]));
+}
+
+fn skinned_vertex_normal(v: u32) -> vec3<f32> {
+    return unpack4x8snorm(skinned_vertices[v * SKINNED_VERTEX_WORDS + 3u]).xyz;
+}
+
 fn ray_proxy_position(v: u32) -> vec3<f32> {
     let at = RAY_PROXY_FLOATS * v;
     return vec3<f32>(proxy_vertices[at], proxy_vertices[at + 1u], proxy_vertices[at + 2u]);
@@ -59,12 +76,15 @@ fn ray_proxy_uv(v: u32) -> vec2<f32> {
 }
 
 // A hit's triangle, in object space: its corners and UV0s, its pool
-// vertices, and whether it is a proxy's (no vertex normals).
+// vertices, whether it is a proxy's (no vertex normals), and for a skinned
+// instance its skin cache vertices (where its corners and normals are).
 struct RayTriangle {
     corners: array<vec3<f32>, 3>,
     uv: array<vec2<f32>, 3>,
     vertices: vec3<u32>,
     proxy: bool,
+    skinned: bool,
+    cached: vec3<u32>,
 }
 
 // Triangle `primitive` of `instance` (a hit's `primitive_index`), from the
@@ -73,14 +93,21 @@ fn ray_triangle(instance: RayInstance, primitive: u32) -> RayTriangle {
     let base = instance.first_index + 3u * primitive;
     var t: RayTriangle;
     t.proxy = (instance.flags & RAY_INSTANCE_PROXY) != 0u;
+    t.skinned = (instance.flags & RAY_INSTANCE_SKINNED) != 0u;
     if t.proxy {
         t.vertices = vec3<u32>(proxy_indices[base], proxy_indices[base + 1u], proxy_indices[base + 2u]) + instance.base_vertex;
         t.corners = array<vec3<f32>, 3>(ray_proxy_position(t.vertices.x), ray_proxy_position(t.vertices.y), ray_proxy_position(t.vertices.z));
         t.uv = array<vec2<f32>, 3>(ray_proxy_uv(t.vertices.x), ray_proxy_uv(t.vertices.y), ray_proxy_uv(t.vertices.z));
     } else {
-        t.vertices = vec3<u32>(indices[base], indices[base + 1u], indices[base + 2u]) + instance.base_vertex;
-        t.corners = array<vec3<f32>, 3>(mesh_vertex_position(t.vertices.x), mesh_vertex_position(t.vertices.y), mesh_vertex_position(t.vertices.z));
+        let local = vec3<u32>(indices[base], indices[base + 1u], indices[base + 2u]);
+        t.vertices = local + instance.base_vertex;
         t.uv = array<vec2<f32>, 3>(mesh_vertex_uv(t.vertices.x), mesh_vertex_uv(t.vertices.y), mesh_vertex_uv(t.vertices.z));
+        if t.skinned {
+            t.cached = local + instance.skinned_vertex;
+            t.corners = array<vec3<f32>, 3>(skinned_vertex_position(t.cached.x), skinned_vertex_position(t.cached.y), skinned_vertex_position(t.cached.z));
+        } else {
+            t.corners = array<vec3<f32>, 3>(mesh_vertex_position(t.vertices.x), mesh_vertex_position(t.vertices.y), mesh_vertex_position(t.vertices.z));
+        }
     }
     return t;
 }
@@ -90,6 +117,9 @@ fn ray_triangle(instance: RayInstance, primitive: u32) -> RayTriangle {
 fn ray_triangle_outside(t: RayTriangle, b: vec3<f32>) -> vec3<f32> {
     if t.proxy {
         return cross(t.corners[1] - t.corners[0], t.corners[2] - t.corners[0]);
+    }
+    if t.skinned {
+        return skinned_vertex_normal(t.cached.x) * b.x + skinned_vertex_normal(t.cached.y) * b.y + skinned_vertex_normal(t.cached.z) * b.z;
     }
     return mesh_vertex_normal(t.vertices.x) * b.x + mesh_vertex_normal(t.vertices.y) * b.y + mesh_vertex_normal(t.vertices.z) * b.z;
 }

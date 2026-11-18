@@ -6,6 +6,7 @@ enable wgpu_binding_array;
 //!use material_row
 //!use material_surface
 //!use mesh_draw_rows
+//!use mesh_skinning
 //!use lightmap_regions
 //!use portal_chain
 
@@ -52,11 +53,6 @@ struct Globals {
     time: f32, // RADIANT_GLOBALS_TIME: seconds since start, for graph time nodes
 }
 
-struct SkinVertex {
-    joints: vec4<u32>,
-    weights: vec4<f32>,
-}
-
 // Whether the graph requested baked lighting's lightmap UV as the G-buffer's
 // surface payload (`helio_frame_api::gbuffer::payload`): the drawer then
 // writes each lightmapped object's atlas UV there.
@@ -86,8 +82,10 @@ override HELIO_VIEW_CLIP: bool = false;
 // slot here and moving the whole space with a single matrix write.
 @group(0) @binding(5) var<storage, read>    coordinate_spaces:      array<mat4x4<f32>>;
 @group(0) @binding(6) var<storage, read>    coordinate_spaces_prev: array<mat4x4<f32>>;
-@group(0) @binding(7) var<storage, read>    skin_vertices: array<SkinVertex>;
-@group(0) @binding(8) var<storage, read>    bone_palette: array<mat4x4<f32>>;
+// The skin cache (`helio_mesh_api::SKIN_CACHE`, `mesh_skinning`): a skinned
+// instance's vertices this frame and last, as the meshes' skin pass wrote them.
+@group(0) @binding(7) var<storage, read>    skin_cache: array<SkinnedVertex>;
+@group(0) @binding(8) var<storage, read>    skin_cache_rows: array<SkinCacheRow>;
 
 @group(1) @binding(0) var<storage, read>    materials:          array<GpuMaterial>;
 @group(1) @binding(1) var<storage, read>    material_textures:  array<MaterialTextureData>;
@@ -175,30 +173,13 @@ fn mesh_vertex(
     map: mat4x4<f32>,
     prev_map: mat4x4<f32>,
 ) -> VertexOutput {
-    var local_position = v.position;
-    var local_normal = decode_snorm8x4(v.normal);
-    var local_tangent = decode_snorm8x4(v.tangent);
-    if inst.bone_palette_count > 0u {
-        let skin = skin_vertices[vertex_index + inst.skin_vertex_offset];
-        var blended = mat4x4<f32>(
-            vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0));
-        var total_weight = 0.0;
-        for (var influence = 0u; influence < 4u; influence = influence + 1u) {
-            let weight = skin.weights[influence];
-            let joint = skin.joints[influence];
-            if weight > 0.0 && joint < inst.bone_palette_count {
-                blended += bone_palette[inst.bone_palette_offset + joint] * weight;
-                total_weight += weight;
-            }
-        }
-        if total_weight > 0.00001 {
-            blended = blended * (1.0 / total_weight);
-            local_position = (blended * vec4<f32>(v.position, 1.0)).xyz;
-            let skin_normal = mat3x3<f32>(blended[0].xyz, blended[1].xyz, blended[2].xyz);
-            local_normal = normalize(skin_normal * local_normal);
-            local_tangent = normalize(skin_normal * local_tangent);
-        }
-    }
+    // A skinned instance's vertex from the skin cache (its pose this frame
+    // and last); a rigid one's as it is.
+    let skinned = mesh_skinned_vertex(
+        inst, vertex_index, v.position, decode_snorm8x4(v.normal), decode_snorm8x4(v.tangent));
+    let local_position = skinned.position;
+    let local_normal = skinned.normal;
+    let local_tangent = skinned.tangent;
 
     // Coordinate space: world space (slot 0, identity) for the overwhelming
     // common case, or wherever a sublevel/portal has placed this instance.
@@ -233,24 +214,7 @@ fn mesh_vertex(
     // Previous-frame clip position for velocity buffer. Uses the coordinate
     // space's own previous-frame transform so a moving sublevel/portal still
     // produces correct motion vectors instead of a false one-frame pop.
-    var prev_local_position = v.position;
-    if inst.bone_palette_count > 0u {
-        let skin = skin_vertices[vertex_index + inst.skin_vertex_offset];
-        var prev_blended = mat4x4<f32>(
-            vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0));
-        var prev_total_weight = 0.0;
-        for (var influence = 0u; influence < 4u; influence = influence + 1u) {
-            let weight = skin.weights[influence];
-            let joint = skin.joints[influence];
-            if weight > 0.0 && joint < inst.bone_palette_count {
-                prev_blended += bone_palette[inst.bone_palette_offset + inst.bone_palette_count + joint] * weight;
-                prev_total_weight += weight;
-            }
-        }
-        if prev_total_weight > 0.00001 {
-            prev_local_position = (prev_blended * (1.0 / prev_total_weight) * vec4<f32>(v.position, 1.0)).xyz;
-        }
-    }
+    let prev_local_position = skinned.previous;
     let prev_world  = prev_map * (space_prev * (inst.prev_model * vec4<f32>(prev_local_position, 1.0)));
     let prev_clip   = cameras[0].prev_view_proj * prev_world;
 

@@ -145,9 +145,10 @@ pub struct GBufferPass {
 /// composed after it.
 pub const GBUFFER_PROGRAM: &str = include_str!("../shaders/gbuffer.wgsl");
 /// The snippets [`GBUFFER_PROGRAM`] composes with: the meshes' draw rows and
-/// the frame's G-buffer output.
-pub const GBUFFER_PROGRAM_SNIPPETS: [helio_core::shader::ShaderSnippet; 4] = [
+/// skin cache, and the frame's G-buffer output.
+pub const GBUFFER_PROGRAM_SNIPPETS: [helio_core::shader::ShaderSnippet; 5] = [
     helio_mesh_api::DRAW_ROWS_SNIPPET,
+    helio_mesh_api::SKINNING_SNIPPET,
     helio_frame_api::gbuffer::OUTPUT_SNIPPET,
     helio_bake_api::LIGHTMAP_REGIONS_SNIPPET,
     helio_portal_api::PORTAL_CHAIN_SNIPPET,
@@ -451,8 +452,8 @@ impl RenderPass for GBufferPass {
             helio_mesh_api::MESH_VERTICES.name(),
             helio_mats::MATERIALS.name(),
             helio_light_api::SCENE_LIGHTS.name(),
-            helio_mesh_api::BONE_PALETTE.name(),
-            helio_mesh_api::SKIN_VERTICES.name(),
+            helio_mesh_api::SKIN_CACHE_ROWS.name(),
+            helio_mesh_api::SKIN_CACHE.name(),
         ];
         LIST
     }
@@ -884,8 +885,8 @@ impl RenderPass for GBufferPass {
         let coordinate_spaces_prev_buf = coord_spaces
             .map(|c| c.coordinate_spaces_prev)
             .unwrap_or(ctx.camera);
-        let skin_handle = ctx.scene_buffers.get(helio_mesh_api::SKIN_VERTICES.key());
-        let palette_handle = ctx.scene_buffers.get(helio_mesh_api::BONE_PALETTE.key());
+        let skin_handle = ctx.scene_buffers.get(helio_mesh_api::SKIN_CACHE.key());
+        let palette_handle = ctx.scene_buffers.get(helio_mesh_api::SKIN_CACHE_ROWS.key());
         let skin_buf = skin_handle
             .map(|handle| &handle.buffer)
             .unwrap_or(&self.fallback_skeletal_storage);

@@ -143,8 +143,8 @@ pub struct StreamBindings<'a> {
 }
 
 /// The meshes as rays see them this frame: the TLAS, its instance rows
-/// (`helio_mesh_api::RAY_INSTANCES`), the scene's mesh pools and the proxy
-/// pool, if any.
+/// (`helio_mesh_api::RAY_INSTANCES`), the scene's mesh pools, the proxy
+/// pool and the skin cache (`helio_mesh_api::RAY_SKINNED_VERTICES`), if any.
 #[derive(Clone, Copy)]
 pub struct MeshRayScene<'a> {
     pub tlas: &'a wgpu::Tlas,
@@ -152,6 +152,7 @@ pub struct MeshRayScene<'a> {
     pub vertices: &'a wgpu::Buffer,
     pub indices: &'a wgpu::Buffer,
     pub proxies: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
+    pub skinned: Option<&'a wgpu::Buffer>,
 }
 
 /// The pipelines and stand-ins every stream's pass shares (one set a graph).
@@ -241,6 +242,7 @@ impl Pipelines {
             storage(7, true),
             storage(8, true),
             storage(9, true),
+            storage(11, true),
         ];
         let occlusion_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Mesh rays (occlusion)"),
@@ -343,7 +345,7 @@ fn materials_group(
 /// Group 0's inputs, by identity: header, rays, hits, instances, vertices,
 /// indices, proxy vertices, proxy indices; the surfaces; the TLAS.
 struct Inputs {
-    buffers: [wgpu::Buffer; 8],
+    buffers: [wgpu::Buffer; 9],
     surfaces: Option<wgpu::Buffer>,
     tlas: wgpu::Tlas,
 }
@@ -351,7 +353,7 @@ struct Inputs {
 impl Inputs {
     fn matches(
         &self,
-        buffers: &[&wgpu::Buffer; 8],
+        buffers: &[&wgpu::Buffer; 9],
         surfaces: Option<&wgpu::Buffer>,
         tlas: &wgpu::Tlas,
     ) -> bool {
@@ -450,6 +452,7 @@ impl MeshRayTracer {
         let (proxy_vertices, proxy_indices) = scene
             .proxies
             .unwrap_or((&self.pipelines.no_proxies, &self.pipelines.no_proxies));
+        let skinned = scene.skinned.unwrap_or(&self.pipelines.no_proxies);
         let buffers = [
             stream.header,
             stream.rays,
@@ -459,13 +462,14 @@ impl MeshRayTracer {
             scene.indices,
             proxy_vertices,
             proxy_indices,
+            skinned,
         ];
         if !self
             .inputs
             .as_ref()
             .is_some_and(|(inputs, _)| inputs.matches(&buffers, surfaces, scene.tlas))
         {
-            let mut entries: Vec<wgpu::BindGroupEntry<'_>> = [0, 1, 2, 5, 6, 7, 8, 9]
+            let mut entries: Vec<wgpu::BindGroupEntry<'_>> = [0, 1, 2, 5, 6, 7, 8, 9, 11]
                 .into_iter()
                 .zip(buffers)
                 .map(|(binding, buffer)| wgpu::BindGroupEntry {
@@ -568,6 +572,7 @@ impl MeshRayPass {
             helio_mesh_api::RAY_INSTANCES,
             helio_mesh_api::RAY_PROXY_VERTICES,
             helio_mesh_api::RAY_PROXY_INDICES,
+            helio_mesh_api::RAY_SKINNED_VERTICES,
         ]);
         let mut writes = vec![stream.hits];
         writes.extend(stream.surfaces);
@@ -645,6 +650,7 @@ impl RenderPass for MeshRayPass {
                 vertices,
                 indices,
                 proxies,
+                skinned: proxy(helio_mesh_api::RAY_SKINNED_VERTICES),
             }),
             _ => None,
         };

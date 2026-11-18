@@ -135,6 +135,8 @@ impl SceneRays {
         let Some(projection) = &mut self.projection else {
             return;
         };
+        // Its acceleration-structure stats go to the renderer's frame stats.
+        projection.set_stats(renderer.frame_stats().clone());
         match projection.prepare(world) {
             Ok(_) => projection.publish(renderer),
             Err(error) => {

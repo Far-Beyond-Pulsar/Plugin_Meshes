@@ -18,6 +18,21 @@
 //! surface is. A partial projection holds them; a full one
 //! ([`SceneDbRayTracing::new`], for consumers that take every candidate as
 //! glass or as opaque) still refuses them.
+//!
+//! Given an eye ([`SceneDbRayTracing::set_view`]), objects are culled as the
+//! engine world's projection culls them (`helio_mesh_api::RAY_TRACING`:
+//! past the culling radius and smaller than the culling angle, Unreal's
+//! ray-tracing culling); the eye's moves rescan only after it moved a
+//! twentieth of the radius. Without one, every object is traced. Each
+//! preparation adds the acceleration structures' stats to the renderer's
+//! frame stats once a host hands them over ([`SceneDbRayTracing::set_stats`]).
+//!
+//! Why this is a projection of its own: it reads the standalone hosts' scene
+//! model (`StaticObjectComponent` rows a host authors with their mesh and
+//! material slots), where the engine's world (`meshes_component::ray_scene`)
+//! reads mesh components placed by their owners' transform hierarchy, with
+//! material instances. The rows are different data, not one job done twice.
+//! The standalone model has no skinned meshes, so it traces none.
 use crate::ray_proxies::{Lookup, VgRayProxies, VgRayStats};
 use crate::{MeshComponent, RenderGroupComponent, StaticObjectComponent};
 use helio_core::{
@@ -155,7 +170,21 @@ pub struct SceneDbRayTracing {
     /// Base colour textures' means: a hit's colour is its material's factor
     /// times its texture's mean.
     texture_means: crate::texture_means::TextureMeans,
+    /// The eye the culling tests from ([`Self::set_view`]), where the scan
+    /// last tested, the criterion and the objects it left out (by key: a
+    /// move re-tests them).
+    eye: Option<glam::DVec3>,
+    tested_at: Option<glam::DVec3>,
+    culling: helio_mesh_api::RayTracingSettings,
+    culled: HashMap<Entity, CasterKey>,
+    stats: Option<helio_core::FrameStats>,
 }
+
+/// How far past the culling thresholds a traced object stays traced.
+const CULLING_SLACK: f64 = 1.1;
+/// The share of the culling radius the eye moves before a rescan.
+const CULLING_RETEST: f64 = 0.05;
+
 impl SceneDbRayTracing {
     /// The scene's shadow casters, all of them: an object the projection
     /// cannot represent (masked or custom-shader materials, group or
@@ -202,7 +231,59 @@ impl SceneDbRayTracing {
             casters: Vec::new(),
             caster_slots: HashMap::new(),
             changes: Vec::new(),
+            eye: None,
+            tested_at: None,
+            culling: helio_mesh_api::RayTracingSettings::default(),
+            culled: HashMap::new(),
+            stats: None,
         }
+    }
+
+    /// Cull objects by `settings` from `eye` (world space) from the next
+    /// preparation on; `None` traces every object.
+    pub fn set_view(
+        &mut self,
+        eye: Option<glam::DVec3>,
+        settings: helio_mesh_api::RayTracingSettings,
+    ) {
+        if settings != self.culling || eye.is_some() != self.eye.is_some() {
+            self.culling = settings;
+            self.cursors = None;
+        }
+        self.eye = eye;
+        let retest = (settings.culling_radius * CULLING_RETEST).max(1.0);
+        if let (Some(eye), Some(at)) = (eye, self.tested_at) {
+            if at.distance(eye) > retest {
+                self.cursors = None;
+            }
+        }
+    }
+
+    /// Add each preparation's acceleration-structure stats to `stats` (a
+    /// renderer's `frame_stats()`).
+    pub fn set_stats(&mut self, stats: helio_core::FrameStats) {
+        self.stats = Some(stats);
+    }
+
+    /// The BLAS manager's counters.
+    pub fn blas_counters(&self) -> helio_core::BlasCounters {
+        self.blas.counters()
+    }
+
+    /// Objects the culling left out of the last build.
+    pub fn culled_count(&self) -> usize {
+        self.culled.len()
+    }
+
+    /// Whether `object` is traced from the eye: its world sphere within the
+    /// criterion (`slack` above 1 for one already traced).
+    fn traces(&self, object: &StaticObjectComponent, slack: f64) -> bool {
+        let Some(eye) = self.eye else {
+            return true;
+        };
+        let [x, y, z, r] = object.row().bounds.map(f64::from);
+        self.culling
+            .traces(glam::DVec3::new(x, y, z).distance(eye), r, slack)
     }
 
     /// Traces virtual-geometry instances (static objects whose mesh is an
@@ -277,6 +358,18 @@ impl SceneDbRayTracing {
             self.tlas.invalidate();
             self.cursors = None;
             return Err(error);
+        }
+        if let Some(stats) = &self.stats {
+            self.blas.report(stats);
+            self.tlas.report(stats);
+            stats.add_named(
+                helio_mesh_api::stats::RAY_INSTANCES,
+                self.instances.len() as u64,
+            );
+            stats.add_named(
+                helio_mesh_api::stats::RAY_INSTANCES_CULLED,
+                self.culled.len() as u64,
+            );
         }
         self.texture_means.dispatch(&self.device, &self.queue);
         Ok(self.tlas.tlas().expect("successful TLAS build"))
@@ -364,6 +457,13 @@ impl SceneDbRayTracing {
                     world.get::<StaticObjectComponent>(change.entity)
                 }
             };
+            // A culled object: a move that brings it in rescans.
+            if let Some(key) = self.culled.get(&change.entity) {
+                match object {
+                    Some(o) if CasterKey::of(o) == *key && !self.traces(o, 1.0) => continue,
+                    _ => return Ok(false),
+                }
+            }
             match (slot, object) {
                 // A non-caster changed and still is not one.
                 (None, None) => {
@@ -379,7 +479,9 @@ impl SceneDbRayTracing {
                         .get(&change.entity)
                         .is_some_and(|key| object.is_none_or(|o| CasterKey::of(o) == *key)) => {}
                 (Some(slot), Some(object))
-                    if self.projects(object) && CasterKey::of(object) == self.casters[slot].1 =>
+                    if self.projects(object)
+                        && CasterKey::of(object) == self.casters[slot].1
+                        && self.traces(object, CULLING_SLACK) =>
                 {
                     let transform = tlas_transform(object);
                     if self.instances[slot].transform != transform {
@@ -418,6 +520,8 @@ impl SceneDbRayTracing {
         self.casters.clear();
         self.caster_slots.clear();
         self.skipped.clear();
+        self.culled.clear();
+        self.tested_at = self.eye;
         let error = rt_error;
         if !self.partial {
             reject_unsupported_geometry(world, &self.untraced, self.vg.is_some())?;
@@ -451,6 +555,10 @@ impl SceneDbRayTracing {
         let mut has_transmission = false;
         for (object_entity, (object,)) in world.query::<(&StaticObjectComponent,)>() {
             if !self.projects(object) {
+                continue;
+            }
+            if !self.traces(object, 1.0) {
+                self.culled.insert(object_entity, CasterKey::of(object));
                 continue;
             }
             // An object the projection cannot represent: left out of a
@@ -703,7 +811,8 @@ impl SceneDbRayTracing {
                 material: object.material_slot,
                 base_color: row.base_color,
                 emissive: row.emissive,
-                transmission: [rgb[0], rgb[1], rgb[2], 0.0],
+                transmission: rgb,
+                skinned_vertex: 0,
             });
             self.caster_slots.insert(object_entity, self.casters.len());
             self.casters.push((object_entity, CasterKey::of(object)));

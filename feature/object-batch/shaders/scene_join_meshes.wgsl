@@ -228,7 +228,7 @@ fn cs_join_meshes(@builtin(global_invocation_id) gid: vec3<u32>) {
             flags,
             skin.offset - vertices.offset,
             palette.offset,
-            palette.count / 2u,
+            palette.count,
             s,
         );
         if slot < arrayLength(&owners_out) {

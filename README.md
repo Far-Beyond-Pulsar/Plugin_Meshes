@@ -60,6 +60,24 @@ draw phases and api crates.
 - **Its standalone hosts also compose**: `helio-light-api, helio-light-host, helio-pass-billboard, helio-pass-deferred-light, helio-pass-hlfs, helio-pass-light-cull` (lights); `helio-mats, helio-pass-materials` (materials) (demos and GPU tests
   draw a whole scene; the plugin itself does not depend on these).
 
+## Skinning and the ray-traced scene
+
+- **The skin cache** (`meshes_component::skin_cache`): one compute pass
+  blends each posed skinned instance's palette into its vertices once a frame
+  (`helio_mesh_api::SKIN_CACHE`, its instance table `SKIN_CACHE_ROWS`), only
+  for the instances whose palette changed, keeping the previous positions for
+  motion vectors. Every drawer (G-buffer, shadow casters and transmittance,
+  forward, transparent, selection) reads it through `//!use mesh_skinning`;
+  no drawer blends a palette.
+- **The ray-traced scene**: the engine world's (`meshes_component::ray_scene`,
+  static and skinned meshes; a skinned instance has its own deforming BLAS,
+  refit from the cache under a triangle budget a frame) and the standalone
+  hosts' (`helio_mesh_host::ray_tracing`, `StaticObjectComponent` rows). Both
+  cull instances by distance and angle and report the acceleration
+  structures' stats; the settings are `helio_mesh_api::RAY_TRACING`
+  (`ray_tracing` in a project). Helio's `rendering.md`, "As built: Skinned
+  meshes, foliage and culling in the TLAS", has the design.
+
 ## Building and testing
 
 Like [Plugin_Physics](https://github.com/Far-Beyond-Pulsar/Plugin_Physics), this plugin's crates are members

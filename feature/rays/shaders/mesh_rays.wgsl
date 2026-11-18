@@ -35,6 +35,9 @@ enable wgpu_ray_query;
 @group(0) @binding(7) var<storage, read> indices: array<u32>;
 @group(0) @binding(8) var<storage, read> proxy_vertices: array<f32>;
 @group(0) @binding(9) var<storage, read> proxy_indices: array<u32>;
+// The skin cache (`helio_mesh_api::RAY_SKINNED_VERTICES`, `SkinnedVertex`
+// words): skinned instances' corners and normals.
+@group(0) @binding(11) var<storage, read> skinned_vertices: array<u32>;
 // A nearest-hit stream's surfaces (none in the occlusion pipeline).
 @group(0) @binding(10) var<storage, read_write> surfaces: array<SceneSurface>;
 // Group 1: the scene's material rows (`materials`, for a hit's metalness

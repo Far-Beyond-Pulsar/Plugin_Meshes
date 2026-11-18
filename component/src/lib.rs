@@ -33,6 +33,7 @@ pub mod mesh_materials;
 pub mod mesh_spatial;
 pub mod ray_scene;
 pub mod records;
+pub mod skin_cache;
 pub mod vg_settings;
 pub mod virtual_geometry_host;
 pub mod virtual_geometry_instances;
