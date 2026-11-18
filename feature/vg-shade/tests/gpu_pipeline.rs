@@ -605,6 +605,7 @@ fn resolve_bin_shade_and_final_depth() {
                 rt: None,
                 rt_visible: None,
                 remaps: None,
+                view_remaps: None,
                 dense_mask: None,
                 dense_merge: false,
                 debug: $debug,

@@ -60,7 +60,11 @@ fn occurs(inst: GpuInstanceData, chain: GpuPortalChain) -> bool {
     if (inst.flags & INSTANCE_FLAG_CLASSIC_SUPPRESSED) != 0u {
         return false;
     }
-    let space = coordinate_spaces[instance_coordinate_space(inst.flags)];
+    let slot = instance_coordinate_space(inst.flags);
+    if slot != chain.destination_space {
+        return false;
+    }
+    let space = coordinate_spaces[slot];
     let center = (space * vec4<f32>(inst.bounds.xyz, 1.0)).xyz;
     let radius = inst.bounds.w;
     for (var s = 0u; s < chain.stage_count; s += 1u) {

@@ -165,6 +165,9 @@ struct InstanceTestResult {
 /// coordinate space (see `libhelio::coordinate_space`) pays the extra mapping.
 fn test_instance(inst: GpuInstance, aabb: GpuAabb) -> InstanceTestResult {
     let space_id = (inst.flags >> 8u) & 0xFFu;
+    if !helio_camera_sees_space(cameras[0], space_id) {
+        return InstanceTestResult(false, inst.bounds.xyz);
+    }
     let aabb_degenerate = all(aabb.min == aabb.max);
 
     if space_id == 0u {

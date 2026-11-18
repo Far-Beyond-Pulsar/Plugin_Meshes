@@ -90,6 +90,7 @@ const FLAG_DENSE: u32 = 2;
 const FLAG_DENSE_MASK: u32 = 8;
 const FLAG_RT: u32 = 4;
 const FLAG_DENSE_MERGE: u32 = 16;
+const FLAG_CONTENT_REMAPS: u32 = 32;
 
 /// The per-frame `Globals` uniform the classic G-buffer shader (and so every
 /// material template) reads. Same layout as `helio_pass_gbuffer::GBufferGlobals`.
@@ -259,6 +260,8 @@ pub struct VgShadeInputs<'a> {
     /// Per instance row, the remap its pixels carry (a run drawn through
     /// another space, [`VgShade::with_remaps`]); `None` tags them plain.
     pub remaps: Option<&'a wgpu::Buffer>,
+    /// The frame's drawn-to-content transform table for `remaps`.
+    pub view_remaps: Option<&'a wgpu::Buffer>,
     /// The dense-tile mask `dense_keys` is valid under (one `u32` per 16x16 tile,
     /// nonzero = resolved by Tier 3). With it, a dense tile takes only the dense
     /// result and other tiles ignore `dense_keys`; `None` merges per pixel.
@@ -326,6 +329,7 @@ pub struct VgShade {
     bins: wgpu::Buffer,
     dispatch_args: wgpu::Buffer,
     dummy_keys: wgpu::Buffer,
+    dummy_view_remaps: wgpu::Buffer,
     dummy_rt_payload: wgpu::TextureView,
     dummy_rt_depth: wgpu::TextureView,
 
@@ -573,6 +577,8 @@ impl VgShade {
         s0.push(storage_entry(10, true));
         s0.push(storage_entry(11, true));
         s0.push(storage_entry(12, true));
+        s0.push(storage_entry(13, true));
+        s0.push(uniform_entry(14));
         let shade_bgl0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("VgShade shade 0"),
             entries: &s0,
@@ -679,6 +685,11 @@ impl VgShade {
             storage | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC,
         );
         let dummy_keys = buffer("VgShade empty keys", 8, storage);
+        let dummy_view_remaps = buffer(
+            "VgShade no view remaps",
+            helio_frame_api::lighting::VIEW_REMAPS_BYTES,
+            wgpu::BufferUsages::UNIFORM,
+        );
         let dummy = |label: &str, format: wgpu::TextureFormat| {
             device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -724,6 +735,7 @@ impl VgShade {
             bins,
             dispatch_args,
             dummy_keys,
+            dummy_view_remaps,
             dummy_rt_payload: dummy("VgShade no rt payload", wgpu::TextureFormat::Rg32Uint),
             dummy_rt_depth: dummy("VgShade no rt depth", wgpu::TextureFormat::R32Float),
             debug: None,
@@ -949,6 +961,9 @@ impl VgShade {
         let pixels = width * height;
 
         let mut flags = 0;
+        if inputs.remaps.is_some() && inputs.view_remaps.is_some() {
+            flags |= FLAG_CONTENT_REMAPS;
+        }
         if inputs.sw_keys.is_some() {
             flags |= FLAG_SW;
         }
@@ -1213,6 +1228,14 @@ impl VgShade {
                 wgpu::BindGroupEntry {
                     binding: 12,
                     resource: buf(inputs.rt_visible.unwrap_or(&self.dummy_keys)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: buf(inputs.remaps.unwrap_or(&self.dummy_keys)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: buf(inputs.view_remaps.unwrap_or(&self.dummy_view_remaps)),
                 },
             ],
         });

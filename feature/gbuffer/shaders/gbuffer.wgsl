@@ -289,7 +289,8 @@ fn compute_velocity(input: VertexOutput) -> vec4<f32> {
 @fragment
 fn fs_main(vertex: VertexOutput, @builtin(front_facing) front: bool) -> GBufferOutput {
     if HELIO_VIEW_CLIP && helio_view_clipped(cameras[0], vertex.world_position) { discard; }
-    return mesh_fragment(vertex, front);
+    let identity = mat3x3<f32>(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.0, 1.0));
+    return mesh_fragment(vertex, front, identity, cameras[0].position_near.xyz);
 }
 
 // What a chain shows: beyond its outermost opening where the aperture mask
@@ -307,10 +308,12 @@ fn fs_occurrence(vertex: VertexOutput, @builtin(front_facing) front: bool) -> GB
     for (var h = 0u; h < chain.hole_count; h += 1u) {
         if portal_hole_covers(portal_stages[chain.first_hole + h], p) { discard; }
     }
-    return mesh_fragment(vertex, front);
+    let rotation = portal_chain_rotation(chain);
+    let eye = transpose(rotation) * (cameras[0].position_near.xyz - chain.content_to_drawn[3].xyz);
+    return mesh_fragment(vertex, front, rotation, eye);
 }
 
-fn mesh_fragment(vertex: VertexOutput, front: bool) -> GBufferOutput {
+fn mesh_fragment(vertex: VertexOutput, front: bool, content_to_drawn: mat3x3<f32>, eye: vec3<f32>) -> GBufferOutput {
     var input = vertex;
     let material = material_at(input.material_id);
     let material_tex = material_texture_data(material,input.material_id);
@@ -376,10 +379,13 @@ fn mesh_fragment(vertex: VertexOutput, front: bool) -> GBufferOutput {
         );
     }
 
+    // Material graphs evaluate in the content's world. Only the final
+    // G-buffer normal rotates back into the projected frame's world.
+    let drawn_to_content = transpose(content_to_drawn);
     let surface = radiant_eval_surface(material, material_tex, MaterialInput(
-        input.clip_position, input.world_position, input.world_normal,
-        input.world_tangent, input.bitangent_sign, input.tex_coords,
-        cameras[0].position_near.xyz, globals.frame,
+        input.clip_position, input.content_position, drawn_to_content * input.world_normal,
+        drawn_to_content * input.world_tangent, input.bitangent_sign, input.tex_coords,
+        eye, globals.frame,
     ));
 
     // Alpha test
@@ -388,7 +394,7 @@ fn mesh_fragment(vertex: VertexOutput, front: bool) -> GBufferOutput {
 
     var out: GBufferOutput;
     out.albedo = vec4<f32>(surface.albedo.rgb, surface.alpha);
-    out.normal = vec4<f32>(surface.normal, surface.specular_f0.r);
+    out.normal = vec4<f32>(content_to_drawn * surface.normal, surface.specular_f0.r);
     out.orm = vec4<f32>(surface.ao, surface.roughness, surface.metallic, surface.specular_f0.g);
     out.emissive = vec4<f32>(surface.emissive, surface.specular_f0.b);
     out.surface = input.lightmap_uv;
