@@ -666,6 +666,9 @@ impl VgCullCore {
         if !self.config.root_shortcut {
             flags |= FLAG_NO_ROOT_SHORTCUT;
         }
+        if self.config.seeds_instances {
+            flags |= crate::FLAG_EXPLICIT_INSTANCES;
+        }
         if self.config.current_hiz {
             flags |= FLAG_CURRENT_HIZ;
         }

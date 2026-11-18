@@ -500,6 +500,8 @@ pub const FLAG_NO_ROOT_SHORTCUT: u32 = 32;
 /// [`crate::VgCullConfig::current_hiz`]): one exact occlusion phase against it,
 /// with this frame's view-projection; occluded work is dropped, none deferred.
 pub const FLAG_CURRENT_HIZ: u32 = 64;
+/// The run has an explicit list of instances selected by the host feature.
+pub const FLAG_EXPLICIT_INSTANCES: u32 = 128;
 
 // ── Shader assembly ────────────────────────────────────────────────────────
 
@@ -538,6 +540,7 @@ pub fn wgsl_constants() -> String {
     u("VGC_FLAG_SW_MASKED", FLAG_SW_MASKED);
     u("VGC_FLAG_NO_ROOT_SHORTCUT", FLAG_NO_ROOT_SHORTCUT);
     u("VGC_FLAG_CURRENT_HIZ", FLAG_CURRENT_HIZ);
+    u("VGC_FLAG_EXPLICIT_INSTANCES", FLAG_EXPLICIT_INSTANCES);
     u("VGC_CLUSTER_FLAG_LEAF", GpuCluster::FLAG_LEAF);
     for (name, v) in [
         ("JOBS", stats::JOBS),
@@ -590,12 +593,14 @@ pub fn shader_source() -> String {
 {}
 {}
 {}
+{}
 {}",
         wgsl_constants(),
         // The material row's words and flags (the materials' snippet).
         helio_mats::MATERIAL_ROW_SNIPPET.source,
         // The scene join's object row (the meshes' snippet).
         helio_mesh_api::OBJECT_ROW_SNIPPET.source,
+        helio_mesh_api::DRAW_ROWS_SNIPPET.source,
         helio_vg_format::WGSL,
         helio_vg_stream::bindings_wgsl(0, 4, true),
         helio_vg_stream::WGSL,

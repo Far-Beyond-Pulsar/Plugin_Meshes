@@ -1033,6 +1033,10 @@ fn job_instance(job: vec2<u32>) {
     if job.x >= params.instance_count { return; }
     let inst = vg_instances[job.x];
     if (inst.flags & VG_INST_ENABLED) == 0u { return; }
+    if (params.flags & VGC_FLAG_EXPLICIT_INSTANCES) == 0u &&
+        !helio_camera_sees_space(cameras[0], instance_coordinate_space(objects[inst.object_row].flags)) {
+        return;
+    }
     if inst.asset_slot >= arrayLength(&vg_asset_headers) { return; }
     // Not VG-active until the root pages are resident: draw nothing (the
     // derivation keeps such instances on the classic path).
