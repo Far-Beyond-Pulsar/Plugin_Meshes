@@ -265,7 +265,7 @@ fn the_skin_cache_skins_what_the_frame_sees() {
         eye,
         view_proj: helio_core::depth::perspective(1.0, 1.0, 0.1)
             * glam::camera::rh::view::look_to_mat4(Vec3::ZERO, forward, Vec3::Y),
-        rays: helio_mesh_api::RayTracingSettings::default(),
+        rays: helio_pass_mesh_rays::RayTracingSettings::default(),
     };
     let away = view(glam::DVec3::ZERO, -Vec3::Z);
     let mut cache = SkinCache::new(device.clone());
@@ -383,7 +383,7 @@ fn skin_cache_cost() {
         eye: glam::DVec3::ZERO,
         view_proj: helio_core::depth::perspective(1.0, 16.0 / 9.0, 0.1)
             * glam::camera::rh::view::look_to_mat4(Vec3::ZERO, -Vec3::Z, Vec3::Y),
-        rays: helio_mesh_api::RayTracingSettings::default(),
+        rays: helio_pass_mesh_rays::RayTracingSettings::default(),
     };
     // (instances, grid side: 100 is 10,000 vertices, 173 about 30,000).
     for (count, side, posed, culled) in [

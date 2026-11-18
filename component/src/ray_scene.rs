@@ -39,7 +39,7 @@
 //!   when the cache posed it (`positions_revision` is the cache's revision),
 //!   rebuilt on the acceleration policy's schedule, nothing when its pose
 //!   is unchanged. Refits are budgeted in triangles a frame
-//!   (`helio_mesh_api::RAY_TRACING`'s `skinned_refit_triangles`), nearest
+//!   (`helio_pass_mesh_rays::RAY_TRACING`'s `skinned_refit_triangles`), nearest
 //!   first and the longest-waiting ahead of nearer ones; an instance over the
 //!   budget keeps last frame's BLAS (a frame stale, not wrong). Their rows
 //!   (`RAY_INSTANCE_SKINNED`) point the tracer at the cache, so a hit shades
@@ -75,10 +75,11 @@ use helio_frame_api::rays::stream::{MASK_MOVABLE, MASK_STATIC};
 use helio_mats::instance::{MaterialInstanceComponent, row_of};
 use helio_mesh_api::{
     RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_SKINNED, RAY_INSTANCE_TWO_SIDED,
-    RayInstance, RayTracingSettings,
+    RayInstance,
 };
 use helio_mesh_host::ray_proxies::{Lookup, ProxyRange, VgRayProxies};
 use helio_mesh_host::texture_means::TextureMeans;
+use helio_pass_mesh_rays::RayTracingSettings;
 use pulsar_scene_model::attachments::ComponentOwner;
 use pulsar_scene_model::{Parent, Transform, Visibility};
 use pulsar_scenedb::gpu::{GpuMirrorHandle, SceneGpuStore, VarLenHandle};

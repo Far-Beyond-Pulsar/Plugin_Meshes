@@ -10,6 +10,7 @@ helio-mesh-api = { workspace = true }
 helio-frame-api = { workspace = true }
 helio-feature-api = { workspace = true }
 helio-core = { workspace = true }
+helio-settings = { workspace = true }
 helio-mats = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }

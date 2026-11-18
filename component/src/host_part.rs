@@ -239,8 +239,8 @@ impl RenderHostPart for MeshesHostPart {
         let scene = scene.read();
         let settings = {
             use engine_backend::subsystems::render::helio_renderer::project_settings;
-            helio_mesh_api::RayTracingSettings::from_settings(&project_settings::resolved(
-                &helio_mesh_api::RAY_TRACING,
+            helio_pass_mesh_rays::RayTracingSettings::from_settings(&project_settings::resolved(
+                &helio_pass_mesh_rays::RAY_TRACING,
             ))
         };
         // Skinned only where the frame draws or traces them.

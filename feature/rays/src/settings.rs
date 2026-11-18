@@ -2,6 +2,12 @@
 //! `helio_settings` describes the renderer's): which mesh instances the
 //! frame's TLAS holds and how much skinned geometry is refit a frame. Read
 //! back into [`RayTracingSettings`] by the projections.
+//!
+//! The group lives with the meshes' ray-tracing feature, as the other kinds'
+//! settings live with their features (GI's, the voxels', water's): a group is
+//! a `static` compared by address, which an api crate does not hold, and both
+//! projections (the engine's `meshes_component::ray_scene` and the standalone
+//! hosts' `helio_mesh_host::ray_tracing`) already link this crate.
 
 use helio_settings::{integer, live, number, Group, Resolved};
 

@@ -20,7 +20,7 @@
 //! glass or as opaque) still refuses them.
 //!
 //! Given an eye ([`SceneDbRayTracing::set_view`]), objects are culled as the
-//! engine world's projection culls them (`helio_mesh_api::RAY_TRACING`:
+//! engine world's projection culls them (`helio_pass_mesh_rays::RAY_TRACING`:
 //! past the culling radius and smaller than the culling angle, Unreal's
 //! ray-tracing culling); the eye's moves rescan only after it moved a
 //! twentieth of the radius. Without one, every object is traced. Each
@@ -175,7 +175,7 @@ pub struct SceneDbRayTracing {
     /// move re-tests them).
     eye: Option<glam::DVec3>,
     tested_at: Option<glam::DVec3>,
-    culling: helio_mesh_api::RayTracingSettings,
+    culling: helio_pass_mesh_rays::RayTracingSettings,
     culled: HashMap<Entity, CasterKey>,
     stats: Option<helio_core::FrameStats>,
 }
@@ -233,7 +233,7 @@ impl SceneDbRayTracing {
             changes: Vec::new(),
             eye: None,
             tested_at: None,
-            culling: helio_mesh_api::RayTracingSettings::default(),
+            culling: helio_pass_mesh_rays::RayTracingSettings::default(),
             culled: HashMap::new(),
             stats: None,
         }
@@ -244,7 +244,7 @@ impl SceneDbRayTracing {
     pub fn set_view(
         &mut self,
         eye: Option<glam::DVec3>,
-        settings: helio_mesh_api::RayTracingSettings,
+        settings: helio_pass_mesh_rays::RayTracingSettings,
     ) {
         if settings != self.culling || eye.is_some() != self.eye.is_some() {
             self.culling = settings;

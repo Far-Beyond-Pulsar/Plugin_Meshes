@@ -141,7 +141,7 @@ impl SceneRays {
         projection.set_stats(renderer.frame_stats().clone());
         projection.set_view(
             Some(camera.eye),
-            helio_mesh_api::RayTracingSettings::default(),
+            helio_pass_mesh_rays::RayTracingSettings::default(),
         );
         match projection.prepare(world) {
             Ok(_) => projection.publish(renderer),

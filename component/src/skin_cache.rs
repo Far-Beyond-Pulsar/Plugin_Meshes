@@ -161,7 +161,7 @@ pub struct SkinView {
     /// (`helio::Camera::view_proj_in(eye)`).
     pub view_proj: glam::Mat4,
     /// The ray-traced scene's culling criterion.
-    pub rays: helio_mesh_api::RayTracingSettings,
+    pub rays: helio_pass_mesh_rays::RayTracingSettings,
 }
 
 impl SkinView {

@@ -45,7 +45,9 @@
 //! change, one 16-byte uniform written a frame.
 
 pub mod feature;
+mod settings;
 pub use feature::MeshRays;
+pub use settings::{RayTracingSettings, RAY_TRACING};
 
 use std::sync::Arc;
 

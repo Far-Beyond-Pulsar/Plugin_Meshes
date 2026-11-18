@@ -42,9 +42,6 @@ pub use rows::{
     RENDER_GROUPS, SKELETAL_BONE_PALETTE, SKELETAL_SKIN_VERTICES, SKIN_CACHE, SKIN_CACHE_ROWS,
     SKIN_VERTICES, STATIC_OBJECTS, STATIC_OBJECT_OWNERS, VG_INSTANCES, VG_INSTANCE_ROWS,
 };
-pub use settings::{RayTracingSettings, RAY_TRACING};
-
-mod settings;
 
 /// The meshes' surfaces as rays see them, for a tracer's WGSL
 /// (`//!use mesh_ray_surface`): the [`RayInstance`] row and its flags, the

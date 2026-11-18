@@ -149,7 +149,7 @@ pub(crate) fn build(p: &mut pulsar_plugins::PluginBuilder) {
     p.add(
         pulsar_settings::project::rendering::SettingsGroupRegistration {
             origin: p.origin(),
-            group: &helio_mesh_api::RAY_TRACING,
+            group: &helio_pass_mesh_rays::RAY_TRACING,
         },
     );
 

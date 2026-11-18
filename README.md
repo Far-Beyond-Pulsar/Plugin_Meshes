@@ -74,7 +74,7 @@ draw phases and api crates.
   refit from the cache under a triangle budget a frame) and the standalone
   hosts' (`helio_mesh_host::ray_tracing`, `StaticObjectComponent` rows). Both
   cull instances by distance and angle and report the acceleration
-  structures' stats; the settings are `helio_mesh_api::RAY_TRACING`
+  structures' stats; the settings are `helio_pass_mesh_rays::RAY_TRACING`
   (`ray_tracing` in a project). Helio's `rendering.md`, "As built: Skinned
   meshes, foliage and culling in the TLAS", has the design.
 

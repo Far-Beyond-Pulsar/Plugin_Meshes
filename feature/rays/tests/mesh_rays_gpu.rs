@@ -1928,7 +1928,7 @@ mod graph {
         };
         projection.set_view(
             Some(glam::DVec3::ZERO),
-            helio_mesh_api::RayTracingSettings::default(),
+            helio_pass_mesh_rays::RayTracingSettings::default(),
         );
         let culled = shoot(&mut projection);
         assert_eq!(projection.culled_count(), 1, "the far small box");
@@ -1938,7 +1938,7 @@ mod graph {
             (culled[2] - 999.5).abs() < 1e-2,
             "the far wall stays: {culled:?}"
         );
-        projection.set_view(None, helio_mesh_api::RayTracingSettings::default());
+        projection.set_view(None, helio_pass_mesh_rays::RayTracingSettings::default());
         let all = shoot(&mut projection);
         assert_eq!(projection.culled_count(), 0);
         assert!(
