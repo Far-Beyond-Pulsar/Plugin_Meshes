@@ -8,7 +8,9 @@
 //!   multi-draw they are issued with; in WGSL, [`DRAW_ROWS_SNIPPET`];
 //! - the buffers their ray-tracing projection publishes beside the frame's
 //!   TLAS (`helio_frame_api::rays::SceneRays`): the instance rows
-//!   ([`RAY_INSTANCES`]) and the proxy pool ([`RAY_PROXY_VERTICES`],
+//!   ([`RAY_INSTANCES`]), each TLAS instance's transform
+//!   ([`RAY_INSTANCE_TRANSFORMS`]), the coordinate spaces' mask groups
+//!   ([`RAY_SPACE_GROUPS`]) and the proxy pool ([`RAY_PROXY_VERTICES`],
 //!   [`RAY_PROXY_INDICES`]); in WGSL, [`RAY_SURFACE_SNIPPET`].
 //!
 //! No passes: a kind that reads meshes depends on this crate, never on the
@@ -46,7 +48,9 @@ pub use rows::{
 /// The meshes' surfaces as rays see them, for a tracer's WGSL
 /// (`//!use mesh_ray_surface`): the [`RayInstance`] row and its flags, the
 /// mesh pools' vertex decode, the proxy pool's, and `ray_triangle`, which
-/// fetches a hit's triangle by instance and primitive. The reader declares
+/// fetches a hit's triangle by instance and primitive; [`RayTransform`]
+/// (`ray_transform_point`, `ray_transform_normal`) and the space groups'
+/// decode (`ray_space_cull`). The reader declares
 /// the storage it reads under these names: `instances: array<RayInstance>`
 /// ([`RAY_INSTANCES`]), `vertices: array<u32>` and `indices: array<u32>`
 /// (the mesh pools, [`MESH_VERTICES`] / [`MESH_INDICES`]),
@@ -81,9 +85,92 @@ pub const OBJECT_ROW_SNIPPET: helio_core::shader::ShaderSnippet =
 pub const SKINNING_SNIPPET: helio_core::shader::ShaderSnippet =
     helio_core::wgsl_snippet!("//!use mesh_skinning", "shaders/skinning.wgsl");
 
-/// Graph key of the rows that follow the frame's TLAS instance order, a
-/// [`RayInstance`] an instance.
+/// Graph key of the rows that follow the frame's TLAS instance order: a
+/// [`RayInstance`] a traced section, an instance's sections from its custom
+/// data (its first row) on, a hit's row its custom data plus its
+/// `geometry_index`.
 pub const RAY_INSTANCES: &str = "ray_instances";
+
+/// Graph key of each TLAS instance's transform, by TLAS instance index
+/// ([`RayInstance::instance`]): a [`RayTransform`] an instance, the
+/// object-to-frame matrix the TLAS holds (frame space: relative to the
+/// frame's origin). What a pass shading hits without the ray query (a
+/// surface pass over hits binned by material) takes a hit's normals and
+/// tangents to the frame with. Both projections publish it beside the TLAS.
+pub const RAY_INSTANCE_TRANSFORMS: &str = "ray_instance_transforms";
+
+/// A TLAS instance's object-to-frame transform ([`RAY_INSTANCE_TRANSFORMS`]):
+/// three rows of a 3x4 matrix (row-major, as `wgpu::TlasInstance` holds it),
+/// 48 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RayTransform {
+    pub rows: [[f32; 4]; 3],
+}
+
+impl RayTransform {
+    /// The row-major 3x4 matrix `m` (a `TlasInstance::transform`).
+    pub fn from_rows(m: [f32; 12]) -> Self {
+        Self {
+            rows: [
+                [m[0], m[1], m[2], m[3]],
+                [m[4], m[5], m[6], m[7]],
+                [m[8], m[9], m[10], m[11]],
+            ],
+        }
+    }
+}
+
+/// Graph key of the coordinate spaces' TLAS mask groups: 256 `u32`, one a
+/// space slot (`RAY_SPACE_*` bits), so a ray restricted to one space
+/// (`SceneRay::space`) is traced with the cull mask of that space's group
+/// alone. An instance's TLAS mask is one bit, `1 << (2 * group + class)`,
+/// class 0 for casters that never move and 1 for those that may (the frame's
+/// `MASK_STATIC` / `MASK_MOVABLE` are group 0's bits): four groups of two
+/// classes fill the 8 bits a mask has. Group 0 is the world's (slot 0)
+/// alone; the other traced spaces take groups 1 to 3, one each while there
+/// are at most three, else sharing them (`RAY_SPACE_SHARED`): a ray of a
+/// shared group's space has its candidates tested against each row's space
+/// ([`RayInstance::space`]), which costs it the any-hit loop, never the rays
+/// of another group. Absent (a projection that traces only the world): the
+/// world's group is 0 and no other space is traced.
+pub const RAY_SPACE_GROUPS: &str = "ray_space_groups";
+/// Space slots [`RAY_SPACE_GROUPS`] holds.
+pub const RAY_SPACE_SLOTS: usize = 256;
+/// [`RAY_SPACE_GROUPS`] entry: the group (bits 0..2).
+pub const RAY_SPACE_GROUP: u32 = 3;
+/// [`RAY_SPACE_GROUPS`] entry: the group holds other spaces too.
+pub const RAY_SPACE_SHARED: u32 = 4;
+/// [`RAY_SPACE_GROUPS`] entry: the space has traced instances.
+pub const RAY_SPACE_PRESENT: u32 = 8;
+/// Groups of the TLAS mask (two class bits each).
+pub const RAY_SPACE_MASK_GROUPS: u32 = 4;
+
+/// The TLAS mask of an instance of group `group` (`RAY_SPACE_GROUPS`), of
+/// casters that may move (`movable`) or not.
+pub const fn ray_instance_mask(group: u32, movable: bool) -> u8 {
+    1 << (2 * group + movable as u32)
+}
+
+/// The space groups of the traced spaces `spaces` (slots, any order,
+/// duplicates allowed): the [`RAY_SPACE_GROUPS`] table. The world (slot 0)
+/// is group 0, present or not; the others take groups 1..=3 in slot order,
+/// shared past three (by slot, round robin).
+pub fn ray_space_groups(spaces: impl IntoIterator<Item = u32>) -> [u32; RAY_SPACE_SLOTS] {
+    let mut present = [false; RAY_SPACE_SLOTS];
+    for space in spaces {
+        present[(space as usize).min(RAY_SPACE_SLOTS - 1)] = true;
+    }
+    let others: Vec<usize> = (1..RAY_SPACE_SLOTS).filter(|&s| present[s]).collect();
+    let shared = others.len() > (RAY_SPACE_MASK_GROUPS - 1) as usize;
+    let mut table = [0u32; RAY_SPACE_SLOTS];
+    table[0] = if present[0] { RAY_SPACE_PRESENT } else { 0 };
+    for (rank, &slot) in others.iter().enumerate() {
+        let group = 1 + (rank as u32 % (RAY_SPACE_MASK_GROUPS - 1));
+        table[slot] = group | RAY_SPACE_PRESENT | if shared { RAY_SPACE_SHARED } else { 0 };
+    }
+    table
+}
 /// Graph key of the proxy pool's vertices: the triangles of the instances
 /// traced through a proxy ([`RAY_INSTANCE_PROXY`]), packed vertices of
 /// [`RAY_PROXY_VERTEX_BYTES`] (a `Float32x3` position, then a `Float32x2`
@@ -95,9 +182,12 @@ pub const RAY_PROXY_INDICES: &str = "ray_proxy_indices";
 /// Bytes of a proxy pool vertex: position, then UV.
 pub const RAY_PROXY_VERTEX_BYTES: u64 = 20;
 
-/// The surface of a TLAS instance, for shading ray hits without a G-buffer
-/// (`ray_instances` rows, indexed by TLAS instance index): where its
-/// triangles are in the scene's mesh pools and its material's colours.
+/// The surface of a traced section, for shading ray hits without a G-buffer
+/// ([`RAY_INSTANCES`] rows, a hit's its instance's custom data plus its
+/// `geometry_index`): where its triangles are in the scene's mesh pools, its
+/// material, its TLAS instance (whose transform is
+/// [`RAY_INSTANCE_TRANSFORMS`]'s) and coordinate space, and its material's
+/// colours.
 /// Triangle `p` of the instance is pool indices `first_index + 3p ..`
 /// (mesh-local), plus `base_vertex`, into `builtin_mesh_vertex`
 /// (`PackedVertex`). Hits are shaded without sampling textures:
@@ -122,7 +212,8 @@ pub const RAY_PROXY_VERTEX_BYTES: u64 = 20;
 pub struct RayInstance {
     pub first_index: u32,
     pub base_vertex: u32,
-    /// `RAY_INSTANCE_*` bits.
+    /// `RAY_INSTANCE_*` bits, and the coordinate space slot it is authored
+    /// in at [`RAY_INSTANCE_SPACE_SHIFT`] (8 bits).
     pub flags: u32,
     /// The material's row in the scene's `materials` (and its texture
     /// metadata's row).
@@ -131,7 +222,10 @@ pub struct RayInstance {
     /// texture's mean.
     pub base_color: [f32; 4],
     /// The radiance it gives off (RGB: colour times strength).
-    pub emissive: [f32; 4],
+    pub emissive: [f32; 3],
+    /// Its TLAS instance: the row of [`RAY_INSTANCE_TRANSFORMS`] holding
+    /// its object-to-frame transform.
+    pub instance: u32,
     /// The linear RGB share of light it lets through (zero: opaque).
     pub transmission: [f32; 3],
     /// For a [`RAY_INSTANCE_SKINNED`] instance, its first vertex in the skin
@@ -159,3 +253,19 @@ pub const RAY_INSTANCE_MASKED: u32 = 2;
 /// [`RayInstance::flags`]: both faces are its outside (a double-sided
 /// material): a ray meeting its back has met a surface, not an inside.
 pub const RAY_INSTANCE_TWO_SIDED: u32 = 4;
+/// [`RayInstance::flags`]: where its coordinate space slot is (bits 8..16).
+pub const RAY_INSTANCE_SPACE_SHIFT: u32 = 8;
+
+impl RayInstance {
+    /// The coordinate space slot it is authored in.
+    pub fn space(&self) -> u32 {
+        (self.flags >> RAY_INSTANCE_SPACE_SHIFT) & 0xff
+    }
+
+    /// The row in space slot `space`.
+    pub fn in_space(mut self, space: u32) -> Self {
+        self.flags = (self.flags & !(0xff << RAY_INSTANCE_SPACE_SHIFT))
+            | ((space & 0xff) << RAY_INSTANCE_SPACE_SHIFT);
+        self
+    }
+}

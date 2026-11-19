@@ -4,45 +4,52 @@
 //! publish as `helio_frame_api::rays::SCENE_RAYS`).
 //!
 //! - **Nearest-hit streams** (`mesh_rays_nearest`): each ray queries up to the
-//!   nearest hit its row holds, with its caster mask. Opaque triangles
-//!   commit; cut-outs (`RAY_INSTANCE_MASKED`) are tested as the raster's
-//!   alpha test, at the mip matching the ray's footprint, stochastic past the
-//!   finest mip; transmitting sheets (glass) are passed. A nearer hit is
-//!   written with its [`SceneSurface`](helio_frame_api::rays::stream::SceneSurface)
-//!   in the same invocation (below), in the hit payload of [`payload`].
+//!   nearest hit its row holds, with its caster mask and its coordinate
+//!   space's mask group (`helio_mesh_api::RAY_SPACE_GROUPS`). Opaque
+//!   triangles commit; cut-outs (`RAY_INSTANCE_MASKED`) are tested as the
+//!   raster's alpha test, at the mip matching the ray's footprint, stochastic
+//!   past the finest mip; transmitting sheets (glass) are passed. A nearer
+//!   hit is written in the hit payload of [`payload`].
+//! - **Surfaces** (`mesh_rays_surface`, the tracer's `surface` pass): once
+//!   every tracer traced, the [`SceneSurface`](helio_frame_api::rays::stream::SceneSurface)
+//!   of each hit that stayed the meshes', from the payload's row, triangle
+//!   and barycentrics and the instance's transform
+//!   (`helio_mesh_api::RAY_INSTANCE_TRANSFORMS`).
 //! - **Occlusion streams** (`mesh_rays_occlusion`): what gets through the
 //!   meshes along the whole ray, multiplied into the row: nothing past an
 //!   opaque triangle or a cut-out's surface, each sheet tinting.
 //!
-//! Both are one indirect dispatch over the stream's header. On a frame
-//! without a TLAS or without the meshes' instance rows the pass records
-//! nothing, and the rows stay as they were.
+//! Each is one indirect dispatch over the stream's header. On a frame
+//! without a TLAS or without the meshes' instance rows and transforms the
+//! pass records nothing, and the rows stay as they were.
 //!
-//! **Why the trace pass writes the surface.** The surface's normals are the
-//! triangle's object-space normals taken to the frame by the instance's
-//! transform, and only a committed intersection holds that transform: the
-//! instance rows (`RayInstance`) carry none, and a hit's 96 bits hold its row,
-//! triangle and barycentrics. So the tracer's `surface` build adds no pass:
-//! the trace pass writes a hit's surface when it commits the hit. A later
-//! tracer that finds a nearer hit overwrites the row and writes its own
-//! surface (its surface pass runs after every tracer traced), so a row always
-//! ends with its final hit's surface. What that costs: the surface of a mesh
-//! hit another kind then beats is wasted work. The alternative, a second
-//! pass that re-fetches the triangle, needs each instance's transform on the
-//! GPU by row; the projections publish it when the surface pass becomes the
-//! materials' evaluator (r2: textured, binned by material), and the split
-//! happens then.
+//! **Coordinate spaces.** A ray answers only with rows of its space
+//! (`SceneRay::space`). An instance's TLAS mask is one bit, its caster class
+//! in its space's group (`helio_mesh_api::ray_instance_mask`): the world's
+//! group alone, up to three other spaces a group each, so a restricted ray
+//! is culled by the hardware with no per-candidate work. Past three other
+//! traced spaces they share groups, and a ray of a shared group's space has
+//! every candidate forced to the any-hit loop and passed when its row is of
+//! another space: correct at any count, the cost confined to those rays.
+//!
+//! **Why the surface is a pass of its own.** A hit's payload names its row,
+//! triangle and barycentrics, and the row its TLAS instance, whose transform
+//! the projections publish by instance: the surface pass needs no ray query.
+//! Its surface is then written only for the hits that stayed the meshes'
+//! (none for a mesh hit another kind beats), and it is the pass a material
+//! evaluator replaces with kernels over hits binned by material program
+//! (rendering.md, r2), keyed by the row's material.
 //!
 //! How others do it: DXR and Vulkan ray-tracing pipelines run a closest-hit
 //! shader per hit group (Unreal's ray-tracing materials, RTXPT), which sees
 //! the instance's transform and writes a payload; wavefront tracers split
 //! intersection from shading through a hit buffer and keep the instance
-//! table on the GPU (Laine et al. 2013). This tracer is the inline
-//! equivalent of a closest-hit shader for the meshes' hit group.
+//! table on the GPU (Laine et al. 2013), as this tracer does.
 //!
 //! Cost scales with the rays a consumer writes, never with the scene: per
-//! stream one dispatch over its count, bind groups made when their inputs
-//! change, one 16-byte uniform written a frame.
+//! stream one dispatch over its count (two for a nearest-hit stream), bind
+//! groups made when their inputs change, one 16-byte uniform written a
+//! frame.
 
 pub mod feature;
 mod settings;
@@ -125,9 +132,23 @@ pub fn tracer() -> Tracer {
                 .add_pass(Box::new(MeshRayPass::new(*stream, tracer)));
             Ok(())
         }),
-        // The trace pass writes the surfaces of the hits it commits (crate
-        // docs): nothing to add once every tracer traced.
-        surface: Arc::new(|_, _, _| Ok(())),
+        // The surfaces of the hits that stayed the meshes' (crate docs).
+        surface: Arc::new(|build, stream, id| {
+            let (device, queue) = (build.env.device.clone(), build.env.queue.clone());
+            let pipelines = build
+                .env
+                .shared(|| SharedPipelines(None))
+                .0
+                .get_or_insert_with(|| Arc::new(Pipelines::new(&device, &queue)))
+                .clone();
+            let tracer =
+                MeshRayTracer::with_pipelines(build.env.device, pipelines, stream.class, id)
+                    .surfaces();
+            build
+                .graph
+                .add_pass(Box::new(MeshRayPass::new(*stream, tracer)));
+            Ok(())
+        }),
     }
 }
 
@@ -145,12 +166,17 @@ pub struct StreamBindings<'a> {
 }
 
 /// The meshes as rays see them this frame: the TLAS, its instance rows
-/// (`helio_mesh_api::RAY_INSTANCES`), the scene's mesh pools, the proxy
-/// pool and the skin cache (`helio_mesh_api::RAY_SKINNED_VERTICES`), if any.
+/// (`helio_mesh_api::RAY_INSTANCES`) and transforms
+/// (`helio_mesh_api::RAY_INSTANCE_TRANSFORMS`), the coordinate spaces' mask
+/// groups (`helio_mesh_api::RAY_SPACE_GROUPS`; none: the world's alone), the
+/// scene's mesh pools, the proxy pool and the skin cache
+/// (`helio_mesh_api::RAY_SKINNED_VERTICES`), if any.
 #[derive(Clone, Copy)]
 pub struct MeshRayScene<'a> {
     pub tlas: &'a wgpu::Tlas,
     pub instances: &'a wgpu::Buffer,
+    pub transforms: &'a wgpu::Buffer,
+    pub space_groups: Option<&'a wgpu::Buffer>,
     pub vertices: &'a wgpu::Buffer,
     pub indices: &'a wgpu::Buffer,
     pub proxies: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer)>,
@@ -168,11 +194,14 @@ pub struct Pipelines {
     binding: MaterialBindingConfig,
     nearest: wgpu::ComputePipeline,
     occlusion: wgpu::ComputePipeline,
+    surface: wgpu::ComputePipeline,
     /// Without the materials plugin: the materials' stand-in (one grey
     /// opaque row, a white texture table), as every drawer binds.
     no_materials: wgpu::BindGroup,
     /// No proxy pool: a binding for each of its buffers.
     no_proxies: wgpu::Buffer,
+    /// No space groups published: the world's (slot 0, group 0) alone.
+    world_only: wgpu::Buffer,
 }
 
 /// `mesh_rays.wgsl` with the cut-outs' alpha evaluator
@@ -189,8 +218,10 @@ pub fn shader_source(binding: MaterialBindingConfig) -> String {
 }
 
 /// What the shader resolves (`//!use` markers).
-pub const SNIPPETS: [helio_core::shader::ShaderSnippet; 3] = [
+pub const SNIPPETS: [helio_core::shader::ShaderSnippet; 5] = [
     helio_frame_api::rays::stream::SNIPPET,
+    helio_frame_api::rays::stream::SURFACE_SNIPPET,
+    helio_frame_api::gbuffer::SURFACE_SNIPPET,
     helio_mesh_api::RAY_SURFACE_SNIPPET,
     helio_mats::MATERIAL_ROW_SNIPPET,
 ];
@@ -245,12 +276,14 @@ impl Pipelines {
             storage(8, true),
             storage(9, true),
             storage(11, true),
+            storage(12, true),
         ];
         let occlusion_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Mesh rays (occlusion)"),
             entries: &entries,
         });
         entries.push(storage(10, false));
+        entries.push(storage(13, true));
         let nearest_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Mesh rays (nearest)"),
             entries: &entries,
@@ -296,6 +329,7 @@ impl Pipelines {
             &occlusion_layout,
             "mesh_rays_occlusion",
         );
+        let surface = pipeline("mesh_rays_surface", &nearest_layout, "mesh_rays_surface");
         let stand_in = MaterialStandIn::new(device, queue);
         let no_materials = materials_group(
             device,
@@ -306,10 +340,22 @@ impl Pipelines {
         );
         let no_proxies = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Mesh rays no proxies"),
-            size: 16,
+            size: 48,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        let world_only = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Mesh rays world space only"),
+            size: (helio_mesh_api::RAY_SPACE_SLOTS * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        helio_core::upload::write_buffer(
+            queue,
+            &world_only,
+            0,
+            bytemuck::cast_slice(&helio_mesh_api::ray_space_groups([0])),
+        );
         Self {
             nearest_layout,
             occlusion_layout,
@@ -317,8 +363,10 @@ impl Pipelines {
             binding,
             nearest,
             occlusion,
+            surface,
             no_materials,
             no_proxies,
+            world_only,
         }
     }
 }
@@ -345,32 +393,36 @@ fn materials_group(
 }
 
 /// Group 0's inputs, by identity: header, rays, hits, instances, vertices,
-/// indices, proxy vertices, proxy indices; the surfaces; the TLAS.
+/// indices, proxy vertices, proxy indices, skinned vertices, space groups;
+/// the surfaces and transforms; the TLAS.
 struct Inputs {
-    buffers: [wgpu::Buffer; 9],
-    surfaces: Option<wgpu::Buffer>,
+    buffers: [wgpu::Buffer; 10],
+    surfaces: Option<(wgpu::Buffer, wgpu::Buffer)>,
     tlas: wgpu::Tlas,
 }
 
 impl Inputs {
     fn matches(
         &self,
-        buffers: &[&wgpu::Buffer; 9],
-        surfaces: Option<&wgpu::Buffer>,
+        buffers: &[&wgpu::Buffer; 10],
+        surfaces: Option<(&wgpu::Buffer, &wgpu::Buffer)>,
         tlas: &wgpu::Tlas,
     ) -> bool {
         self.tlas == *tlas
-            && self.surfaces.as_ref() == surfaces
+            && self.surfaces.as_ref().map(|(a, b)| (a, b)) == surfaces
             && self.buffers.iter().zip(buffers).all(|(a, b)| a == *b)
     }
 }
 
-/// The meshes' dispatch for one stream: its class's pipeline, its uniform
-/// (seed and tracer id) and its bind groups, made when their inputs change.
+/// The meshes' dispatch for one stream: its class's pipeline (or, for
+/// [`Self::surfaces`], the surface pass's), its uniform (seed and tracer id)
+/// and its bind groups, made when their inputs change.
 pub struct MeshRayTracer {
     pipelines: Arc<Pipelines>,
     class: RayClass,
     tracer: TracerId,
+    /// The surface pass of a nearest-hit stream, not its trace.
+    surfaces: bool,
     frame: wgpu::Buffer,
     inputs: Option<(Inputs, wgpu::BindGroup)>,
     /// The scene's material table, by what it was made of.
@@ -407,6 +459,7 @@ impl MeshRayTracer {
             pipelines,
             class,
             tracer,
+            surfaces: false,
             frame: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Mesh rays frame"),
                 size: FRAME_BYTES,
@@ -416,6 +469,14 @@ impl MeshRayTracer {
             inputs: None,
             materials: None,
         }
+    }
+
+    /// The surface pass of the stream (`mesh_rays_surface`): it writes the
+    /// surfaces of the hits that are this tracer's, after every tracer
+    /// traced. Nothing for an occlusion stream.
+    pub fn surfaces(mut self) -> Self {
+        self.surfaces = true;
+        self
     }
 
     /// Writes frame `frame`'s uniform through `write` (buffer, bytes): its
@@ -428,8 +489,9 @@ impl MeshRayTracer {
         write(&self.frame, bytemuck::bytes_of(&uniform));
     }
 
-    /// Records the meshes' answer to `stream`'s rays: nothing without a
-    /// `scene` (no TLAS or no instance rows this frame). `materials`: the
+    /// Records the meshes' answer to `stream`'s rays (or, for
+    /// [`Self::surfaces`], their hits' surfaces): nothing without a `scene`
+    /// (no TLAS, instance rows or transforms this frame). `materials`: the
     /// scene's material rows and texture table, if published (the
     /// stand-in's otherwise).
     pub fn record(
@@ -445,16 +507,18 @@ impl MeshRayTracer {
         };
         let surfaces = match self.class {
             RayClass::Nearest => match stream.surfaces {
-                Some(surfaces) => Some(surfaces),
+                Some(surfaces) => Some((surfaces, scene.transforms)),
                 // A nearest-hit stream without its surfaces is no stream.
                 None => return,
             },
+            RayClass::Occlusion if self.surfaces => return,
             RayClass::Occlusion => None,
         };
         let (proxy_vertices, proxy_indices) = scene
             .proxies
             .unwrap_or((&self.pipelines.no_proxies, &self.pipelines.no_proxies));
         let skinned = scene.skinned.unwrap_or(&self.pipelines.no_proxies);
+        let space_groups = scene.space_groups.unwrap_or(&self.pipelines.world_only);
         let buffers = [
             stream.header,
             stream.rays,
@@ -465,13 +529,14 @@ impl MeshRayTracer {
             proxy_vertices,
             proxy_indices,
             skinned,
+            space_groups,
         ];
         if !self
             .inputs
             .as_ref()
             .is_some_and(|(inputs, _)| inputs.matches(&buffers, surfaces, scene.tlas))
         {
-            let mut entries: Vec<wgpu::BindGroupEntry<'_>> = [0, 1, 2, 5, 6, 7, 8, 9, 11]
+            let mut entries: Vec<wgpu::BindGroupEntry<'_>> = [0, 1, 2, 5, 6, 7, 8, 9, 11, 12]
                 .into_iter()
                 .zip(buffers)
                 .map(|(binding, buffer)| wgpu::BindGroupEntry {
@@ -487,10 +552,14 @@ impl MeshRayTracer {
                 binding: 4,
                 resource: wgpu::BindingResource::AccelerationStructure(scene.tlas),
             });
-            if let Some(surfaces) = surfaces {
+            if let Some((surfaces, transforms)) = surfaces {
                 entries.push(wgpu::BindGroupEntry {
                     binding: 10,
                     resource: surfaces.as_entire_binding(),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: transforms.as_entire_binding(),
                 });
             }
             let layout = match self.class {
@@ -504,7 +573,7 @@ impl MeshRayTracer {
             });
             let inputs = Inputs {
                 buffers: buffers.map(Clone::clone),
-                surfaces: surfaces.cloned(),
+                surfaces: surfaces.map(|(a, b)| (a.clone(), b.clone())),
                 tlas: scene.tlas.clone(),
             };
             self.inputs = Some((inputs, group));
@@ -539,12 +608,17 @@ impl MeshRayTracer {
         let Some((_, group)) = &self.inputs else {
             return;
         };
-        let pipeline = match self.class {
-            RayClass::Nearest => &self.pipelines.nearest,
-            RayClass::Occlusion => &self.pipelines.occlusion,
+        let pipeline = match (self.class, self.surfaces) {
+            (RayClass::Nearest, true) => &self.pipelines.surface,
+            (RayClass::Nearest, false) => &self.pipelines.nearest,
+            (RayClass::Occlusion, _) => &self.pipelines.occlusion,
         };
         let mut pass = cmds.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("Mesh rays"),
+            label: Some(if self.surfaces {
+                "Mesh ray surfaces"
+            } else {
+                "Mesh rays"
+            }),
             timestamp_writes: None,
         });
         pass.set_pipeline(pipeline);
@@ -555,7 +629,8 @@ impl MeshRayTracer {
 }
 
 /// The meshes' pass for one stream in the graph (where the consumer's node
-/// called `stream::trace`).
+/// called `stream::trace`): its trace, or (a [`MeshRayTracer::surfaces`]
+/// tracer) its hits' surfaces.
 pub struct MeshRayPass {
     stream: Stream,
     tracer: MeshRayTracer,
@@ -572,14 +647,22 @@ impl MeshRayPass {
             stream.hits,
             helio_core::resource_keys::RENDER_ENVIRONMENT,
             helio_mesh_api::RAY_INSTANCES,
+            helio_mesh_api::RAY_INSTANCE_TRANSFORMS,
+            helio_mesh_api::RAY_SPACE_GROUPS,
             helio_mesh_api::RAY_PROXY_VERTICES,
             helio_mesh_api::RAY_PROXY_INDICES,
             helio_mesh_api::RAY_SKINNED_VERTICES,
         ]);
-        let mut writes = vec![stream.hits];
-        writes.extend(stream.surfaces);
+        let (name, writes) = if tracer.surfaces {
+            (
+                format!("MeshRaySurfaces {}", stream.name),
+                stream.surfaces.into_iter().collect::<Vec<_>>(),
+            )
+        } else {
+            (format!("MeshRays {}", stream.name), vec![stream.hits])
+        };
         Self {
-            name: helio_frame_api::static_name(&format!("MeshRays {}", stream.name)),
+            name: helio_frame_api::static_name(&name),
             reads,
             writes: helio_frame_api::static_names(&writes),
             stream,
@@ -639,21 +722,28 @@ impl RenderPass for MeshRayPass {
         let instances = ctx
             .registry
             .get::<&wgpu::Buffer>(ResourceKey::new(helio_mesh_api::RAY_INSTANCES));
+        let transforms = ctx
+            .registry
+            .get::<&wgpu::Buffer>(ResourceKey::new(helio_mesh_api::RAY_INSTANCE_TRANSFORMS));
         let pool = |key: helio_core::BufferKey| ctx.scene_buffers.get(key).map(|h| &h.buffer);
         let vertices = pool(helio_mesh_api::MESH_VERTICES.key());
         let indices = pool(helio_mesh_api::MESH_INDICES.key());
         let proxy = |name: &'static str| ctx.registry.get::<&wgpu::Buffer>(ResourceKey::new(name));
         let proxies =
             proxy(helio_mesh_api::RAY_PROXY_VERTICES).zip(proxy(helio_mesh_api::RAY_PROXY_INDICES));
-        let scene = match (tlas, instances, vertices, indices) {
-            (Some(tlas), Some(instances), Some(vertices), Some(indices)) => Some(MeshRayScene {
-                tlas,
-                instances,
-                vertices,
-                indices,
-                proxies,
-                skinned: proxy(helio_mesh_api::RAY_SKINNED_VERTICES),
-            }),
+        let scene = match (tlas, instances, transforms, vertices, indices) {
+            (Some(tlas), Some(instances), Some(transforms), Some(vertices), Some(indices)) => {
+                Some(MeshRayScene {
+                    tlas,
+                    instances,
+                    transforms,
+                    space_groups: proxy(helio_mesh_api::RAY_SPACE_GROUPS),
+                    vertices,
+                    indices,
+                    proxies,
+                    skinned: proxy(helio_mesh_api::RAY_SKINNED_VERTICES),
+                })
+            }
             _ => None,
         };
         let materials = pool(helio_mats::MATERIALS.key()).zip(
@@ -708,7 +798,11 @@ mod shader_tests {
             // copies the whole table per invocation).
             let copies = helio_core::shader::value_array_copies(&text).unwrap();
             assert!(copies.is_empty(), "{copies:#?}");
-            for entry in ["mesh_rays_nearest", "mesh_rays_occlusion"] {
+            for entry in [
+                "mesh_rays_nearest",
+                "mesh_rays_occlusion",
+                "mesh_rays_surface",
+            ] {
                 assert!(
                     module.entry_points.iter().any(|e| e.name == entry),
                     "no {entry}"

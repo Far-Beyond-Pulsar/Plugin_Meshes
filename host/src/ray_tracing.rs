@@ -115,7 +115,7 @@ struct MaterialRow {
     /// `RAY_INSTANCE_MASKED` and `RAY_INSTANCE_TWO_SIDED` bits.
     flags: u32,
     base_color: [f32; 4],
-    emissive: [f32; 4],
+    emissive: [f32; 3],
 }
 
 fn casts_shadow(object: &StaticObjectComponent) -> bool {
@@ -140,6 +140,8 @@ pub struct SceneDbRayTracing {
     transmission_rows: Vec<[f32; 4]>,
     /// Each instance's surface (`RayInstance`), in TLAS order.
     instances_buffer: Option<wgpu::Buffer>,
+    /// Each TLAS instance's transform (`RAY_INSTANCE_TRANSFORMS`).
+    transforms_buffer: Option<wgpu::Buffer>,
     instance_rows: Vec<RayInstance>,
     /// Whether objects the projection cannot represent are left out
     /// ([`Self::partial`]) instead of failing the build.
@@ -218,6 +220,7 @@ impl SceneDbRayTracing {
             has_transmission: false,
             transmission_rows: Vec::new(),
             instances_buffer: None,
+            transforms_buffer: None,
             instance_rows: Vec::new(),
             partial,
             skipped: HashMap::new(),
@@ -400,6 +403,11 @@ impl SceneDbRayTracing {
         if let Some(instances) = &self.instances_buffer {
             rays = rays.with(helio_mesh_api::RAY_INSTANCES, instances.clone());
         }
+        // Only the world's space is projected: no space groups (the
+        // tracer's stand-in is the world's alone).
+        if let Some(transforms) = &self.transforms_buffer {
+            rays = rays.with(helio_mesh_api::RAY_INSTANCE_TRANSFORMS, transforms.clone());
+        }
         if let Some((vertices, indices)) = self.vg.as_ref().and_then(VgRayProxies::buffers) {
             rays = rays
                 .with(helio_mesh_api::RAY_PROXY_VERTICES, vertices.clone())
@@ -508,8 +516,40 @@ impl SceneDbRayTracing {
                 )
                 .map_err(|e| rt_error(&e.to_string()))?;
             self.queue.submit([encoder.finish()]);
+            self.write_transforms();
         }
         Ok(true)
+    }
+
+    /// Upload every TLAS instance's transform
+    /// (`helio_mesh_api::RAY_INSTANCE_TRANSFORMS`).
+    fn write_transforms(&mut self) {
+        let transforms: Vec<helio_mesh_api::RayTransform> = self
+            .instances
+            .iter()
+            .map(|instance| helio_mesh_api::RayTransform::from_rows(instance.transform))
+            .collect();
+        let size =
+            (transforms.len().max(1) * std::mem::size_of::<helio_mesh_api::RayTransform>()) as u64;
+        if self
+            .transforms_buffer
+            .as_ref()
+            .is_none_or(|buffer| buffer.size() < size)
+        {
+            self.transforms_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("SceneDB RT instance transforms"),
+                size: size.next_power_of_two(),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        if !transforms.is_empty() {
+            self.queue.write_buffer(
+                self.transforms_buffer.as_ref().expect("made above"),
+                0,
+                bytemuck::cast_slice(&transforms),
+            );
+        }
     }
 
     fn build(&mut self, world: &World) -> helio_core::Result<()> {
@@ -624,7 +664,7 @@ impl SceneDbRayTracing {
                         flags: if masked { RAY_INSTANCE_MASKED } else { 0 }
                             | if two_sided { RAY_INSTANCE_TWO_SIDED } else { 0 },
                         base_color: [r, g, b, 1.0],
-                        emissive: [er * strength, eg * strength, eb * strength, 0.0],
+                        emissive: [er * strength, eg * strength, eb * strength],
                     };
                     material_rows.insert(object.material_slot, row);
                     row
@@ -811,6 +851,7 @@ impl SceneDbRayTracing {
                 material: object.material_slot,
                 base_color: row.base_color,
                 emissive: row.emissive,
+                instance: instances.len() as u32,
                 transmission: rgb,
                 skinned_vertex: 0,
             });
@@ -897,6 +938,7 @@ impl SceneDbRayTracing {
         self.instance_rows = instance_rows;
         self.instances = instances;
         self.queue.submit([encoder.finish()]);
+        self.write_transforms();
         Ok(())
     }
 }

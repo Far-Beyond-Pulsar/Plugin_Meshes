@@ -5,6 +5,7 @@
 //!use specular_aa
 //!use material_row
 //!use material_surface
+//!use frame_surface
 //!use mesh_draw_rows
 //!use mesh_skinning
 //!use frame_ray_stream

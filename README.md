@@ -31,7 +31,7 @@ draw phases and api crates.
 | `helio-pass-indirect-dispatch` | `feature/indirect-dispatch/` | Helio pass: builds the meshes' indirect draw arguments |
 | `helio-pass-object-batch` | `feature/object-batch/` | GPU-driven sort/group/batch pipeline: turns SceneDB's StaticObjectComponent rows into instances/draw_calls/material_class_ranges with zero per-frame CPU involvement |
 | `helio-pass-occlusion-cull` | `feature/occlusion-cull/` | Helio pass: Hi-Z occlusion culling of the mesh instances |
-| `helio-pass-mesh-rays` | `feature/rays/` | Helio pass: the meshes' tracer of ray streams (`helio_frame_api::rays::stream`): ray queries against the frame's TLAS, nearest hits with their surfaces and occlusion |
+| `helio-pass-mesh-rays` | `feature/rays/` | Helio pass: the meshes' tracer of ray streams (`helio_frame_api::rays::stream`): ray queries against the frame's TLAS culled by the ray's coordinate space (`RAY_SPACE_GROUPS`), nearest hits and occlusion, and a surface pass writing the meshes' hits' `SceneSurface` from the instances' transforms (`RAY_INSTANCE_TRANSFORMS`) |
 | `helio-pass-shadow` | `feature/shadow/` | Helio pass: the meshes' shadow-caster drawer (opens the shadow-caster phase) |
 | `helio-pass-shadow-dirty` | `feature/shadow-dirty/` | Helio pass: which shadow views need redrawing |
 | `helio-pass-transparent` | `feature/transparent/` | Helio pass: the meshes' transparent drawer |

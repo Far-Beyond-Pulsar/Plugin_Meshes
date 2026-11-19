@@ -44,6 +44,13 @@
 //!   budget keeps last frame's BLAS (a frame stale, not wrong). Their rows
 //!   (`RAY_INSTANCE_SKINNED`) point the tracer at the cache, so a hit shades
 //!   from the skinned normal.
+//! - **Coordinate spaces.** Each row carries the space slot its owner is
+//!   authored in (`pulsar_scene_model::frames::space_of`), and each TLAS
+//!   instance's mask is its caster class in its space's group
+//!   (`helio_mesh_api::RAY_SPACE_GROUPS`, published beside the TLAS, with
+//!   each instance's transform, `RAY_INSTANCE_TRANSFORMS`): a ray
+//!   restricted to a space sees that space's instances alone. A space slot
+//!   assigned or taken (`SpaceSlot`'s journal) re-evaluates the meshes below.
 //! - **Culled by distance and angle** (`RAY_TRACING`'s `culling_radius` and
 //!   `culling_angle`, Unreal's ray-tracing culling): an instance past the
 //!   radius whose bounding sphere spans less than the angle from the eye
@@ -71,17 +78,16 @@ use std::sync::Arc;
 
 use glam::{DMat4, DVec3};
 use helio_core::{BlasGeometry, BlasManager, BlasSegment, TlasInstanceInput, TlasManager};
-use helio_frame_api::rays::stream::{MASK_MOVABLE, MASK_STATIC};
 use helio_mats::instance::{MaterialInstanceComponent, row_of};
 use helio_mesh_api::{
     RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_SKINNED, RAY_INSTANCE_TWO_SIDED,
-    RayInstance,
+    RAY_SPACE_GROUP, RAY_SPACE_SLOTS, RayInstance, RayTransform,
 };
 use helio_mesh_host::ray_proxies::{Lookup, ProxyRange, VgRayProxies};
 use helio_mesh_host::texture_means::TextureMeans;
 use helio_pass_mesh_rays::RayTracingSettings;
 use pulsar_scene_model::attachments::ComponentOwner;
-use pulsar_scene_model::{Parent, Transform, Visibility};
+use pulsar_scene_model::{Parent, SpaceSlot, Transform, Visibility};
 use pulsar_scenedb::gpu::{GpuMirrorHandle, SceneGpuStore, VarLenHandle};
 use pulsar_scenedb::{ChangeCursor, ChangeRead, ComponentChange, Entity, World};
 
@@ -167,7 +173,7 @@ struct Surface {
     /// `RAY_INSTANCE_MASKED` and `RAY_INSTANCE_TWO_SIDED` bits.
     flags: u32,
     base_color: [f32; 4],
-    emissive: [f32; 4],
+    emissive: [f32; 3],
 }
 
 /// Why a mesh is not traced. The first four are retried every frame (they
@@ -212,6 +218,8 @@ struct Traced {
     materials: Vec<Entity>,
     world: DMat4,
     movable: bool,
+    /// The coordinate space slot its owner is authored in.
+    space: u32,
     proxy: Option<u64>,
     /// Its TLAS instance, once its BLAS is built.
     slot: Option<usize>,
@@ -244,6 +252,7 @@ struct Cursors {
     visibility: ChangeCursor,
     parents: ChangeCursor,
     transforms: ChangeCursor,
+    spaces: ChangeCursor,
 }
 
 impl Cursors {
@@ -257,6 +266,7 @@ impl Cursors {
             visibility: world.open_change_cursor::<Visibility>(),
             parents: world.open_change_cursor::<Parent>(),
             transforms: world.open_change_cursor::<Transform>(),
+            spaces: world.open_change_cursor::<SpaceSlot>(),
         }
     }
 }
@@ -296,6 +306,15 @@ pub struct WorldRayScene {
     rows: Vec<RayInstance>,
     rows_dirty: bool,
     instances_buffer: Option<wgpu::Buffer>,
+    /// Each TLAS instance's transform (`RAY_INSTANCE_TRANSFORMS`), and the
+    /// slots whose transform changed since it was last written (every slot
+    /// after the rows are laid out again or the origin moves).
+    transforms_buffer: Option<wgpu::Buffer>,
+    moved_slots: Vec<usize>,
+    all_moved: bool,
+    /// The spaces' mask groups (`RAY_SPACE_GROUPS`), as last uploaded.
+    space_groups: [u32; RAY_SPACE_SLOTS],
+    space_groups_buffer: Option<wgpu::Buffer>,
     origin: DVec3,
     cursors: Option<Cursors>,
     changes: Vec<ComponentChange>,
@@ -353,6 +372,11 @@ impl WorldRayScene {
             rows: Vec::new(),
             rows_dirty: true,
             instances_buffer: None,
+            transforms_buffer: None,
+            moved_slots: Vec::new(),
+            all_moved: true,
+            space_groups: [u32::MAX; RAY_SPACE_SLOTS],
+            space_groups_buffer: None,
             origin: DVec3::ZERO,
             cursors: None,
             changes: Vec::new(),
@@ -461,6 +485,7 @@ impl WorldRayScene {
                     self.instances[slot].transform = tlas_transform(traced.world, origin);
                 }
             }
+            self.all_moved = true;
         }
         self.build_blases(store, encoder);
         self.refit_skinned(store, skins, encoder);
@@ -468,6 +493,7 @@ impl WorldRayScene {
         if self.rows_dirty {
             self.write_rows();
         }
+        self.write_transforms();
         match self
             .tlas
             .build_masked(encoder, &self.instances, &self.blas, &self.masks)
@@ -528,6 +554,12 @@ impl WorldRayScene {
         if let Some(instances) = &self.instances_buffer {
             rays = rays.with(helio_mesh_api::RAY_INSTANCES, instances.clone());
         }
+        if let Some(transforms) = &self.transforms_buffer {
+            rays = rays.with(helio_mesh_api::RAY_INSTANCE_TRANSFORMS, transforms.clone());
+        }
+        if let Some(groups) = &self.space_groups_buffer {
+            rays = rays.with(helio_mesh_api::RAY_SPACE_GROUPS, groups.clone());
+        }
         if let Some((vertices, indices)) = self.vg.as_ref().and_then(VgRayProxies::buffers) {
             rays = rays
                 .with(helio_mesh_api::RAY_PROXY_VERTICES, vertices.clone())
@@ -576,7 +608,13 @@ impl WorldRayScene {
                 // or re-pointed at another mesh (re-evaluated: cheap).
                 let skeletal = read(&mut cursors.skeletal);
                 let materials = read(&mut cursors.materials);
-                let placed = [read(&mut cursors.visibility), read(&mut cursors.parents)];
+                // A space slot assigned or taken moves the meshes below
+                // into another space.
+                let placed = [
+                    read(&mut cursors.visibility),
+                    read(&mut cursors.parents),
+                    read(&mut cursors.spaces),
+                ];
                 let transforms = read(&mut cursors.transforms);
                 if complete {
                     dirty.extend(own.into_iter().flatten());
@@ -796,12 +834,18 @@ impl WorldRayScene {
     ) -> Option<Entry> {
         let link = world.get::<ComponentOwner>(entity)?;
         let owner = link.entity();
-        let state = if let Some(mesh) = world.get::<StaticMeshComponent>(entity) {
+        let mut state = if let Some(mesh) = world.get::<StaticMeshComponent>(entity) {
             self.trace(world, mirror, store, entity, mesh, link, owner)
         } else {
             let mesh = world.get::<SkeletalMeshComponent>(entity)?;
             self.trace_skinned(world, mirror, store, skins, entity, mesh, link, owner)
         };
+        if let Ok(traced) = &mut state {
+            traced.space = pulsar_scene_model::frames::space_of(world, owner);
+            for row in &mut traced.rows {
+                *row = row.in_space(traced.space);
+            }
+        }
         let chain = chain_of(world, owner);
         Some(Entry { chain, state })
     }
@@ -890,6 +934,7 @@ impl WorldRayScene {
                     material: row_of(material),
                     base_color: surface.base_color,
                     emissive: surface.emissive,
+                    instance: 0,
                     transmission: [0.0; 3],
                     skinned_vertex: skin.cache_vertex,
                 })
@@ -897,6 +942,7 @@ impl WorldRayScene {
             materials: vec![material; sections.len()],
             world: world_matrix,
             movable: true,
+            space: 0,
             proxy: None,
             slot: None,
             source_hint: (
@@ -972,6 +1018,7 @@ impl WorldRayScene {
                 material: row_of(material),
                 base_color: surface.base_color,
                 emissive: surface.emissive,
+                instance: 0,
                 transmission: [0.0; 3],
                 skinned_vertex: 0,
             };
@@ -1052,6 +1099,7 @@ impl WorldRayScene {
             materials,
             world: world_matrix,
             movable,
+            space: 0,
             proxy,
             slot: None,
             source_hint,
@@ -1081,6 +1129,7 @@ impl WorldRayScene {
         (traced.center, traced.radius) = world_sphere(matrix, traced.bounds_local);
         if let Some(slot) = traced.slot {
             self.instances[slot].transform = tlas_transform(matrix, self.origin);
+            self.moved_slots.push(slot);
         }
         self.cull(entity);
     }
@@ -1327,29 +1376,58 @@ impl WorldRayScene {
                 transform: tlas_transform(traced.world, self.origin),
                 custom_data: 0,
             });
-            // The casters' masks rays select by (the frame's ray masks).
-            self.masks.push(if traced.movable {
-                MASK_MOVABLE
-            } else {
-                MASK_STATIC
-            });
+            // Its mask: its caster class in its space's group, once the
+            // rows are laid out (`write_rows`).
+            self.masks.push(0);
             self.rows_dirty = true;
         }
     }
 
     /// Lay the traced meshes' rows out in TLAS order (each instance's custom
-    /// data its first row) and upload them; keep the proxies they use.
+    /// data its first row, each row its instance), give the spaces their
+    /// mask groups and each instance its mask, and upload them; keep the
+    /// proxies they use.
     fn write_rows(&mut self) {
         self.rows_dirty = false;
+        self.all_moved = true;
         self.rows.clear();
+        let traced_spaces: Vec<u32> = self
+            .slots
+            .iter()
+            .filter_map(|entity| match self.entries.get(entity).map(|e| &e.state) {
+                Some(Ok(traced)) => Some(traced.space),
+                _ => None,
+            })
+            .collect();
+        let groups = helio_mesh_api::ray_space_groups(traced_spaces);
         let mut proxies = HashSet::new();
         for (slot, entity) in self.slots.iter().enumerate() {
             let Some(Ok(traced)) = self.entries.get(entity).map(|e| &e.state) else {
                 continue;
             };
             self.instances[slot].custom_data = self.rows.len() as u32;
-            self.rows.extend_from_slice(&traced.rows);
+            self.masks[slot] = helio_mesh_api::ray_instance_mask(
+                groups[traced.space as usize % RAY_SPACE_SLOTS] & RAY_SPACE_GROUP,
+                traced.movable,
+            );
+            self.rows.extend(traced.rows.iter().map(|row| RayInstance {
+                instance: slot as u32,
+                ..*row
+            }));
             proxies.extend(traced.proxy);
+        }
+        if groups != self.space_groups || self.space_groups_buffer.is_none() {
+            self.space_groups = groups;
+            let buffer = self.space_groups_buffer.get_or_insert_with(|| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("World RT space groups"),
+                    size: (RAY_SPACE_SLOTS * 4) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            });
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&self.space_groups));
         }
         for entity in &self.awaiting_blas {
             if let Some(Ok(traced)) = self.entries.get(entity).map(|e| &e.state) {
@@ -1379,6 +1457,63 @@ impl WorldRayScene {
                 bytemuck::cast_slice(&self.rows),
             );
         }
+    }
+
+    /// Upload the transforms of the TLAS instances that moved
+    /// (`RAY_INSTANCE_TRANSFORMS`): every one after the rows were laid out
+    /// again or the origin moved, else the moved slots' runs.
+    fn write_transforms(&mut self) {
+        let bytes = std::mem::size_of::<RayTransform>();
+        let size = (self.instances.len().max(1) * bytes) as u64;
+        if self
+            .transforms_buffer
+            .as_ref()
+            .is_none_or(|buffer| buffer.size() < size)
+        {
+            self.transforms_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("World RT transforms"),
+                size: size.next_power_of_two(),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.all_moved = true;
+        }
+        let buffer = self.transforms_buffer.as_ref().expect("made above");
+        let rows = |range: std::ops::Range<usize>| -> Vec<RayTransform> {
+            self.instances[range]
+                .iter()
+                .map(|instance| RayTransform::from_rows(instance.transform))
+                .collect()
+        };
+        if self.all_moved {
+            self.all_moved = false;
+            self.moved_slots.clear();
+            if !self.instances.is_empty() {
+                let all = rows(0..self.instances.len());
+                self.queue
+                    .write_buffer(buffer, 0, bytemuck::cast_slice(&all));
+            }
+            return;
+        }
+        let mut moved = std::mem::take(&mut self.moved_slots);
+        moved.retain(|&slot| slot < self.instances.len());
+        moved.sort_unstable();
+        moved.dedup();
+        let mut at = 0;
+        while at < moved.len() {
+            let first = moved[at];
+            let mut last = first;
+            while at + 1 < moved.len() && moved[at + 1] == last + 1 {
+                at += 1;
+                last = moved[at];
+            }
+            at += 1;
+            let run = rows(first..last + 1);
+            self.queue
+                .write_buffer(buffer, (first * bytes) as u64, bytemuck::cast_slice(&run));
+        }
+        moved.clear();
+        self.moved_slots = moved;
     }
 
     /// What a ray sees of the material instance `entity` (cached until it
@@ -1427,7 +1562,7 @@ impl WorldRayScene {
                 flags: if masked { RAY_INSTANCE_MASKED } else { 0 }
                     | if two_sided { RAY_INSTANCE_TWO_SIDED } else { 0 },
                 base_color: [r * mean[0], g * mean[1], b * mean[2], 1.0],
-                emissive: [er * strength, eg * strength, eb * strength, 0.0],
+                emissive: [er * strength, eg * strength, eb * strength],
             }
         });
         self.surfaces.insert(entity, surface);

@@ -5,6 +5,7 @@ enable wgpu_binding_array;
 //!use pbr_eval
 //!use material_row
 //!use material_surface
+//!use frame_surface
 //!use mesh_draw_rows
 //!use mesh_skinning
 //!use frame_ray_stream
@@ -382,7 +383,7 @@ fn mesh_fragment(vertex: VertexOutput, front: bool, content_to_drawn: mat3x3<f32
     // Material graphs evaluate in the content's world. Only the final
     // G-buffer normal rotates back into the projected frame's world.
     let drawn_to_content = transpose(content_to_drawn);
-    let surface = radiant_eval_surface(material, material_tex, MaterialInput(
+    var surface = radiant_eval_surface(material, material_tex, MaterialInput(
         input.clip_position, input.content_position, drawn_to_content * input.world_normal,
         drawn_to_content * input.world_tangent, input.bitangent_sign, input.tex_coords,
         eye, globals.frame,
@@ -392,15 +393,6 @@ fn mesh_fragment(vertex: VertexOutput, front: bool, content_to_drawn: mat3x3<f32
     if surface.alpha <= 0.001 { discard; }
     if surface.alpha < material_tex.params.z { discard; }
 
-    var out: GBufferOutput;
-    out.albedo = vec4<f32>(surface.albedo.rgb, surface.alpha);
-    out.normal = vec4<f32>(content_to_drawn * surface.normal, surface.specular_f0.r);
-    out.orm = vec4<f32>(surface.ao, surface.roughness, surface.metallic, surface.specular_f0.g);
-    out.emissive = vec4<f32>(surface.emissive, surface.specular_f0.b);
-    out.surface = input.lightmap_uv;
-    out.sss = vec4<f32>(surface.subsurface_color, surface.subsurface_radius);
-    out.extra = vec4<f32>(surface.roughness_aniso_x, surface.roughness_aniso_y,
-                          surface.aniso_rotation, f32(surface.flags));
-    out.velocity = compute_velocity(input);
-    return out;
+    surface.normal = content_to_drawn * surface.normal;
+    return gbuffer_output(surface, input.lightmap_uv, compute_velocity(input));
 }

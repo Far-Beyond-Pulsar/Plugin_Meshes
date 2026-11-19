@@ -4,7 +4,9 @@
 //! the meshes', a ray's length and caster mask, cut-outs (exact at a fine
 //! footprint, in proportion to coverage at a coarse one), occlusion through
 //! sheets, cut-outs and opaque meshes, a proxy (virtual-geometry) instance,
-//! rows past the header's count, and a frame without a TLAS. The last test
+//! rows past the header's count, a frame without a TLAS, and coordinate
+//! spaces (overlapping placements in different spaces, a group each and
+//! shared groups). The last test
 //! traces a stream in a mesh scene's graph, its TLAS from the standalone
 //! projection. Needs hardware ray queries: without them each test returns
 //! at once.
@@ -14,11 +16,12 @@ use std::sync::Arc;
 use glam::{Mat3, Mat4, Quat, Vec2, Vec3};
 use helio_core::{BlasGeometry, BlasManager, BlasSegment, TlasInstanceInput, TlasManager};
 use helio_frame_api::rays::stream::{
-    self, RayClass, SceneHit, SceneRay, SceneSurface, Stream, StreamBuffers, TracerId, MASK_ALL,
-    MASK_MOVABLE, MASK_STATIC,
+    self, space_of_slot, RayClass, SceneHit, SceneRay, SceneSurface, Stream, StreamBuffers,
+    TracerId, MASK_ALL, MASK_MOVABLE, MASK_STATIC, SPACE_ANY,
 };
 use helio_mesh_api::{
-    RayInstance, RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_TWO_SIDED,
+    RayInstance, RayTransform, RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_TWO_SIDED,
+    RAY_SPACE_GROUP,
 };
 use helio_pass_mesh_rays::{payload, MeshRayScene, MeshRayTracer, StreamBindings};
 use wgpu::util::DeviceExt;
@@ -69,8 +72,8 @@ fn gpu() -> Option<&'static Gpu> {
 /// (a parallelogram: `corner`, plus `u`, plus `v`), its vertex normal (none:
 /// zero normals), its surface, UVs from 0 to `uv` across it, its row's
 /// `RAY_INSTANCE_*` flags and material row, its transmission (a sheet), its
-/// object-to-frame transform and caster mask. A proxy's triangles go in the
-/// proxy pool.
+/// object-to-frame transform, caster class (`MASK_STATIC` or `MASK_MOVABLE`)
+/// and coordinate space slot. A proxy's triangles go in the proxy pool.
 #[derive(Clone)]
 struct Quad {
     corner: Vec3,
@@ -85,6 +88,7 @@ struct Quad {
     transmission: Vec3,
     transform: Mat4,
     mask: u8,
+    space: u32,
 }
 
 impl Default for Quad {
@@ -102,6 +106,7 @@ impl Default for Quad {
             transmission: Vec3::ZERO,
             transform: Mat4::IDENTITY,
             mask: MASK_STATIC,
+            space: 0,
         }
     }
 }
@@ -130,6 +135,8 @@ struct Scene {
     tlas: TlasManager,
     _blas: BlasManager,
     instances: wgpu::Buffer,
+    transforms: wgpu::Buffer,
+    space_groups: Option<wgpu::Buffer>,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     proxies: Option<(wgpu::Buffer, wgpu::Buffer)>,
@@ -140,6 +147,8 @@ impl Scene {
         MeshRayScene {
             tlas: self.tlas.tlas().unwrap(),
             instances: &self.instances,
+            transforms: &self.transforms,
+            space_groups: self.space_groups.as_ref(),
             vertices: &self.vertices,
             indices: &self.indices,
             proxies: self.proxies.as_ref().map(|(v, i)| (v, i)),
@@ -198,16 +207,20 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
             indices.extend_from_slice(&QUAD_INDICES);
             at
         };
-        rows.push(RayInstance {
-            first_index,
-            base_vertex,
-            flags: q.flags,
-            material: q.material,
-            base_color: q.base_color.extend(1.0).to_array(),
-            emissive: q.emissive.extend(0.0).to_array(),
-            transmission: q.transmission.to_array(),
-            skinned_vertex: 0,
-        });
+        rows.push(
+            RayInstance {
+                first_index,
+                base_vertex,
+                flags: q.flags,
+                material: q.material,
+                base_color: q.base_color.extend(1.0).to_array(),
+                emissive: q.emissive.to_array(),
+                instance: rows.len() as u32,
+                transmission: q.transmission.to_array(),
+                skinned_vertex: 0,
+            }
+            .in_space(q.space),
+        );
     }
     // Never-empty pools (a binding each).
     vertices.resize(vertices.len().max(10), 0);
@@ -239,6 +252,25 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
         bytemuck::cast_slice(&rows),
         wgpu::BufferUsages::STORAGE,
     );
+    // As a projection publishes them: each instance's transform, and the
+    // spaces' mask groups where any instance is outside the world's space.
+    let transforms: Vec<RayTransform> = quads
+        .iter()
+        .map(|q| RayTransform::from_rows(tlas_transform(q.transform)))
+        .collect();
+    let transforms = init(
+        "ray instance transforms",
+        bytemuck::cast_slice(&transforms),
+        wgpu::BufferUsages::STORAGE,
+    );
+    let groups = helio_mesh_api::ray_space_groups(quads.iter().map(|q| q.space));
+    let space_groups = quads.iter().any(|q| q.space != 0).then(|| {
+        init(
+            "ray space groups",
+            bytemuck::cast_slice(&groups),
+            wgpu::BufferUsages::STORAGE,
+        )
+    });
     let mut blas = BlasManager::new(gpu.device.clone());
     let mut tlas = TlasManager::new(gpu.device.clone(), quads.len() as u32);
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
@@ -276,7 +308,15 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
             transform: tlas_transform(q.transform),
         });
     }
-    let masks: Vec<u8> = quads.iter().map(|q| q.mask).collect();
+    let masks: Vec<u8> = quads
+        .iter()
+        .map(|q| {
+            helio_mesh_api::ray_instance_mask(
+                groups[q.space as usize] & RAY_SPACE_GROUP,
+                q.mask == MASK_MOVABLE,
+            )
+        })
+        .collect();
     tlas.build_masked(&mut encoder, &inputs, &blas, &masks)
         .unwrap();
     gpu.queue.submit([encoder.finish()]);
@@ -284,6 +324,8 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
         tlas,
         _blas: blas,
         instances,
+        transforms,
+        space_groups,
         vertices: vertex_buffer,
         indices: index_buffer,
         proxies,
@@ -456,12 +498,12 @@ fn cut_out_materials(gpu: &Gpu, texture: &wgpu::Texture) -> Materials {
 // ── Streams ─────────────────────────────────────────────────────────────────
 
 fn ray(origin: Vec3, dir: Vec3, t_max: f32, spread: f32, mask: u8) -> SceneRay {
-    SceneRay {
-        origin: origin.to_array(),
+    SceneRay::new(
+        origin.to_array(),
         t_max,
-        dir: dir.normalize().to_array(),
-        cone: SceneRay::cone(0.0, spread, mask),
-    }
+        dir.normalize().to_array(),
+        SceneRay::cone(0.0, spread, mask),
+    )
 }
 
 fn read<T: bytemuck::Pod>(gpu: &Gpu, buffer: &wgpu::Buffer) -> Vec<T> {
@@ -544,15 +586,27 @@ fn trace(
         }
         let views = materials.map(|m| m.views(gpu)).unwrap_or_default();
         let materials = materials.map(|m| m.bindings(&views));
+        let bindings = StreamBindings {
+            header: &buffers.header,
+            rays: &buffers.rays,
+            hits: &buffers.hits,
+            surfaces: buffers.surfaces.as_ref(),
+        };
         tracer.record(
             &gpu.device,
             &mut cmds,
-            StreamBindings {
-                header: &buffers.header,
-                rays: &buffers.rays,
-                hits: &buffers.hits,
-                surfaces: buffers.surfaces.as_ref(),
-            },
+            bindings,
+            scene.map(Scene::rays),
+            materials,
+        );
+        // The surfaces of the hits that are the meshes', as `stream::trace`
+        // adds the tracer's surface pass after every trace.
+        surfaces_of(
+            gpu,
+            class,
+            frame,
+            &mut cmds,
+            bindings,
             scene.map(Scene::rays),
             materials,
         );
@@ -566,6 +620,29 @@ fn trace(
             .map(|s| read(gpu, s))
             .unwrap_or_default(),
     }
+}
+
+/// Records the meshes' surface pass of a stream of `class` (nothing for an
+/// occlusion stream).
+fn surfaces_of(
+    gpu: &Gpu,
+    class: RayClass,
+    frame: u64,
+    cmds: &mut helio_core::CommandRecorder<'_>,
+    bindings: StreamBindings<'_>,
+    scene: Option<MeshRayScene<'_>>,
+    materials: Option<(&wgpu::Buffer, helio_mats::MaterialTextureBindings<'_>)>,
+) {
+    if class != RayClass::Nearest {
+        return;
+    }
+    let mut surfaces = MeshRayTracer::new(&gpu.device, &gpu.queue, class, MESHES)
+        .unwrap()
+        .surfaces();
+    surfaces.write_frame(frame, |buffer, bytes| {
+        gpu.queue.write_buffer(buffer, 0, bytes)
+    });
+    surfaces.record(&gpu.device, cmds, bindings, scene, materials);
 }
 
 // ── The CPU reference ───────────────────────────────────────────────────────
@@ -608,10 +685,10 @@ fn triangle(q: &Quad, primitive: u32) -> [Vec3; 3] {
 /// may rightly take either.
 fn nearest(quads: &[Quad], r: &SceneRay) -> (Option<Reference>, bool) {
     let (o, d) = (Vec3::from(r.origin), Vec3::from(r.dir));
-    let mask = ((r.cone >> 16) & 0xff) as u8;
+    let mask = r.mask();
     let mut found = Vec::new();
     for (k, q) in quads.iter().enumerate() {
-        if q.mask & mask == 0 {
+        if q.mask & mask == 0 || !r.sees_space(q.space) {
             continue;
         }
         for primitive in 0..2 {
@@ -740,7 +817,7 @@ fn check_hit(
         "ray {k}: roughness {}",
         surface.roughness()
     );
-    assert_eq!(surface.transmission(), 0.0, "ray {k}");
+    assert_eq!(surface.transmission(), [0.0; 3], "ray {k}");
     let emissive = Vec3::from(stream::unpack_radiance(surface.emissive));
     assert!(
         (emissive - q.emissive).abs().max_element() <= q.emissive.max_element() / 256.0 + 1e-6,
@@ -888,6 +965,9 @@ fn the_nearer_of_the_row_s_hit_and_the_meshes_stands() {
         base_color: 3,
         params: 4,
         emissive: 5,
+        specular: 6,
+        subsurface: 7,
+        anisotropy: 8,
     };
     let traced = trace(
         gpu,
@@ -1339,13 +1419,19 @@ fn a_skinned_instance_is_traced_where_its_pose_puts_it() {
         flags: helio_mesh_api::RAY_INSTANCE_SKINNED,
         material: 0,
         base_color: [0.5, 0.5, 0.5, 1.0],
-        emissive: [0.0; 4],
+        emissive: [0.0; 3],
+        instance: 0,
         transmission: [0.0; 3],
         skinned_vertex: 0,
     }];
     let instances = init(
         "ray instances",
         bytemuck::cast_slice(&rows),
+        wgpu::BufferUsages::STORAGE,
+    );
+    let transforms = init(
+        "ray instance transforms",
+        bytemuck::bytes_of(&RayTransform::from_rows(tlas_transform(Mat4::IDENTITY))),
         wgpu::BufferUsages::STORAGE,
     );
     let mut blas = BlasManager::new(gpu.device.clone());
@@ -1401,6 +1487,8 @@ fn a_skinned_instance_is_traced_where_its_pose_puts_it() {
         let scene = MeshRayScene {
             tlas: tlas.tlas().unwrap(),
             instances: &instances,
+            transforms: &transforms,
+            space_groups: None,
             vertices: &vertex_pool,
             indices: &index_pool,
             proxies: None,
@@ -1486,15 +1574,25 @@ fn trace_scene(
         let mut cmds = helio_core::CommandRecorder::from_encoder(&mut encoder);
         buffers.clear(&mut cmds);
         let views = materials.views(gpu);
+        let bindings = StreamBindings {
+            header: &buffers.header,
+            rays: &buffers.rays,
+            hits: &buffers.hits,
+            surfaces: buffers.surfaces.as_ref(),
+        };
         tracer.record(
             &gpu.device,
             &mut cmds,
-            StreamBindings {
-                header: &buffers.header,
-                rays: &buffers.rays,
-                hits: &buffers.hits,
-                surfaces: buffers.surfaces.as_ref(),
-            },
+            bindings,
+            Some(scene),
+            Some(materials.bindings(&views)),
+        );
+        surfaces_of(
+            gpu,
+            RayClass::Nearest,
+            1,
+            &mut cmds,
+            bindings,
             Some(scene),
             Some(materials.bindings(&views)),
         );
@@ -1503,6 +1601,128 @@ fn trace_scene(
     Traced {
         hits: read(gpu, &buffers.hits),
         surfaces: read(gpu, buffers.surfaces.as_ref().unwrap()),
+    }
+}
+
+// ── Coordinate spaces ───────────────────────────────────────────────────────
+
+/// Two quads at the same place in two coordinate spaces (`near_space` a
+/// little nearer the rays than `far_space`'s), and the spaces in `others`
+/// holding a quad far off the rays (they take mask groups).
+fn overlapping(near_space: u32, far_space: u32, others: &[u32]) -> Vec<Quad> {
+    let mut quads = vec![
+        Quad {
+            base_color: Vec3::new(0.0, 0.9, 0.0),
+            transform: Mat4::from_translation(Vec3::Z * 0.01),
+            space: near_space,
+            ..Default::default()
+        },
+        Quad {
+            base_color: Vec3::new(0.9, 0.0, 0.0),
+            space: far_space,
+            ..Default::default()
+        },
+    ];
+    quads.extend(others.iter().map(|&space| Quad {
+        transform: Mat4::from_translation(Vec3::new(100.0, 0.0, 0.0)),
+        space,
+        ..Default::default()
+    }));
+    quads
+}
+
+/// A ray down -z through the quads' middle in space `space`.
+fn down_in(space: u32) -> SceneRay {
+    ray(Vec3::new(0.1, 0.2, 5.0), -Vec3::Z, 50.0, 0.0, MASK_ALL).in_space(space)
+}
+
+/// Overlapping placements in two spaces: a ray of every space meets the
+/// nearer, a ray of one space meets that space's quad alone, a ray of a
+/// space with nothing traced meets nothing; with a group each and with
+/// every group shared (more spaces than the mask has groups); for nearest
+/// hits (with their surfaces) and for occlusion.
+#[test]
+fn a_ray_meets_only_its_own_space() {
+    let Some(gpu) = gpu() else { return };
+    let table = materials(gpu, &[material(0.5, 0.0)]);
+    for (what, quads) in [
+        ("a group each", overlapping(4, 0, &[])),
+        // Spaces 1 and 4 share group 1: the near quad (4) is a candidate of
+        // the far space's rays, passed by its row's space.
+        ("shared groups", overlapping(4, 1, &[2, 3, 5, 6])),
+        ("the world nearer", overlapping(0, 9, &[2])),
+    ] {
+        let scene = scene(gpu, &quads);
+        let (near, far) = (quads[0].space, quads[1].space);
+        let rays = [
+            down_in(SPACE_ANY),
+            down_in(space_of_slot(near)),
+            down_in(space_of_slot(far)),
+            down_in(space_of_slot(77)),
+        ];
+        let traced = trace(
+            gpu,
+            RayClass::Nearest,
+            &rays,
+            rays.len() as u32,
+            None,
+            None,
+            Some(&scene),
+            Some(&table),
+            1,
+        );
+        let colour = |k: usize| {
+            let [r, g, b, _] = traced.surfaces[k].base_color();
+            Vec3::new(r, g, b)
+        };
+        assert_eq!(payload::row(&traced.hits[0]), 0, "{what}: any space");
+        assert!(
+            (traced.hits[0].t - 4.99).abs() < 1e-3,
+            "{what}: {:?}",
+            traced.hits[0]
+        );
+        assert_eq!(payload::row(&traced.hits[1]), 0, "{what}: the near space");
+        assert!(colour(1).y > 0.8, "{what}: {}", colour(1));
+        assert_eq!(payload::row(&traced.hits[2]), 1, "{what}: the far space");
+        assert!(
+            (traced.hits[2].t - 5.0).abs() < 1e-3,
+            "{what}: {:?}",
+            traced.hits[2]
+        );
+        assert!(colour(2).x > 0.8, "{what}: {}", colour(2));
+        assert_eq!(
+            traced.hits[3],
+            SceneHit::default(),
+            "{what}: an empty space"
+        );
+        for (k, r) in rays.iter().enumerate() {
+            check_hit(
+                &quads,
+                &[material(0.5, 0.0)],
+                k,
+                r,
+                &traced.hits[k],
+                &traced.surfaces[k],
+            );
+        }
+        let occluded = trace(
+            gpu,
+            RayClass::Occlusion,
+            &rays,
+            rays.len() as u32,
+            None,
+            None,
+            Some(&scene),
+            Some(&table),
+            1,
+        );
+        let through: Vec<[f32; 3]> = occluded.hits.iter().map(SceneHit::through).collect();
+        assert_eq!(
+            through[..3],
+            [[0.0; 3]; 3],
+            "{what}: blocked in a space that has a quad"
+        );
+        assert_eq!(through[3], [1.0; 3], "{what}: nothing in an empty space");
     }
 }
 
@@ -1918,6 +2138,10 @@ mod graph {
             let scene = MeshRayScene {
                 tlas: &scene_rays.tlas,
                 instances: scene_rays.buffer(helio_mesh_api::RAY_INSTANCES).unwrap(),
+                transforms: scene_rays
+                    .buffer(helio_mesh_api::RAY_INSTANCE_TRANSFORMS)
+                    .unwrap(),
+                space_groups: scene_rays.buffer(helio_mesh_api::RAY_SPACE_GROUPS),
                 vertices: &vertices,
                 indices: &indices,
                 proxies: None,

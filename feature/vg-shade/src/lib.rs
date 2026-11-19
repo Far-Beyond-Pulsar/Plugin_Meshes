@@ -163,7 +163,7 @@ pub mod shader_source {
         );
         let velocity = between(&gbuffer, "fn compute_velocity", "@fragment");
         format!(
-            "enable wgpu_binding_array;\n//!use helio_prelude\n{}\n//!use pbr_eval\n//!use material_row\n//!use material_surface\n{}\n{COMMON_WGSL}\n{decode}\n{declarations}\n{SHADE_WGSL}\n{velocity}",
+            "enable wgpu_binding_array;\n//!use helio_prelude\n{}\n//!use pbr_eval\n//!use material_row\n//!use material_surface\n//!use frame_surface\n{}\n{COMMON_WGSL}\n{decode}\n{declarations}\n{SHADE_WGSL}\n{velocity}",
             helio_mats::SPECULAR_AA_MARKER,
             helio_vg_format::WGSL
         )

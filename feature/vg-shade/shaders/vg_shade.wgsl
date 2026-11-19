@@ -209,16 +209,20 @@ fn vg_shade(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_inde
             content_to_drawn = transpose(turn);
         }
     }
-    let surface = radiant_eval_surface(material, material_tex, material_input);
+    var surface = radiant_eval_surface(material, material_tex, material_input);
+    // The material shades in its content's space; the G-buffer holds the
+    // drawn space's normal.
+    surface.normal = content_to_drawn * surface.normal;
 
     // Debug views (cluster/triangle ids included) are written by `vg_debug.wgsl`
-    // after this pass, only while one is selected.
-    textureStore(out_albedo, px, vec4<f32>(surface.albedo.rgb, surface.alpha));
-    textureStore(out_normal, px, vec4<f32>(content_to_drawn * surface.normal, surface.specular_f0.r));
-    textureStore(out_orm, px, vec4<f32>(surface.ao, surface.roughness, surface.metallic, surface.specular_f0.g));
-    textureStore(out_emissive, px, vec4<f32>(surface.emissive, surface.specular_f0.b));
-    textureStore(out_sss, px, vec4<f32>(surface.subsurface_color, surface.subsurface_radius));
-    textureStore(out_extra, px, vec4<f32>(surface.roughness_aniso_x, surface.roughness_aniso_y,
-                                          surface.aniso_rotation, f32(surface.flags)));
+    // after this pass, only while one is selected. The frame's G-buffer
+    // encoding of the surface (`gbuffer_surface_texels`, `//!use frame_surface`).
+    let t = gbuffer_surface_texels(surface);
+    textureStore(out_albedo, px, t.albedo);
+    textureStore(out_normal, px, t.normal);
+    textureStore(out_orm, px, t.orm);
+    textureStore(out_emissive, px, t.emissive);
+    textureStore(out_sss, px, t.sss);
+    textureStore(out_extra, px, t.extra);
     textureStore(out_velocity, px, compute_velocity(input));
 }
