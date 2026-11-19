@@ -1,7 +1,8 @@
 // The meshes' surfaces as rays see them (helio-mesh-api `RAY_SURFACE_SNIPPET`,
-// `//!use mesh_ray_surface`): the instance rows the meshes publish beside the
-// frame's TLAS, the mesh pools' and the proxy pool's vertex decode, and a hit
-// triangle's fetch. The reader declares the storage these read, under these
+// `//!use mesh_ray_surface`, with `//!use mesh_ray_rows` and
+// `//!use frame_ray_stream`): the mesh pools' and the proxy pool's vertex
+// decode, a hit triangle's fetch, its tangent frame and the normals a hit
+// is oriented by. The reader declares the storage these read, under these
 // names:
 //   instances: array<RayInstance>   (`helio_mesh_api::RAY_INSTANCES`)
 //   vertices: array<u32>            (`helio_mesh_api::MESH_VERTICES`)
@@ -12,88 +13,12 @@
 // and, a pass that shades hits without the ray query, the instances'
 // transforms (`helio_mesh_api::RAY_INSTANCE_TRANSFORMS`, `RayTransform`).
 
-// `helio_mesh_api::RayInstance`, a traced section's row (a hit's: its
-// instance's custom data plus its `geometry_index`). `flags` holds the
-// `RAY_INSTANCE_*` bits and, at `RAY_INSTANCE_SPACE_SHIFT`, the coordinate
-// space slot; `instance` its TLAS instance (its `RayTransform`).
-struct RayInstance {
-    first_index: u32,
-    base_vertex: u32,
-    flags: u32,
-    material: u32,
-    base_color: vec4<f32>,
-    emissive: vec3<f32>,
-    instance: u32,
-    transmission: vec3<f32>,
-    skinned_vertex: u32,
-}
-
-// `helio_mesh_api::RAY_INSTANCE_PROXY`: the instance's triangles are in the
-// proxy pool, positions and UVs only (a virtual-geometry asset's coarse cut).
-const RAY_INSTANCE_PROXY: u32 = 1u;
-// `helio_mesh_api::RAY_INSTANCE_MASKED`: a cut-out, its material alpha-tested.
-const RAY_INSTANCE_MASKED: u32 = 2u;
-// `helio_mesh_api::RAY_INSTANCE_TWO_SIDED`: both faces are outside.
-const RAY_INSTANCE_TWO_SIDED: u32 = 4u;
-// `helio_mesh_api::RAY_INSTANCE_SKINNED`: positions and normals in the skin
-// cache at `skinned_vertex`.
-const RAY_INSTANCE_SKINNED: u32 = 8u;
-// `helio_mesh_api::RAY_INSTANCE_SPACE_SHIFT`: the row's coordinate space slot.
-const RAY_INSTANCE_SPACE_SHIFT: u32 = 8u;
-
-fn ray_instance_space(instance: RayInstance) -> u32 {
-    return (instance.flags >> RAY_INSTANCE_SPACE_SHIFT) & 0xffu;
-}
-
-// `helio_mesh_api::RayTransform`: a TLAS instance's object-to-frame matrix,
-// three rows of a 3x4.
-struct RayTransform {
-    rows: array<vec4<f32>, 3>,
-}
-
-fn ray_transform_point(t: RayTransform, p: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(dot(t.rows[0].xyz, p), dot(t.rows[1].xyz, p), dot(t.rows[2].xyz, p))
-        + vec3<f32>(t.rows[0].w, t.rows[1].w, t.rows[2].w);
-}
-
-fn ray_transform_vector(t: RayTransform, v: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(dot(t.rows[0].xyz, v), dot(t.rows[1].xyz, v), dot(t.rows[2].xyz, v));
-}
-
-// An object-space normal to the frame: by the inverse transpose (the
-// columns of the inverse are the rows' cross products over the
-// determinant), not normalized.
-fn ray_transform_normal(t: RayTransform, n: vec3<f32>) -> vec3<f32> {
-    let r0 = t.rows[0].xyz;
-    let r1 = t.rows[1].xyz;
-    let r2 = t.rows[2].xyz;
-    let c0 = cross(r1, r2);
-    let det = dot(r0, c0);
-    return vec3<f32>(dot(c0, n), dot(cross(r2, r0), n), dot(cross(r0, r1), n)) / select(det, 1e-30, det == 0.0);
-}
-
-// `helio_mesh_api::RAY_SPACE_GROUPS` entries: the group, shared, present.
-const RAY_SPACE_GROUP: u32 = 3u;
-const RAY_SPACE_SHARED: u32 = 4u;
-const RAY_SPACE_PRESENT: u32 = 8u;
-
-// The TLAS cull mask of a ray of caster classes `classes` (the frame's ray
-// caster mask: bit 0 casters that never move, bit 1 those that may) in
-// coordinate space `space` (`SceneRay::space`), `entry` that space's
-// `RAY_SPACE_GROUPS` entry (unread for a ray of every space): x the mask (0:
-// no instance of the space is traced), y 1 where the space's group is shared
-// (its candidates are then tested by `ray_instance_space`).
-fn ray_space_cull(classes: u32, space: u32, entry: u32) -> vec2<u32> {
-    let c = classes & 3u;
-    if space == 0u { return vec2<u32>(c * 0x55u, 0u); }
-    if (entry & RAY_SPACE_PRESENT) == 0u { return vec2<u32>(0u); }
-    return vec2<u32>(c << (2u * (entry & RAY_SPACE_GROUP)), select(0u, 1u, (entry & RAY_SPACE_SHARED) != 0u));
-}
 // `helio_mesh_api::SkinnedVertex` in `u32` words: position (words 0-2), the
-// octahedral normal (3, `scene_pack_unit`: the reader has `frame_ray_stream`).
+// octahedral normal (3, `scene_pack_unit`: the reader has `frame_ray_stream`),
+// the octahedral tangent (7).
 const SKINNED_VERTEX_WORDS: u32 = 8u;
-// `helio_mesh_api::PackedVertex` in `u32` words: position (words 0-2), UV0
-// (4-5), the snorm8x4 normal (8).
+// `helio_mesh_api::PackedVertex` in `u32` words: position (words 0-2), the
+// bitangent's sign (3), UV0 (4-5), the snorm8x4 normal (8) and tangent (9).
 const MESH_VERTEX_WORDS: u32 = 10u;
 // A proxy pool vertex in floats (`helio_mesh_api::RAY_PROXY_VERTEX_BYTES`):
 // position, then UV0.
@@ -113,6 +38,14 @@ fn mesh_vertex_normal(v: u32) -> vec3<f32> {
     return unpack4x8snorm(vertices[v * MESH_VERTEX_WORDS + 8u]).xyz;
 }
 
+fn mesh_vertex_tangent(v: u32) -> vec3<f32> {
+    return unpack4x8snorm(vertices[v * MESH_VERTEX_WORDS + 9u]).xyz;
+}
+
+fn mesh_vertex_bitangent_sign(v: u32) -> f32 {
+    return bitcast<f32>(vertices[v * MESH_VERTEX_WORDS + 3u]);
+}
+
 fn skinned_vertex_position(v: u32) -> vec3<f32> {
     let at = v * SKINNED_VERTEX_WORDS;
     return vec3<f32>(bitcast<f32>(skinned_vertices[at]), bitcast<f32>(skinned_vertices[at + 1u]), bitcast<f32>(skinned_vertices[at + 2u]));
@@ -120,6 +53,10 @@ fn skinned_vertex_position(v: u32) -> vec3<f32> {
 
 fn skinned_vertex_normal(v: u32) -> vec3<f32> {
     return scene_unpack_unit(skinned_vertices[v * SKINNED_VERTEX_WORDS + 3u]);
+}
+
+fn skinned_vertex_tangent(v: u32) -> vec3<f32> {
+    return scene_unpack_unit(skinned_vertices[v * SKINNED_VERTEX_WORDS + 7u]);
 }
 
 fn ray_proxy_position(v: u32) -> vec3<f32> {
@@ -179,4 +116,78 @@ fn ray_triangle_outside(t: RayTriangle, b: vec3<f32>) -> vec3<f32> {
         return skinned_vertex_normal(t.cached.x) * b.x + skinned_vertex_normal(t.cached.y) * b.y + skinned_vertex_normal(t.cached.z) * b.z;
     }
     return mesh_vertex_normal(t.vertices.x) * b.x + mesh_vertex_normal(t.vertices.y) * b.y + mesh_vertex_normal(t.vertices.z) * b.z;
+}
+
+// The tangent along +u at barycentrics `b` (object space, not normalized;
+// xyz) and the bitangent's sign (w), as the G-buffer's vertex stage hands
+// them to a material: the vertices' tangents blended (a skinned instance's
+// from the skin cache) and the first corner's sign (a mesh's sign is one a
+// triangle). A proxy has no vertex tangents: its triangle's direction of
+// +u on its face, the sign the side +v takes.
+fn ray_triangle_tangent(t: RayTriangle, b: vec3<f32>) -> vec4<f32> {
+    if t.proxy {
+        let e1 = t.corners[1] - t.corners[0];
+        let e2 = t.corners[2] - t.corners[0];
+        let d1 = t.uv[1] - t.uv[0];
+        let d2 = t.uv[2] - t.uv[0];
+        let det = d1.x * d2.y - d1.y * d2.x;
+        let r = select(1.0 / det, 0.0, abs(det) < 1e-20);
+        let tangent = (e1 * d2.y - e2 * d1.y) * r;
+        let bitangent = (e2 * d1.x - e1 * d2.x) * r;
+        let n = cross(e1, e2);
+        return vec4<f32>(tangent, select(1.0, -1.0, dot(cross(n, tangent), bitangent) < 0.0));
+    }
+    let sign = mesh_vertex_bitangent_sign(t.vertices.x);
+    if t.skinned {
+        return vec4<f32>(skinned_vertex_tangent(t.cached.x) * b.x + skinned_vertex_tangent(t.cached.y) * b.y + skinned_vertex_tangent(t.cached.z) * b.z, sign);
+    }
+    return vec4<f32>(mesh_vertex_tangent(t.vertices.x) * b.x + mesh_vertex_tangent(t.vertices.y) * b.y + mesh_vertex_tangent(t.vertices.z) * b.z, sign);
+}
+
+// The side triangle `t` calls outside at barycentrics `b`, in object space:
+// its vertex normals blended; a proxy's winding (no vertex normals), unit.
+fn mesh_ray_outside(t: RayTriangle, b: vec3<f32>) -> vec3<f32> {
+    let local = ray_triangle_outside(t, b);
+    return select(local, local / max(length(local), 1e-30), t.proxy);
+}
+
+// The face's and the shading normal at a hit, both on the side the ray
+// met, unit: from `face_in` the triangle's frame-space cross product and
+// `shading_in` its outside (`mesh_ray_outside`) taken to the frame by the
+// inverse transpose; whether the ray met the back of a single-sided
+// surface (`inside`); and whether the shading normal was turned to the
+// side the ray met (`flipped`: a material's tangent frame turns with it).
+struct MeshRayNormals {
+    face: vec3<f32>,
+    shading: vec3<f32>,
+    inside: bool,
+    flipped: bool,
+}
+
+fn mesh_ray_normals(instance: RayInstance, face_in: vec3<f32>, shading_in: vec3<f32>, dir: vec3<f32>) -> MeshRayNormals {
+    var face = face_in / max(length(face_in), 1e-20);
+    var shading = shading_in;
+    if dot(shading, shading) < 1e-8 {
+        // No vertex normals: two-sided.
+        shading = -dir;
+    }
+    shading = normalize(shading);
+    if dot(face, shading) < 0.0 { face = -face; }
+    var flipped = false;
+    // Two-sided: the side the ray meets is its outside.
+    if (instance.flags & RAY_INSTANCE_TWO_SIDED) != 0u && dot(face, dir) > 0.0 {
+        face = -face;
+        shading = -shading;
+        flipped = true;
+    }
+    // Its inside: the back of a single-sided surface (the ray starts in a
+    // wall or a solid). The surface's normals are then those of the side
+    // the ray met.
+    let inside = dot(face, dir) > 0.0;
+    if inside {
+        face = -face;
+        shading = -shading;
+        flipped = !flipped;
+    }
+    return MeshRayNormals(face, shading, inside, flipped);
 }

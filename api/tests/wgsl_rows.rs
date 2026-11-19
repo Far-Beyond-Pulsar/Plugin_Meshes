@@ -6,6 +6,7 @@ use helio_mesh_api::*;
 
 /// The storage `mesh_ray_surface` reads, as a reader declares it.
 const RAY_SURFACE_READER: &str = "//!use mesh_ray_surface
+//!use mesh_ray_rows
 //!use frame_ray_stream
 @group(0) @binding(0) var<storage, read> instances: array<RayInstance>;
 @group(0) @binding(1) var<storage, read> vertices: array<u32>;
@@ -19,6 +20,10 @@ const RAY_SURFACE_READER: &str = "//!use mesh_ray_surface
 fn main() {
     let t = ray_triangle(instances[0], 0u);
     let n = ray_triangle_outside(t, vec3<f32>(1.0, 0.0, 0.0));
+    let tangent = ray_triangle_tangent(t, vec3<f32>(1.0, 0.0, 0.0));
+    let normals = mesh_ray_normals(instances[0], n, mesh_ray_outside(t, vec3<f32>(1.0, 0.0, 0.0)), tangent.xyz);
+    _ = normals.flipped;
+    _ = instances[0].program;
     let x = transforms[instances[0].instance];
     _ = ray_transform_point(x, n) + ray_transform_vector(x, n) + ray_transform_normal(x, n);
     _ = ray_space_cull(3u, ray_instance_space(instances[0]) + 1u, space_groups[0]);
@@ -82,7 +87,11 @@ fn constant(module: &naga::Module, name: &str) -> u32 {
 fn the_ray_surface_rows_match_the_rust() {
     let m = modules(
         RAY_SURFACE_READER,
-        &[RAY_SURFACE_SNIPPET, helio_frame_api::rays::stream::SNIPPET],
+        &[
+            RAY_SURFACE_SNIPPET,
+            RAY_ROWS_SNIPPET,
+            helio_frame_api::rays::stream::SNIPPET,
+        ],
     );
     assert_eq!(
         struct_size(&m, "RayInstance"),
@@ -239,4 +248,25 @@ fn spaces_take_mask_groups() {
     .in_space(200);
     assert_eq!(row.space(), 200);
     assert_eq!(row.flags & 0xff, RAY_INSTANCE_MASKED);
+}
+
+/// Program 0 is always the table-driven evaluation, and an index, once
+/// given, stays its program's.
+#[test]
+fn ray_programs_keep_the_table_first_and_their_indices() {
+    let mut programs = RayPrograms::default();
+    assert_eq!(programs.programs(), &[RayProgram::TABLE]);
+    assert_eq!(programs.index(RayProgram::TABLE), 0);
+    let graph = RayProgram {
+        template: 0,
+        graph_hash: 0xabcd,
+    };
+    let foliage = RayProgram {
+        template: 5,
+        graph_hash: 0,
+    };
+    assert_eq!(programs.index(graph), 1);
+    assert_eq!(programs.index(foliage), 2);
+    assert_eq!(programs.index(graph), 1);
+    assert_eq!(programs.programs().len(), 3);
 }

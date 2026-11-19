@@ -5,8 +5,10 @@
 //! cursors, so it lives with them (moved from helio-default-passes in the
 //! layered rewrite's phase 1). Passes consume only what the renderer publishes
 //! of it ([`SceneDbRayTracing::publish`]): the TLAS, transmission rows
-//! (`helio_pass_hlfs`, Pulsar-Native#1066) and each instance's surface
-//! (`RayInstance`: the GI probes' mesh tracer shades its hits from them).
+//! (`helio_pass_hlfs`, Pulsar-Native#1066), each instance's row
+//! (`RayInstance`: where its triangles are, its material and the program
+//! the meshes' tracer evaluates it by at a hit) and the programs the rows
+//! name (`helio_mesh_api::RAY_PROGRAMS`).
 //! With [`SceneDbRayTracing::with_virtual_geometry`], virtual-geometry
 //! instances are traced through their assets' proxies
 //! ([`crate::ray_proxies`]).
@@ -40,7 +42,8 @@ use helio_core::{
 };
 use helio_mats::host_rows::MaterialComponent;
 use helio_mesh_api::{
-    RayInstance, RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_TWO_SIDED,
+    RayInstance, RayProgram, RayPrograms, RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY,
+    RAY_INSTANCE_TWO_SIDED,
 };
 use pulsar_scenedb::{
     ChangeCursor, ChangeRead, ComponentChange, ComponentChangeKind, Entity, World,
@@ -110,12 +113,10 @@ struct MaterialRow {
     rgb: [f32; 3],
     transmits: bool,
     /// Whether the projection can represent it (opaque, explicitly
-    /// transmitting, or masked in a partial projection; no custom shader).
+    /// transmitting, or masked in a partial projection).
     supported: bool,
     /// `RAY_INSTANCE_MASKED` and `RAY_INSTANCE_TWO_SIDED` bits.
     flags: u32,
-    base_color: [f32; 4],
-    emissive: [f32; 3],
 }
 
 fn casts_shadow(object: &StaticObjectComponent) -> bool {
@@ -138,8 +139,10 @@ pub struct SceneDbRayTracing {
     transmission: Option<wgpu::Buffer>,
     has_transmission: bool,
     transmission_rows: Vec<[f32; 4]>,
-    /// Each instance's surface (`RayInstance`), in TLAS order.
+    /// Each instance's row (`RayInstance`), in TLAS order.
     instances_buffer: Option<wgpu::Buffer>,
+    /// The programs the rows name (`RAY_PROGRAMS`), from the last build.
+    programs: Arc<RayPrograms>,
     /// Each TLAS instance's transform (`RAY_INSTANCE_TRANSFORMS`).
     transforms_buffer: Option<wgpu::Buffer>,
     instance_rows: Vec<RayInstance>,
@@ -169,9 +172,6 @@ pub struct SceneDbRayTracing {
     casters: Vec<(Entity, CasterKey)>,
     caster_slots: HashMap<Entity, usize>,
     changes: Vec<ComponentChange>,
-    /// Base colour textures' means: a hit's colour is its material's factor
-    /// times its texture's mean.
-    texture_means: crate::texture_means::TextureMeans,
     /// The eye the culling tests from ([`Self::set_view`]), where the scan
     /// last tested, the criterion and the objects it left out (by key: a
     /// move re-tests them).
@@ -189,7 +189,7 @@ const CULLING_RETEST: f64 = 0.05;
 
 impl SceneDbRayTracing {
     /// The scene's shadow casters, all of them: an object the projection
-    /// cannot represent (masked or custom-shader materials, group or
+    /// cannot represent (masked materials, group or
     /// coordinate-space visibility, non-triangle geometry families) fails
     /// the build, so ray-traced shadows never silently miss a caster nor
     /// take a cut-out for a solid card.
@@ -211,7 +211,6 @@ impl SceneDbRayTracing {
     fn with_partial(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, partial: bool) -> Self {
         Self {
             untraced: Vec::new(),
-            texture_means: crate::texture_means::TextureMeans::new(&device),
             blas: BlasManager::new(device.clone()),
             tlas: TlasManager::new(device.clone(), 1),
             device,
@@ -220,6 +219,7 @@ impl SceneDbRayTracing {
             has_transmission: false,
             transmission_rows: Vec::new(),
             instances_buffer: None,
+            programs: Arc::new(RayPrograms::default()),
             transforms_buffer: None,
             instance_rows: Vec::new(),
             partial,
@@ -337,10 +337,6 @@ impl SceneDbRayTracing {
     pub fn prepare(&mut self, world: &World) -> helio_core::Result<&wgpu::Tlas> {
         // Compact the BLASes built in earlier frames (a few a frame).
         self.blas.maintain(&self.queue);
-        // Texture means that arrived change the instances' colours: rebuild.
-        if self.texture_means.collect() {
-            self.cursors = None;
-        }
         // Proxies that arrived or went change the instances: rebuild.
         if self
             .vg
@@ -374,7 +370,6 @@ impl SceneDbRayTracing {
                 self.culled.len() as u64,
             );
         }
-        self.texture_means.dispatch(&self.device, &self.queue);
         Ok(self.tlas.tlas().expect("successful TLAS build"))
     }
 
@@ -416,14 +411,22 @@ impl SceneDbRayTracing {
         Some(rays)
     }
 
-    /// Publishes [`Self::scene_rays`] for `renderer`'s next frame (nothing
-    /// when the preparation failed: that frame has no TLAS).
+    /// The programs the rows name (`helio_mesh_api::RAY_PROGRAMS`), after a
+    /// successful preparation.
+    pub fn programs(&self) -> Arc<RayPrograms> {
+        self.programs.clone()
+    }
+
+    /// Publishes [`Self::scene_rays`] and [`Self::programs`] for
+    /// `renderer`'s next frame (nothing when the preparation failed: that
+    /// frame has no TLAS).
     pub fn publish(&self, renderer: &mut helio::Renderer) {
         if let Some(rays) = self.scene_rays() {
             renderer.set_scene_payload(
                 &helio_frame_api::rays::SCENE_RAYS,
                 std::sync::Arc::new(rays),
             );
+            renderer.set_scene_payload(&helio_mesh_api::RAY_PROGRAMS, self.programs());
         }
     }
 
@@ -592,6 +595,7 @@ impl SceneDbRayTracing {
         let mut instances = Vec::new();
         let mut transmission_rows = Vec::<[f32; 4]>::new();
         let mut instance_rows = Vec::<RayInstance>::new();
+        let mut programs = RayPrograms::default();
         let mut has_transmission = false;
         for (object_entity, (object,)) in world.query::<(&StaticObjectComponent,)>() {
             if !self.projects(object) {
@@ -630,31 +634,15 @@ impl SceneDbRayTracing {
                         .ok_or_else(|| error("missing caster material"))?;
                     let transmission = world.get::<RayTransmission>(*material_entity);
                     let masked = material.flags & helio_mats::FLAG_ALPHA_TEST != 0;
-                    let supported = material.flags & helio_mats::FLAG_HAS_CUSTOM_SHADER == 0
-                        && if masked {
-                            self.partial && transmission.is_none()
-                        } else {
-                            material.flags & helio_mats::FLAG_ALPHA_BLEND == 0
-                                || transmission.is_some()
-                        };
+                    let supported = if masked {
+                        self.partial && transmission.is_none()
+                    } else {
+                        material.flags & helio_mats::FLAG_ALPHA_BLEND == 0 || transmission.is_some()
+                    };
                     let rgb = transmission.map_or([0.0; 3], |value| value.0);
                     if !rgb.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) {
                         return Err(error("transmission must be finite linear RGB in [0, 1]"));
                     }
-                    // The factor times the base colour texture's mean
-                    // (white until measured).
-                    let texture = (material.tex_base_color != helio_mats::GpuMaterial::NO_TEXTURE)
-                        .then(|| world.gpu_mirror().and_then(|m| m.texture_store()))
-                        .flatten()
-                        .and_then(|store| {
-                            store.read().ok()?.texture(material.tex_base_color).cloned()
-                        });
-                    let mean = texture
-                        .and_then(|t| self.texture_means.mean(&t))
-                        .unwrap_or([1.0; 3]);
-                    let [r, g, b, _] = material.base_color;
-                    let [r, g, b] = [r * mean[0], g * mean[1], b * mean[2]];
-                    let [er, eg, eb, strength] = material.emissive;
                     let two_sided = material.flags & helio_mats::FLAG_DOUBLE_SIDED != 0;
                     let row = MaterialRow {
                         generation: material_entity.generation().wrapping_add(1),
@@ -663,15 +651,13 @@ impl SceneDbRayTracing {
                         supported,
                         flags: if masked { RAY_INSTANCE_MASKED } else { 0 }
                             | if two_sided { RAY_INSTANCE_TWO_SIDED } else { 0 },
-                        base_color: [r, g, b, 1.0],
-                        emissive: [er * strength, eg * strength, eb * strength],
                     };
                     material_rows.insert(object.material_slot, row);
                     row
                 }
             };
-            if !row.supported || object.row().graph_hash() != 0 {
-                unsupported!("custom-shader casters, transparent casters without explicit RayTransmission, and masked casters (in a full projection, or transmitting) are unsupported");
+            if !row.supported {
+                unsupported!("transparent casters without explicit RayTransmission, and masked casters (in a full projection, or transmitting) are unsupported");
             }
             if row.generation != object.material_generation {
                 return Err(error("stale caster material identity"));
@@ -844,16 +830,22 @@ impl SceneDbRayTracing {
             };
             has_transmission |= transmits;
             transmission_rows.push([rgb[0], rgb[1], rgb[2], 0.0]);
+            // The program its material is evaluated by at a hit: its class's
+            // template and its graph, as the drawers key their pipelines.
+            let program = programs.index(RayProgram {
+                template: object.material_class,
+                graph_hash: object.row().graph_hash(),
+            });
             instance_rows.push(RayInstance {
                 first_index,
                 base_vertex,
                 flags: flags | row.flags,
                 material: object.material_slot,
-                base_color: row.base_color,
-                emissive: row.emissive,
-                instance: instances.len() as u32,
                 transmission: rgb,
+                instance: instances.len() as u32,
                 skinned_vertex: 0,
+                program,
+                _pad: [0; 2],
             });
             self.caster_slots.insert(object_entity, self.casters.len());
             self.casters.push((object_entity, CasterKey::of(object)));
@@ -913,7 +905,7 @@ impl SceneDbRayTracing {
             self.transmission_rows.clear();
         }
         self.has_transmission = has_transmission;
-        // The instances' surfaces, a row each (at least one: a binding).
+        // The instances' rows, one each (at least one: a binding).
         let size = (instance_rows.len().max(1) * std::mem::size_of::<RayInstance>()) as u64;
         if self
             .instances_buffer
@@ -936,6 +928,9 @@ impl SceneDbRayTracing {
             );
         }
         self.instance_rows = instance_rows;
+        if *self.programs != programs {
+            self.programs = Arc::new(programs);
+        }
         self.instances = instances;
         self.queue.submit([encoder.finish()]);
         self.write_transforms();

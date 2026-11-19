@@ -1,6 +1,9 @@
 //! The meshes' tracer of ray streams against what a stream's rows must hold:
 //! hits and surfaces compared with a CPU ray-triangle reference (distance,
-//! tracer, inside, normals, colours, payload), the nearer of a row's hit and
+//! tracer, inside, normals, the material's colours, payload), the surfaces
+//! binned by material program (a template's surface, a program not compiled
+//! yet, programs past the bound), textures read at the ray cone's
+//! footprint, the nearer of a row's hit and
 //! the meshes', a ray's length and caster mask, cut-outs (exact at a fine
 //! footprint, in proportion to coverage at a coarse one), occlusion through
 //! sheets, cut-outs and opaque meshes, a proxy (virtual-geometry) instance,
@@ -15,15 +18,19 @@ use std::sync::Arc;
 
 use glam::{Mat3, Mat4, Quat, Vec2, Vec3};
 use helio_core::{BlasGeometry, BlasManager, BlasSegment, TlasInstanceInput, TlasManager};
+use helio_frame_api::rays::stream::SurfaceDetail;
 use helio_frame_api::rays::stream::{
     self, space_of_slot, RayClass, SceneHit, SceneRay, SceneSurface, Stream, StreamBuffers,
     TracerId, MASK_ALL, MASK_MOVABLE, MASK_STATIC, SPACE_ANY,
 };
 use helio_mesh_api::{
-    RayInstance, RayTransform, RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_TWO_SIDED,
-    RAY_SPACE_GROUP,
+    RayInstance, RayProgram, RayPrograms, RayTransform, RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY,
+    RAY_INSTANCE_TWO_SIDED, RAY_SPACE_GROUP,
 };
-use helio_pass_mesh_rays::{payload, MeshRayScene, MeshRayTracer, StreamBindings};
+use helio_pass_mesh_rays::surfaces::MeshHitScene;
+use helio_pass_mesh_rays::{
+    payload, HitPrograms, MeshHitSurfaces, MeshRayScene, MeshRayTracer, StreamBindings,
+};
 use wgpu::util::DeviceExt;
 
 struct Gpu {
@@ -70,10 +77,12 @@ fn gpu() -> Option<&'static Gpu> {
 
 /// A quad of a scene, an instance of its own: its corners in object space
 /// (a parallelogram: `corner`, plus `u`, plus `v`), its vertex normal (none:
-/// zero normals), its surface, UVs from 0 to `uv` across it, its row's
-/// `RAY_INSTANCE_*` flags and material row, its transmission (a sheet), its
-/// object-to-frame transform, caster class (`MASK_STATIC` or `MASK_MOVABLE`)
-/// and coordinate space slot. A proxy's triangles go in the proxy pool.
+/// zero normals), its material's base colour and emission ([`quad_rows`]
+/// gives each quad a material row of its own, its test row `material` with
+/// these colours), UVs from 0 to `uv` across it, its row's `RAY_INSTANCE_*`
+/// flags and program, its transmission (a sheet), its object-to-frame
+/// transform, caster class (`MASK_STATIC` or `MASK_MOVABLE`) and coordinate
+/// space slot. A proxy's triangles go in the proxy pool.
 #[derive(Clone)]
 struct Quad {
     corner: Vec3,
@@ -85,6 +94,7 @@ struct Quad {
     uv: f32,
     flags: u32,
     material: u32,
+    program: RayProgram,
     transmission: Vec3,
     transform: Mat4,
     mask: u8,
@@ -103,6 +113,7 @@ impl Default for Quad {
             uv: 1.0,
             flags: 0,
             material: 0,
+            program: RayProgram::TABLE,
             transmission: Vec3::ZERO,
             transform: Mat4::IDENTITY,
             mask: MASK_STATIC,
@@ -140,6 +151,7 @@ struct Scene {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     proxies: Option<(wgpu::Buffer, wgpu::Buffer)>,
+    programs: RayPrograms,
 }
 
 impl Scene {
@@ -147,8 +159,18 @@ impl Scene {
         MeshRayScene {
             tlas: self.tlas.tlas().unwrap(),
             instances: &self.instances,
-            transforms: &self.transforms,
             space_groups: self.space_groups.as_ref(),
+            vertices: &self.vertices,
+            indices: &self.indices,
+            proxies: self.proxies.as_ref().map(|(v, i)| (v, i)),
+            skinned: None,
+        }
+    }
+
+    fn hits(&self) -> MeshHitScene<'_> {
+        MeshHitScene {
+            instances: &self.instances,
+            transforms: &self.transforms,
             vertices: &self.vertices,
             indices: &self.indices,
             proxies: self.proxies.as_ref().map(|(v, i)| (v, i)),
@@ -176,6 +198,7 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
     let mut proxy_vertices = Vec::<f32>::new();
     let mut proxy_indices = Vec::<u32>::new();
     let mut rows = Vec::new();
+    let mut programs = RayPrograms::default();
     for q in quads {
         let uvs = [[0.0, 0.0], [q.uv, 0.0], [q.uv, q.uv], [0.0, q.uv]];
         let (first_index, base_vertex) = if q.proxy() {
@@ -201,7 +224,7 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
                     0,
                     0,
                     q.normal.map_or(0, snorm8),
-                    0,
+                    snorm8(q.u.normalize()),
                 ]);
             }
             indices.extend_from_slice(&QUAD_INDICES);
@@ -212,12 +235,13 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
                 first_index,
                 base_vertex,
                 flags: q.flags,
-                material: q.material,
-                base_color: q.base_color.extend(1.0).to_array(),
-                emissive: q.emissive.to_array(),
-                instance: rows.len() as u32,
+                // Each quad's own material row (`quad_rows`).
+                material: rows.len() as u32,
                 transmission: q.transmission.to_array(),
+                instance: rows.len() as u32,
                 skinned_vertex: 0,
+                program: programs.index(q.program),
+                _pad: [0; 2],
             }
             .in_space(q.space),
         );
@@ -329,6 +353,7 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
         vertices: vertex_buffer,
         indices: index_buffer,
         proxies,
+        programs,
     }
 }
 
@@ -383,6 +408,20 @@ fn material(roughness: f32, metallic: f32) -> helio_mats::GpuMaterial {
         material_class: 0,
         class_params: [0.0; 4],
     }
+}
+
+/// A material row a quad: quad `k`'s is its test row (`rows[q.material]`)
+/// with the quad's base colour and emission (strength 1).
+fn quad_rows(quads: &[Quad], rows: &[helio_mats::GpuMaterial]) -> Vec<helio_mats::GpuMaterial> {
+    quads
+        .iter()
+        .map(|q| {
+            let mut row = rows[q.material as usize];
+            row.base_color = q.base_color.extend(row.base_color[3]).to_array();
+            row.emissive = q.emissive.extend(1.0).to_array();
+            row
+        })
+        .collect()
 }
 
 fn materials(gpu: &Gpu, rows: &[helio_mats::GpuMaterial]) -> Materials {
@@ -464,16 +503,34 @@ fn alpha_texture(gpu: &Gpu, size: u32, alpha: impl Fn(u32, u32) -> u8) -> wgpu::
     texture
 }
 
-/// A material table whose row 0 is alpha-tested and double-sided, its base
-/// colour texture `texture` (slot 0, repeating, linear), with the single-row
-/// texture metadata whose `params.w = -1` takes the row's texture ids and
-/// cutoff 0.5; row 1 opaque (roughness 0.25, metallic 1).
-fn cut_out_materials(gpu: &Gpu, texture: &wgpu::Texture) -> Materials {
+/// The test rows of [`cut_out_materials`]: row 0 alpha-tested and
+/// double-sided, its base colour texture slot 0; row 1 opaque (roughness
+/// 0.25, metallic 1).
+fn cut_out_rows() -> [helio_mats::GpuMaterial; 2] {
     let mut cut_out = material(0.75, 0.0);
     cut_out.base_color = [0.0, 0.0, 0.0, 1.0];
     cut_out.tex_base_color = 0;
     cut_out.flags = helio_mats::FLAG_ALPHA_TEST | helio_mats::FLAG_DOUBLE_SIDED;
-    let mut table = materials(gpu, &[cut_out, material(0.25, 1.0)]);
+    [cut_out, material(0.25, 1.0)]
+}
+
+/// A material table of `quads` over [`cut_out_rows`], the base colour
+/// texture `texture` (slot 0, repeating, linear), with the single-row
+/// texture metadata whose `params.w = -1` takes the row's texture ids and
+/// cutoff 0.5.
+fn cut_out_materials(gpu: &Gpu, quads: &[Quad], texture: &wgpu::Texture) -> Materials {
+    textured_materials(gpu, &quad_rows(quads, &cut_out_rows()), texture)
+}
+
+/// A material table of `rows` whose texture slots all hold `texture`
+/// (repeating, trilinear), with the single-row texture metadata whose
+/// `params.w = -1` takes each row's texture ids with identity UVs.
+fn textured_materials(
+    gpu: &Gpu,
+    rows: &[helio_mats::GpuMaterial],
+    texture: &wgpu::Texture,
+) -> Materials {
+    let mut table = materials(gpu, rows);
     let mut metadata = [0u32; helio_mats::vg_alpha::MATERIAL_TEXTURE_WORDS as usize];
     metadata[metadata.len() - 1] = (-1f32).to_bits();
     let metadata = gpu
@@ -607,8 +664,10 @@ fn trace(
             frame,
             &mut cmds,
             bindings,
-            scene.map(Scene::rays),
+            scene.map(Scene::hits),
             materials,
+            scene.map(|s| &s.programs),
+            SurfaceDetail::Full,
         );
     }
     gpu.queue.submit([encoder.finish()]);
@@ -622,27 +681,47 @@ fn trace(
     }
 }
 
-/// Records the meshes' surface pass of a stream of `class` (nothing for an
-/// occlusion stream).
+/// The hit programs of these tests' device (one set, as a graph shares
+/// them).
+fn hit_programs(gpu: &Gpu) -> Arc<HitPrograms> {
+    static PROGRAMS: std::sync::OnceLock<Arc<HitPrograms>> = std::sync::OnceLock::new();
+    PROGRAMS
+        .get_or_init(|| Arc::new(HitPrograms::new(&gpu.device, &gpu.queue, None)))
+        .clone()
+}
+
+/// Records the meshes' surface passes of a stream of `class` at `detail`
+/// (nothing for an occlusion stream), its rows naming `programs` (every
+/// program compiled first: a test has no frames to wait over).
+#[allow(clippy::too_many_arguments)]
 fn surfaces_of(
     gpu: &Gpu,
     class: RayClass,
     frame: u64,
     cmds: &mut helio_core::CommandRecorder<'_>,
     bindings: StreamBindings<'_>,
-    scene: Option<MeshRayScene<'_>>,
+    scene: Option<MeshHitScene<'_>>,
     materials: Option<(&wgpu::Buffer, helio_mats::MaterialTextureBindings<'_>)>,
-) {
+    programs: Option<&RayPrograms>,
+    detail: SurfaceDetail,
+) -> usize {
     if class != RayClass::Nearest {
-        return;
+        return 0;
     }
-    let mut surfaces = MeshRayTracer::new(&gpu.device, &gpu.queue, class, MESHES)
-        .unwrap()
-        .surfaces();
+    let shared = hit_programs(gpu);
+    let mut surfaces = MeshHitSurfaces::new(&gpu.device, shared.clone(), detail, MESHES);
+    let write = |buffer: &wgpu::Buffer, offset: u64, bytes: &[u8]| {
+        gpu.queue.write_buffer(buffer, offset, bytes)
+    };
+    // Ask once (starting the compiles), wait for them, ask again.
+    surfaces.set_programs(&gpu.device, programs, write);
+    shared.wait();
+    surfaces.set_programs(&gpu.device, programs, write);
     surfaces.write_frame(frame, |buffer, bytes| {
         gpu.queue.write_buffer(buffer, 0, bytes)
     });
     surfaces.record(&gpu.device, cmds, bindings, scene, materials);
+    surfaces.bin_count()
 }
 
 // ── The CPU reference ───────────────────────────────────────────────────────
@@ -897,7 +976,7 @@ fn nearest_hits_and_surfaces_match_the_cpu() {
         },
     ];
     let scene = scene(gpu, &quads);
-    let table = materials(gpu, &rows);
+    let table = materials(gpu, &quad_rows(&quads, &rows));
     let mut lcg = Lcg(7);
     let rays: Vec<SceneRay> = (0..4096)
         .map(|_| {
@@ -942,7 +1021,7 @@ fn the_nearer_of_the_row_s_hit_and_the_meshes_stands() {
     }];
     let scene = scene(gpu, &quads);
     let rows = [material(0.5, 0.0)];
-    let table = materials(gpu, &rows);
+    let table = materials(gpu, &quad_rows(&quads, &rows));
     let rays: Vec<SceneRay> = (0..64)
         .map(|k| {
             let x = (k % 8) as f32 * 0.2 - 0.7;
@@ -1016,7 +1095,7 @@ fn length_masks_and_count_bound_what_a_ray_meets() {
     ];
     let scene = scene(gpu, &quads);
     let rows = [material(0.5, 0.0)];
-    let table = materials(gpu, &rows);
+    let table = materials(gpu, &quad_rows(&quads, &rows));
     let down = |t_max: f32, mask: u8| ray(Vec3::new(0.1, 0.2, 2.0), Vec3::NEG_Z, t_max, 0.0, mask);
     let rays = [
         down(1.5, MASK_ALL),      // short of both
@@ -1111,9 +1190,9 @@ fn cut_outs_stop_rays_only_where_their_alpha_passes() {
     };
     // Fine rays: the left half of the texture leaves.
     let texture = alpha_texture(gpu, 64, |x, _| if x < 32 { 255 } else { 0 });
-    let table = cut_out_materials(gpu, &texture);
-    let rows = [material(0.75, 0.0), material(0.25, 1.0)];
+    let rows = cut_out_rows();
     let quads = [cut_out(1.0), floor.clone()];
+    let table = cut_out_materials(gpu, &quads, &texture);
     let fine = scene(gpu, &quads);
     let rays: Vec<SceneRay> = (0..64)
         .map(|k| {
@@ -1157,8 +1236,8 @@ fn cut_outs_stop_rays_only_where_their_alpha_passes() {
             }
         },
     );
-    let table = cut_out_materials(gpu, &texture);
     let quads = [cut_out(20.0), floor];
+    let table = cut_out_materials(gpu, &quads, &texture);
     let coarse = scene(gpu, &quads);
     let mut lcg = Lcg(3);
     let rays: Vec<SceneRay> = (0..4096)
@@ -1203,7 +1282,6 @@ fn occlusion_rows_multiply_what_the_meshes_let_through() {
         Mat4::from_translation(Vec3::new(x, 0.0, z)) * Mat4::from_scale(Vec3::new(half, 1.0, 1.0))
     };
     let texture = alpha_texture(gpu, 64, |x, _| if x < 32 { 255 } else { 0 });
-    let table = cut_out_materials(gpu, &texture);
     let quads = [
         // The sheet over x in [-3, -1].
         Quad {
@@ -1224,6 +1302,7 @@ fn occlusion_rows_multiply_what_the_meshes_let_through() {
             ..Default::default()
         },
     ];
+    let table = cut_out_materials(gpu, &quads, &texture);
     let scene = scene(gpu, &quads);
     let down = |x: f32, mask: u8| ray(Vec3::new(x, 0.1, 2.0), Vec3::NEG_Z, 10.0, 0.0, mask);
     let rays = [
@@ -1317,7 +1396,7 @@ fn a_proxy_instance_is_traced_by_its_face() {
     ];
     let scene = scene(gpu, &quads);
     let rows = [material(0.4, 0.0)];
-    let table = materials(gpu, &rows);
+    let table = materials(gpu, &quad_rows(&quads, &rows));
     let mut lcg = Lcg(11);
     let rays: Vec<SceneRay> = (0..512)
         .map(|k| {
@@ -1418,11 +1497,11 @@ fn a_skinned_instance_is_traced_where_its_pose_puts_it() {
         base_vertex: 0,
         flags: helio_mesh_api::RAY_INSTANCE_SKINNED,
         material: 0,
-        base_color: [0.5, 0.5, 0.5, 1.0],
-        emissive: [0.0; 3],
-        instance: 0,
         transmission: [0.0; 3],
+        instance: 0,
         skinned_vertex: 0,
+        program: 0,
+        _pad: [0; 2],
     }];
     let instances = init(
         "ray instances",
@@ -1487,14 +1566,21 @@ fn a_skinned_instance_is_traced_where_its_pose_puts_it() {
         let scene = MeshRayScene {
             tlas: tlas.tlas().unwrap(),
             instances: &instances,
-            transforms: &transforms,
             space_groups: None,
             vertices: &vertex_pool,
             indices: &index_pool,
             proxies: None,
             skinned: Some(&skinned),
         };
-        trace_scene(gpu, &rays, scene, &table)
+        let hits = MeshHitScene {
+            instances: &instances,
+            transforms: &transforms,
+            vertices: &vertex_pool,
+            indices: &index_pool,
+            proxies: None,
+            skinned: Some(&skinned),
+        };
+        trace_scene(gpu, &rays, scene, hits, &table)
     };
     // Expect every ray to hit the plane through height `h` at the centre
     // tilted by `tilt` (x within half a metre: the tilt moves it by tan).
@@ -1555,6 +1641,7 @@ fn trace_scene(
     gpu: &Gpu,
     rays: &[SceneRay],
     scene: MeshRayScene<'_>,
+    hits: MeshHitScene<'_>,
     materials: &Materials,
 ) -> Traced {
     let stream = Stream::new(
@@ -1593,14 +1680,345 @@ fn trace_scene(
             1,
             &mut cmds,
             bindings,
-            Some(scene),
+            Some(hits),
             Some(materials.bindings(&views)),
+            None,
+            SurfaceDetail::Full,
         );
     }
     gpu.queue.submit([encoder.finish()]);
     Traced {
         hits: read(gpu, &buffers.hits),
         surfaces: read(gpu, buffers.surfaces.as_ref().unwrap()),
+    }
+}
+
+// ── Materials at hits ───────────────────────────────────────────────────────
+
+/// A mipped RGBA8 texture of `size` x `size` whose every texel of mip `k`
+/// is `colour(k)`.
+fn mip_texture(gpu: &Gpu, size: u32, colour: impl Fn(u32) -> [u8; 4]) -> wgpu::Texture {
+    let levels = size.ilog2() + 1;
+    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("mip colours"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: levels,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for mip in 0..levels {
+        let side = (size >> mip).max(1);
+        let texels: Vec<u8> = (0..side * side).flat_map(|_| colour(mip)).collect();
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: mip,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &texels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * side),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: side,
+                height: side,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    texture
+}
+
+/// One frame of a nearest-hit stream at `detail`, its surfaces by the
+/// rows' programs.
+fn trace_detail(
+    gpu: &Gpu,
+    rays: &[SceneRay],
+    scene: &Scene,
+    materials: &Materials,
+    detail: SurfaceDetail,
+) -> (Traced, usize) {
+    let stream = Stream::new(
+        "mesh_rays_test_detail",
+        RayClass::Nearest,
+        rays.len() as u32,
+    );
+    let buffers = StreamBuffers::new(&gpu.device, &stream);
+    gpu.queue
+        .write_buffer(&buffers.rays, 0, bytemuck::cast_slice(rays));
+    buffers.set_count(&gpu.queue, rays.len() as u32);
+    let mut tracer =
+        MeshRayTracer::new(&gpu.device, &gpu.queue, RayClass::Nearest, MESHES).unwrap();
+    tracer.write_frame(1, |buffer, bytes| gpu.queue.write_buffer(buffer, 0, bytes));
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    let bins;
+    {
+        let mut cmds = helio_core::CommandRecorder::from_encoder(&mut encoder);
+        buffers.clear(&mut cmds);
+        let views = materials.views(gpu);
+        let bindings = StreamBindings {
+            header: &buffers.header,
+            rays: &buffers.rays,
+            hits: &buffers.hits,
+            surfaces: buffers.surfaces.as_ref(),
+        };
+        tracer.record(
+            &gpu.device,
+            &mut cmds,
+            bindings,
+            Some(scene.rays()),
+            Some(materials.bindings(&views)),
+        );
+        bins = surfaces_of(
+            gpu,
+            RayClass::Nearest,
+            1,
+            &mut cmds,
+            bindings,
+            Some(scene.hits()),
+            Some(materials.bindings(&views)),
+            Some(&scene.programs),
+            detail,
+        );
+    }
+    gpu.queue.submit([encoder.finish()]);
+    (
+        Traced {
+            hits: read(gpu, &buffers.hits),
+            surfaces: read(gpu, buffers.surfaces.as_ref().unwrap()),
+        },
+        bins,
+    )
+}
+
+/// Rays down -z onto the quads laid side by side along x (2 m apart), `n`
+/// a quad, clear of their edges.
+fn rays_onto(quads: usize, n: usize, spread: f32) -> Vec<SceneRay> {
+    (0..quads * n)
+        .map(|k| {
+            let (quad, i) = (k / n, k % n);
+            let x = quad as f32 * 3.0 + (i % 8) as f32 * 0.2 - 0.7;
+            let y = (i / 8) as f32 * 0.2 - 0.7;
+            ray(Vec3::new(x, y, 2.0), Vec3::NEG_Z, 10.0, spread, MASK_ALL)
+        })
+        .collect()
+}
+
+/// Quads side by side along x (3 m apart), each with `program`.
+fn side_by_side(programs: &[RayProgram]) -> Vec<Quad> {
+    programs
+        .iter()
+        .enumerate()
+        .map(|(k, program)| Quad {
+            base_color: Vec3::new(0.2 + 0.1 * k as f32, 0.6, 0.4),
+            program: *program,
+            transform: Mat4::from_translation(Vec3::new(3.0 * k as f32, 0.0, 0.0)),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Hits binned by program: the table-driven quad, a clear-coat quad and a
+/// two-sided foliage quad each shade by their own program (three bins), the
+/// first two as the table describes them and the leaf with its share of its
+/// colour let through (`material_transmitted`: the raster's and the hit's
+/// one description); a program whose graph is not registered yet, and one
+/// of a template no registry holds, shade by the table-driven program,
+/// never left without a surface.
+#[test]
+fn hits_are_shaded_by_their_material_program() {
+    let Some(gpu) = gpu() else { return };
+    let programs = [
+        RayProgram::TABLE,
+        RayProgram {
+            template: helio_mats::MATERIAL_CLASS_CLEAR_COAT,
+            graph_hash: 0,
+        },
+        RayProgram {
+            template: helio_mats::MATERIAL_CLASS_FOLIAGE,
+            graph_hash: 0,
+        },
+        // A graph whose source is not registered: waits, the table shades.
+        RayProgram {
+            template: 0,
+            graph_hash: 0x5eed_0000_dead_beef,
+        },
+        // A custom class no registry holds: the table's.
+        RayProgram {
+            template: helio_mats::FIRST_CUSTOM_MATERIAL_CLASS + 900,
+            graph_hash: 0,
+        },
+    ];
+    let quads = side_by_side(&programs);
+    let mut foliage = material(0.6, 0.0);
+    foliage.material_class = helio_mats::MATERIAL_CLASS_FOLIAGE;
+    foliage.class_params = [0.4, 0.0, 0.0, 0.0];
+    let mut clear_coat = material(0.3, 0.0);
+    clear_coat.material_class = helio_mats::MATERIAL_CLASS_CLEAR_COAT;
+    let mut quads = quads;
+    quads[1].material = 1;
+    quads[2].material = 2;
+    let rows = [material(0.5, 0.0), clear_coat, foliage];
+    let scene = scene(gpu, &quads);
+    let table = materials(gpu, &quad_rows(&quads, &rows));
+    let rays = rays_onto(quads.len(), 16, 0.0);
+    for detail in [SurfaceDetail::Full, SurfaceDetail::Diffuse] {
+        let (traced, bins) = trace_detail(gpu, &rays, &scene, &table, detail);
+        assert_eq!(bins, 3, "{detail:?}: the table, clear coat and foliage");
+        for (k, r) in rays.iter().enumerate() {
+            let quad = k / 16;
+            let (hit, surface) = (&traced.hits[k], &traced.surfaces[k]);
+            assert_eq!(
+                payload::row(hit),
+                quad as u32,
+                "{detail:?} ray {k}: {hit:?}"
+            );
+            let [red, green, blue, _] = surface.base_color();
+            let albedo = Vec3::new(red, green, blue);
+            assert!(
+                (albedo - quads[quad].base_color).abs().max_element() <= 1.0 / 255.0,
+                "{detail:?} ray {k}: {albedo} want {}",
+                quads[quad].base_color
+            );
+            let through = Vec3::from(surface.transmission());
+            if quad == 2 {
+                let want = quads[2].base_color * 0.4;
+                assert!(
+                    (through - want).abs().max_element() < 0.01,
+                    "{detail:?} ray {k}: the leaf lets {through} through, want {want}"
+                );
+            } else {
+                assert_eq!(through, Vec3::ZERO, "{detail:?} ray {k}");
+                if detail == SurfaceDetail::Full {
+                    check_hit(&quads, &rows, k, r, hit, surface);
+                }
+            }
+        }
+    }
+}
+
+/// Textures at the ray cone's footprint: a texture whose mips are each a
+/// colour of their own, on a 2 m quad across UV 0..1 (64 texels: 3.1 cm
+/// each), met head on 2 m away by rays whose footprint there spans 1, 4
+/// and 16 texels: each reads mip 0, 2 and 4, at either detail; a ray
+/// meeting the quad at a slant reads a coarser mip than one head on.
+#[test]
+fn textures_are_read_at_the_ray_cone_s_footprint() {
+    let Some(gpu) = gpu() else { return };
+    let colours = [
+        [255, 0, 0, 255],
+        [255, 255, 0, 255],
+        [0, 255, 0, 255],
+        [0, 255, 255, 255],
+        [0, 0, 255, 255],
+        [255, 0, 255, 255],
+        [255, 255, 255, 255],
+    ];
+    let texture = mip_texture(gpu, 64, |mip| colours[mip as usize]);
+    let mut row = material(0.5, 0.0);
+    row.tex_base_color = 0;
+    let quads = [Quad {
+        base_color: Vec3::ONE,
+        ..Default::default()
+    }];
+    let scene = scene(gpu, &quads);
+    let table = textured_materials(gpu, &quad_rows(&quads, &[row]), &texture);
+    let texel = 2.0 / 64.0;
+    for (texels, mip) in [(1.0f32, 0usize), (4.0, 2), (16.0, 4)] {
+        // The footprint at 2 m is `texels` texels across.
+        let rays = rays_onto(1, 16, texels * texel / 2.0);
+        for detail in [SurfaceDetail::Full, SurfaceDetail::Diffuse] {
+            let (traced, _) = trace_detail(gpu, &rays, &scene, &table, detail);
+            let c = colours[mip].map(|c| f32::from(c) / 255.0);
+            let want = Vec3::new(c[0], c[1], c[2]);
+            for k in 0..rays.len() {
+                let [r, g, b, _] = traced.surfaces[k].base_color();
+                let got = Vec3::new(r, g, b);
+                assert!(
+                    (got - want).abs().max_element() < 0.1,
+                    "{detail:?}, {texels} texels: ray {k} read {got}, want mip {mip} {want}"
+                );
+            }
+        }
+    }
+    // At a slant (75 degrees off the normal) the same cone covers four
+    // times the length along the slope: a coarser read than head on.
+    let slant = 75f32.to_radians();
+    let dir = Vec3::new(slant.sin(), 0.0, -slant.cos());
+    let rays: Vec<SceneRay> = (0..16)
+        .map(|i| {
+            let target = Vec3::new(
+                -0.5 + (i % 4) as f32 * 0.1,
+                -0.5 + (i / 4) as f32 * 0.1,
+                0.0,
+            );
+            ray(target - dir * 2.0, dir, 10.0, texel / 2.0, MASK_ALL)
+        })
+        .collect();
+    let (traced, _) = trace_detail(gpu, &rays, &scene, &table, SurfaceDetail::Full);
+    for k in 0..rays.len() {
+        let [_, g, _, _] = traced.surfaces[k].base_color();
+        // Mip 0 is pure red (no green); the slanted read is about mip 2
+        // (the slope's axis about four texels long).
+        assert!(traced.hits[k].t > 0.0, "slanted ray {k} missed");
+        assert!(g > 0.5, "slanted ray {k}: green {g}: read at mip 0");
+    }
+}
+
+/// `Full` evaluates the normal map; `Diffuse` keeps the vertex normal and
+/// the material's constant roughness (no ORM texture read).
+#[test]
+fn diffuse_streams_skip_what_a_diffuse_consumer_does_not_read() {
+    let Some(gpu) = gpu() else { return };
+    // One texture for base colour, normal map and ORM: rgb (0.75, 0.5, 1.0),
+    // a normal tilted toward +u; as ORM, roughness x0.5.
+    let texture = mip_texture(gpu, 4, |_| [191, 128, 255, 255]);
+    let mut row = material(0.8, 0.0);
+    row.tex_base_color = 0;
+    row.tex_normal = 0;
+    row.tex_roughness = 0;
+    row.flags = helio_mats::FLAG_HAS_NORMAL_MAP;
+    let quads = [Quad {
+        base_color: Vec3::ONE,
+        ..Default::default()
+    }];
+    // The quad's tangent (+u: +x) and sign come from its vertices.
+    let scene = scene(gpu, &quads);
+    let table = textured_materials(gpu, &quad_rows(&quads, &[row]), &texture);
+    let rays = rays_onto(1, 16, 0.0);
+    let (full, _) = trace_detail(gpu, &rays, &scene, &table, SurfaceDetail::Full);
+    let (diffuse, _) = trace_detail(gpu, &rays, &scene, &table, SurfaceDetail::Diffuse);
+    for k in 0..rays.len() {
+        let n_full = Vec3::from(stream::unpack_unit(full.surfaces[k].normal));
+        let n_diffuse = Vec3::from(stream::unpack_unit(diffuse.surfaces[k].normal));
+        assert!(
+            angle(n_diffuse, Vec3::Z) < 1e-3,
+            "ray {k}: diffuse normal {n_diffuse}"
+        );
+        assert!(
+            angle(n_full, Vec3::Z) > 0.3,
+            "ray {k}: the full surface's normal map unread: {n_full}"
+        );
+        assert!(
+            (diffuse.surfaces[k].roughness() - 0.8).abs() < 0.01,
+            "ray {k}: diffuse roughness {}",
+            diffuse.surfaces[k].roughness()
+        );
+        assert!(
+            full.surfaces[k].roughness() < 0.75,
+            "ray {k}: the full surface's ORM unread: {}",
+            full.surfaces[k].roughness()
+        );
     }
 }
 
@@ -1644,7 +2062,6 @@ fn down_in(space: u32) -> SceneRay {
 #[test]
 fn a_ray_meets_only_its_own_space() {
     let Some(gpu) = gpu() else { return };
-    let table = materials(gpu, &[material(0.5, 0.0)]);
     for (what, quads) in [
         ("a group each", overlapping(4, 0, &[])),
         // Spaces 1 and 4 share group 1: the near quad (4) is a candidate of
@@ -1653,6 +2070,7 @@ fn a_ray_meets_only_its_own_space() {
         ("the world nearer", overlapping(0, 9, &[2])),
     ] {
         let scene = scene(gpu, &quads);
+        let table = materials(gpu, &quad_rows(&quads, &[material(0.5, 0.0)]));
         let (near, far) = (quads[0].space, quads[1].space);
         let rays = [
             down_in(SPACE_ANY),
@@ -2135,19 +2553,27 @@ mod graph {
         let shoot = |projection: &mut SceneDbRayTracing| {
             projection.prepare(world).unwrap();
             let scene_rays = projection.scene_rays().unwrap();
+            let instances = scene_rays.buffer(helio_mesh_api::RAY_INSTANCES).unwrap();
             let scene = MeshRayScene {
                 tlas: &scene_rays.tlas,
-                instances: scene_rays.buffer(helio_mesh_api::RAY_INSTANCES).unwrap(),
-                transforms: scene_rays
-                    .buffer(helio_mesh_api::RAY_INSTANCE_TRANSFORMS)
-                    .unwrap(),
+                instances,
                 space_groups: scene_rays.buffer(helio_mesh_api::RAY_SPACE_GROUPS),
                 vertices: &vertices,
                 indices: &indices,
                 proxies: None,
                 skinned: None,
             };
-            let traced = trace_scene(gpu, &rays, scene, &table);
+            let hits = MeshHitScene {
+                instances,
+                transforms: scene_rays
+                    .buffer(helio_mesh_api::RAY_INSTANCE_TRANSFORMS)
+                    .unwrap(),
+                vertices: &vertices,
+                indices: &indices,
+                proxies: None,
+                skinned: None,
+            };
+            let traced = trace_scene(gpu, &rays, scene, hits, &table);
             traced.hits.iter().map(|h| h.t).collect::<Vec<f32>>()
         };
         projection.set_view(

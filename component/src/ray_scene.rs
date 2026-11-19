@@ -59,13 +59,15 @@
 //!   has moved a twentieth of the radius.
 //!
 //! What it traces: every enabled, visible static or skinned mesh section
-//! whose material is opaque or a cut-out, within the culling criterion. Cut-outs are non-opaque segments flagged
-//! `RAY_INSTANCE_MASKED`, so a ray query tests their alpha as the raster
-//! does. Blended sections (glass) are left out: probe rays pass them. A
-//! material graph is traced as its resolved row (its fallback surface and
-//! its first texture's mean colour): rays cannot run a graph, so a hit's
-//! colour is that coarse surface, as with every material
-//! (`RayInstance::base_color`).
+//! whose material is opaque or a cut-out, within the culling criterion.
+//! Cut-outs are non-opaque segments flagged `RAY_INSTANCE_MASKED`, so a ray
+//! query tests their alpha as the raster does. Blended sections (glass) are
+//! left out: probe rays pass them. Each row names the program its material
+//! instance is evaluated by at a hit (`RayInstance::program`: its class's
+//! template and graph, from the instance's resolved key), an index of the
+//! programs it publishes with the TLAS (`helio_mesh_api::RAY_PROGRAMS`), so
+//! a hit is shaded by its material in full (the meshes' tracer's surface
+//! passes), graphs included.
 //!
 //! How others do it: Unreal's ray-tracing scene keeps one instance per
 //! primitive with a BLAS per mesh LOD whose segments are its sections (hit
@@ -81,10 +83,9 @@ use helio_core::{BlasGeometry, BlasManager, BlasSegment, TlasInstanceInput, Tlas
 use helio_mats::instance::{MaterialInstanceComponent, row_of};
 use helio_mesh_api::{
     RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_SKINNED, RAY_INSTANCE_TWO_SIDED,
-    RAY_SPACE_GROUP, RAY_SPACE_SLOTS, RayInstance, RayTransform,
+    RAY_SPACE_GROUP, RAY_SPACE_SLOTS, RayInstance, RayProgram, RayPrograms, RayTransform,
 };
 use helio_mesh_host::ray_proxies::{Lookup, ProxyRange, VgRayProxies};
-use helio_mesh_host::texture_means::TextureMeans;
 use helio_pass_mesh_rays::RayTracingSettings;
 use pulsar_scene_model::attachments::ComponentOwner;
 use pulsar_scene_model::{Parent, SpaceSlot, Transform, Visibility};
@@ -172,8 +173,9 @@ struct Surface {
     blended: bool,
     /// `RAY_INSTANCE_MASKED` and `RAY_INSTANCE_TWO_SIDED` bits.
     flags: u32,
-    base_color: [f32; 4],
-    emissive: [f32; 3],
+    /// The program its material is evaluated by at a hit: an index of the
+    /// published programs.
+    program: u32,
 }
 
 /// Why a mesh is not traced. The first four are retried every frame (they
@@ -318,14 +320,14 @@ pub struct WorldRayScene {
     origin: DVec3,
     cursors: Option<Cursors>,
     changes: Vec<ComponentChange>,
-    /// Material instances' surfaces: their rows with the texture means
-    /// applied; cleared when means arrive.
+    /// Material instances' surfaces, until they change.
     surfaces: HashMap<Entity, Option<Surface>>,
+    /// The programs rows name (`RAY_PROGRAMS`): every program a traced
+    /// material was evaluated by since the scene began (an index, once
+    /// given, stays that program's), published with the TLAS.
+    programs: Arc<RayPrograms>,
     /// Meshes to re-evaluate past last frame's budget.
     pending: HashSet<Entity>,
-    /// Base colour textures' means: a hit's colour is its material's factor
-    /// times its texture's mean.
-    texture_means: TextureMeans,
     vg: Option<VgRayProxies>,
     tlas_ok: bool,
     logged: Option<Stats>,
@@ -354,7 +356,6 @@ impl WorldRayScene {
             return None;
         }
         Some(Self {
-            texture_means: TextureMeans::new(&device),
             blas: BlasManager::new(device.clone()),
             tlas,
             device,
@@ -381,6 +382,7 @@ impl WorldRayScene {
             cursors: None,
             changes: Vec::new(),
             surfaces: HashMap::new(),
+            programs: Arc::new(RayPrograms::default()),
             pending: HashSet::new(),
             vg: virtual_geometry.map(VgRayProxies::new),
             tlas_ok: false,
@@ -399,9 +401,9 @@ impl WorldRayScene {
     /// origin is `origin` and whose eye is `eye` (world space), recording
     /// its builds into `encoder` after the skin cache's pass (`skins`, which
     /// did `skin_frame` this frame). Call after the world's GPU mirror is
-    /// flushed (the BLASes read the mirrored geometry); submit `encoder`,
-    /// then call [`Self::after_submit`]. Adds the acceleration structures'
-    /// stats to `stats`.
+    /// flushed (the BLASes read the mirrored geometry), then submit
+    /// `encoder` and publish [`Self::scene_rays`] with [`Self::programs`].
+    /// Adds the acceleration structures' stats to `stats`.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
@@ -441,12 +443,6 @@ impl WorldRayScene {
         dirty.extend(self.waiting.drain());
         // Skinned instances the cache moved or dropped: their rows follow.
         dirty.extend(skin_frame.moved.iter().copied());
-        // Texture means that arrived recolour the rows (from the cached
-        // material rows: nothing is resolved again).
-        if self.texture_means.collect() {
-            self.surfaces.clear();
-            self.recolour(world, mirror);
-        }
         // A budget of meshes a frame; the rest wait for the next frames (a
         // level loading spreads over them).
         let mut evaluated = 0;
@@ -525,11 +521,6 @@ impl WorldRayScene {
         self.log_stats();
     }
 
-    /// After the encoder [`Self::prepare`] recorded into is submitted.
-    pub fn after_submit(&mut self) {
-        self.texture_means.dispatch(&self.device, &self.queue);
-    }
-
     /// The BLAS manager's counters (builds, refits, compactions).
     pub fn blas_counters(&self) -> helio_core::BlasCounters {
         self.blas.counters()
@@ -543,6 +534,12 @@ impl WorldRayScene {
     /// How many instances the culling leaves out.
     pub fn culled_count(&self) -> usize {
         self.culled
+    }
+
+    /// The programs the rows name (`helio_mesh_api::RAY_PROGRAMS`), to
+    /// publish with [`Self::scene_rays`].
+    pub fn programs(&self) -> Arc<RayPrograms> {
+        self.programs.clone()
     }
 
     /// The frame's ray-traced scene, after [`Self::prepare`].
@@ -932,11 +929,11 @@ impl WorldRayScene {
                     base_vertex: skin.mesh_vertex,
                     flags: RAY_INSTANCE_SKINNED | surface.flags,
                     material: row_of(material),
-                    base_color: surface.base_color,
-                    emissive: surface.emissive,
-                    instance: 0,
                     transmission: [0.0; 3],
+                    instance: 0,
                     skinned_vertex: skin.cache_vertex,
+                    program: surface.program,
+                    _pad: [0; 2],
                 })
                 .collect(),
             materials: vec![material; sections.len()],
@@ -1016,11 +1013,11 @@ impl WorldRayScene {
                 base_vertex,
                 flags: flags | surface.flags,
                 material: row_of(material),
-                base_color: surface.base_color,
-                emissive: surface.emissive,
-                instance: 0,
                 transmission: [0.0; 3],
+                instance: 0,
                 skinned_vertex: 0,
+                program: surface.program,
+                _pad: [0; 2],
             };
         let lookup = match self.vg.as_mut() {
             Some(vg) => vg.lookup((vertices.offset, vertices.count)),
@@ -1132,32 +1129,6 @@ impl WorldRayScene {
             self.moved_slots.push(slot);
         }
         self.cull(entity);
-    }
-
-    /// The traced rows' colours from the surfaces (texture means arrived).
-    fn recolour(&mut self, world: &World, mirror: &GpuMirrorHandle) {
-        let meshes: Vec<Entity> = self.entries.keys().copied().collect();
-        for entity in meshes {
-            let Some(materials) = (match self.entries.get(&entity).map(|e| &e.state) {
-                Some(Ok(traced)) => Some(traced.materials.clone()),
-                _ => None,
-            }) else {
-                continue;
-            };
-            let surfaces: Vec<_> = materials
-                .iter()
-                .map(|material| self.surface(world, mirror, *material))
-                .collect();
-            if let Some(Ok(traced)) = self.entries.get_mut(&entity).map(|e| &mut e.state) {
-                for (row, surface) in traced.rows.iter_mut().zip(surfaces) {
-                    if let Some(surface) = surface {
-                        row.base_color = surface.base_color;
-                        row.emissive = surface.emissive;
-                    }
-                }
-            }
-        }
-        self.rows_dirty = true;
     }
 
     /// Build queued BLASes, up to the frame's triangle budget.
@@ -1527,42 +1498,35 @@ impl WorldRayScene {
         if let Some(surface) = self.surfaces.get(&entity) {
             return *surface;
         }
-        // The row the materials plugin resolved when the instance bound, as
-        // the GPU mirror's CPU shadow holds it. Never resolved here:
-        // resolving a graph registers and uploads its textures (locks, cooks)
-        // and must not run under the scene lock this projection holds.
-        let row = world
-            .is_alive(entity)
-            .then(|| {
-                mirror.store().read_dirty_tracked_row_bytes(
-                    helio_mats::host_rows::MaterialComponent::packed_gpu_component_id(),
-                    row_of(entity),
-                )
-            })
-            .flatten()
-            .and_then(|bytes| {
-                bytemuck::try_pod_read_unaligned::<helio_mats::host_rows::MaterialComponent>(&bytes)
-                    .ok()
-            })
-            .map(helio_mats::GpuMaterial::from);
+        // The row and key the materials plugin resolved when the instance
+        // bound (`helio_mats::instance::resolved_row` / `resolved_key`, the
+        // GPU mirror's CPU shadow). Never resolved here: resolving a graph
+        // registers and uploads its textures (locks, cooks) and must not run
+        // under the scene lock this projection holds.
+        let alive = world.is_alive(entity);
+        let row = alive
+            .then(|| helio_mats::instance::resolved_row(mirror, entity))
+            .flatten();
+        let key = alive
+            .then(|| helio_mats::instance::resolved_key(mirror, entity))
+            .flatten();
         let surface = row.map(|row| {
-            let texture = (row.tex_base_color != helio_mats::GpuMaterial::NO_TEXTURE)
-                .then(|| mirror.texture_store())
-                .flatten()
-                .and_then(|store| store.read().ok()?.texture(row.tex_base_color).cloned());
-            let mean = texture
-                .and_then(|texture| self.texture_means.mean(&texture))
-                .unwrap_or([1.0; 3]);
-            let [r, g, b, _] = row.base_color;
-            let [er, eg, eb, strength] = row.emissive;
             let masked = row.flags & helio_mats::FLAG_ALPHA_TEST != 0;
             let two_sided = row.flags & helio_mats::FLAG_DOUBLE_SIDED != 0;
+            let program = key.map_or(RayProgram::TABLE, |key| RayProgram {
+                template: key.material_class,
+                graph_hash: key.graph_hash,
+            });
+            let programs = &mut self.programs;
+            let index = match programs.programs().iter().position(|p| *p == program) {
+                Some(index) => index as u32,
+                None => Arc::make_mut(programs).index(program),
+            };
             Surface {
                 blended: !masked && row.flags & helio_mats::FLAG_ALPHA_BLEND != 0,
                 flags: if masked { RAY_INSTANCE_MASKED } else { 0 }
                     | if two_sided { RAY_INSTANCE_TWO_SIDED } else { 0 },
-                base_color: [r * mean[0], g * mean[1], b * mean[2], 1.0],
-                emissive: [er * strength, eg * strength, eb * strength],
+                program: index,
             }
         });
         self.surfaces.insert(entity, surface);

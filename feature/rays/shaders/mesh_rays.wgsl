@@ -1,8 +1,6 @@
 //!use frame_ray_stream
-//!use frame_ray_surface
-//!use frame_surface
+//!use mesh_ray_rows
 //!use mesh_ray_surface
-//!use material_row
 enable wgpu_ray_query;
 // The meshes' tracer of a ray stream (`helio_frame_api::rays::stream`,
 // crate docs): each ray queries the frame's TLAS from its origin up to the
@@ -21,9 +19,8 @@ enable wgpu_ray_query;
 // hardware's opaque path.
 //
 // A nearest-hit ray the meshes stop writes its hit (`mesh_rays_nearest`);
-// once every tracer traced, `mesh_rays_surface` writes the surface of the
-// hits that stayed the meshes', from the hit's row, triangle and
-// barycentrics and its instance's transform (`RAY_INSTANCE_TRANSFORMS`).
+// once every tracer traced, the surface passes (`mesh_hit_surface.wgsl`)
+// evaluate the material of the hits that stayed the meshes'.
 //
 // The ray is traced from its origin exactly (`t` from 0): offsetting an
 // origin off the surface it leaves is the consumer's, which knows that
@@ -47,14 +44,8 @@ enable wgpu_ray_query;
 @group(0) @binding(11) var<storage, read> skinned_vertices: array<u32>;
 // The coordinate spaces' mask groups (`helio_mesh_api::RAY_SPACE_GROUPS`).
 @group(0) @binding(12) var<storage, read> space_groups: array<u32>;
-// A nearest-hit stream's surfaces and the instances' transforms (none in
-// the occlusion pipeline).
-@group(0) @binding(10) var<storage, read_write> surfaces: array<SceneSurface>;
-@group(0) @binding(13) var<storage, read> transforms: array<RayTransform>;
-// Group 1: the scene's material rows (`materials`, for a hit's metalness
-// and roughness), then the same rows and the texture table for cut-outs'
-// alpha (`helio_mats::vg_alpha`, spliced in before this file).
-@group(1) @binding(0) var<storage, read> materials: array<GpuMaterial>;
+// Group 1: the material rows and the texture table for cut-outs' alpha
+// (`helio_mats::vg_alpha`, spliced in before this file, from binding 1).
 
 struct MeshRayFrame {
     // x: this frame's seed, y: this tracer's id in the stream's hits.
@@ -148,14 +139,6 @@ fn ray_seed(index: u32) -> u32 {
     return hash(index ^ trace.info.x);
 }
 
-// The material row of a hit (the grey stand-in for a row the table lacks).
-fn material_of(id: u32) -> GpuMaterial {
-    if id < arrayLength(&materials) {
-        return materials[id];
-    }
-    return material_stand_in();
-}
-
 @compute @workgroup_size(RAY_STREAM_GROUP)
 fn mesh_rays_nearest(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= header.count || id.x >= arrayLength(&rays) { return; }
@@ -192,7 +175,7 @@ fn mesh_rays_nearest(@builtin(global_invocation_id) id: vec3<u32>) {
     let held = hits[id.x];
     if held.t > 0.0 && c.t >= held.t { return; }
     // Its inside: the back of a single-sided surface (the ray starts in a
-    // wall or a solid), as `mesh_rays_surface` orients it again.
+    // wall or a solid), as the surface pass orients it again.
     let instance = instances[ray_row(c)];
     let t = ray_triangle(instance, c.primitive_index);
     let p0 = c.object_to_world * vec4<f32>(t.corners[0], 1.0);
@@ -203,85 +186,6 @@ fn mesh_rays_nearest(@builtin(global_invocation_id) id: vec3<u32>) {
     let inside = mesh_ray_normals(instance, cross(p1 - p0, p2 - p0), vec3<f32>(dot(w[0], local), dot(w[1], local), dot(w[2], local)), ray.dir).inside;
     // A hit at the origin itself is still a hit (t 0 means none).
     hits[id.x] = scene_nearest(trace.info.y, max(c.t, 1e-6), inside, ray_row(c), c.primitive_index, pack2x16unorm(c.barycentrics));
-}
-
-// The side triangle `t` calls outside at barycentrics `b`, in object space:
-// its vertex normals blended; a proxy's winding (no vertex normals), unit.
-fn mesh_ray_outside(t: RayTriangle, b: vec3<f32>) -> vec3<f32> {
-    let local = ray_triangle_outside(t, b);
-    return select(local, local / max(length(local), 1e-30), t.proxy);
-}
-
-// The face's and the shading normal at a hit, both on the side the ray
-// met, unit: from `face_in` the triangle's frame-space cross product and
-// `shading_in` its outside (`mesh_ray_outside`) taken to the frame by the
-// inverse transpose; and whether the ray met the back of a single-sided
-// surface (`inside`).
-struct MeshRayNormals {
-    face: vec3<f32>,
-    shading: vec3<f32>,
-    inside: bool,
-}
-
-fn mesh_ray_normals(instance: RayInstance, face_in: vec3<f32>, shading_in: vec3<f32>, dir: vec3<f32>) -> MeshRayNormals {
-    var face = face_in / max(length(face_in), 1e-20);
-    var shading = shading_in;
-    if dot(shading, shading) < 1e-8 {
-        // No vertex normals: two-sided.
-        shading = -dir;
-    }
-    shading = normalize(shading);
-    if dot(face, shading) < 0.0 { face = -face; }
-    // Two-sided: the side the ray meets is its outside.
-    if (instance.flags & RAY_INSTANCE_TWO_SIDED) != 0u && dot(face, dir) > 0.0 {
-        face = -face;
-        shading = -shading;
-    }
-    // Its inside: the back of a single-sided surface (the ray starts in a
-    // wall or a solid). The surface's normals are then those of the side
-    // the ray met.
-    let inside = dot(face, dir) > 0.0;
-    if inside {
-        face = -face;
-        shading = -shading;
-    }
-    return MeshRayNormals(face, shading, inside);
-}
-
-// The surfaces of the hits that stayed the meshes' (`trace.info.y`), once
-// every tracer traced: the triangle again from the hit's row and
-// primitive, taken to the frame by its instance's transform
-// (`RAY_INSTANCE_TRANSFORMS`), the shading normal where it faces the ray (the
-// face's where an interpolated normal turns away: a silhouette's grazing
-// hit), the row's colours and the material's metalness and roughness.
-@compute @workgroup_size(RAY_STREAM_GROUP)
-fn mesh_rays_surface(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= header.count || id.x >= arrayLength(&rays) { return; }
-    let hit = hits[id.x];
-    if hit.t <= 0.0 || scene_hit_tracer(hit) != trace.info.y { return; }
-    let row = scene_hit_payload(hit);
-    if row >= arrayLength(&instances) { return; }
-    let ray = rays[id.x];
-    let instance = instances[row];
-    let x = transforms[min(instance.instance, arrayLength(&transforms) - 1u)];
-    let t = ray_triangle(instance, hit.b);
-    let bary = unpack2x16unorm(hit.c);
-    let local = mesh_ray_outside(t, vec3<f32>(1.0 - bary.x - bary.y, bary));
-    let p0 = ray_transform_point(x, t.corners[0]);
-    let p1 = ray_transform_point(x, t.corners[1]);
-    let p2 = ray_transform_point(x, t.corners[2]);
-    let normals = mesh_ray_normals(instance, cross(p1 - p0, p2 - p0), ray_transform_normal(x, local), ray.dir);
-    let n = select(normals.face, normals.shading, dot(normals.shading, ray.dir) < 0.0);
-    let material = material_of(instance.material);
-    let metallic = select(0.0, material.roughness_metallic.y, material.workflow == MATERIAL_WORKFLOW_METALLIC);
-    let surface = surface_data(
-        clamp(instance.base_color.rgb, vec3<f32>(0.0), vec3<f32>(1.0)),
-        n,
-        clamp(material.roughness_metallic.x, 0.0, 1.0),
-        clamp(metallic, 0.0, 1.0),
-        max(instance.emissive, vec3<f32>(0.0)),
-    );
-    surfaces[id.x] = scene_surface_pack(surface, normals.face);
 }
 
 // The share of light that gets along `ray` (its whole length) past the

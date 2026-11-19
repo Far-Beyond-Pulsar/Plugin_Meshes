@@ -265,11 +265,11 @@ impl RenderHostPart for MeshesHostPart {
             );
         }
         queue.submit([encoder.finish()]);
-        if let RayScene::Ready(rays) = &mut self.ray_scene {
-            rays.after_submit();
+        if let RayScene::Ready(rays) = &self.ray_scene {
             if let Some(scene_rays) = rays.scene_rays() {
                 renderer
                     .set_scene_payload(&helio_frame_api::rays::SCENE_RAYS, Arc::new(scene_rays));
+                renderer.set_scene_payload(&helio_mesh_api::RAY_PROGRAMS, rays.programs());
             }
         }
     }

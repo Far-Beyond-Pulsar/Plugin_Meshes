@@ -151,8 +151,8 @@ pub mod shader_source {
     /// over the materials' snippets (the row, `material_surface`, specular
     /// anti-aliasing). A material template's surface function is composed
     /// after it (`RadiantTemplate::compose`), as into the G-buffer's;
-    /// `textureSample` is still the materials' implicit call, see
-    /// [`gradient_sampling`].
+    /// `textureSample` is still the materials' implicit call, lowered by
+    /// [`shade`] (`helio_mats::shader::explicit_gradients`).
     pub fn shade_program(decode: &str) -> String {
         let gbuffer = GBUFFER_WGSL.replace("\r\n", "\n");
         // Globals (the camera is the prelude's).
@@ -163,39 +163,10 @@ pub mod shader_source {
         );
         let velocity = between(&gbuffer, "fn compute_velocity", "@fragment");
         format!(
-            "enable wgpu_binding_array;\n//!use helio_prelude\n{}\n//!use pbr_eval\n//!use material_row\n//!use material_surface\n//!use frame_surface\n{}\n{COMMON_WGSL}\n{decode}\n{declarations}\n{SHADE_WGSL}\n{velocity}",
+            "enable wgpu_binding_array;\n//!use helio_prelude\n{}\n//!use pbr_eval\n//!use material_row\n//!use material_surface\n//!use material_gradients\n//!use frame_surface\n{}\n{COMMON_WGSL}\n{decode}\n{declarations}\n{SHADE_WGSL}\n{velocity}",
             helio_mats::SPECULAR_AA_MARKER,
             helio_vg_format::WGSL
         )
-    }
-
-    /// Compute shaders have no implicit derivatives: rewrite the evaluator's
-    /// texture sampling to `textureSampleGrad` with the analytic UV
-    /// derivatives (`vg_duv_dx/dy`), and specular anti-aliasing's normal
-    /// derivatives to the analytic ones (`vg_dn_dx/dy`). Handles both
-    /// material binding modes (the expanded one must already have had its
-    /// WebGPU fixups applied).
-    pub fn gradient_sampling(src: &str, max_textures: usize, bindless: bool) -> String {
-        const GRAD: &str = "uv, vg_slot_grad(slot, vg_duv_dx), vg_slot_grad(slot, vg_duv_dy)";
-        let src = &src
-            .replace("dpdx(n)", "vg_dn_dx")
-            .replace("dpdy(n)", "vg_dn_dy");
-        if bindless {
-            return src.replace(
-                "textureSample(scene_textures[slot.texture_index], scene_sampler, uv)",
-                &format!(
-                    "textureSampleGrad(scene_textures[slot.texture_index], scene_sampler, {GRAD})"
-                ),
-            );
-        }
-        let mut out = src.to_string();
-        for i in 0..max_textures {
-            out = out.replace(
-                &format!("textureSampleLevel(scene_texture_{i}, scene_sampler, uv, 0.0)"),
-                &format!("textureSampleGrad(scene_texture_{i}, scene_sampler, {GRAD})"),
-            );
-        }
-        out
     }
 
     /// The final shade module for one material template.
@@ -211,7 +182,7 @@ pub mod shader_source {
         } else {
             helio_mats::RadiantTemplate::apply_webgpu_fixups(&composed, binding.max_textures)
         };
-        gradient_sampling(&composed, binding.max_textures, bindless)
+        helio_mats::shader::explicit_gradients(&composed, binding.max_textures, bindless)
     }
 }
 

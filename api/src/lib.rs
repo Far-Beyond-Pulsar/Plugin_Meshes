@@ -11,7 +11,10 @@
 //!   ([`RAY_INSTANCES`]), each TLAS instance's transform
 //!   ([`RAY_INSTANCE_TRANSFORMS`]), the coordinate spaces' mask groups
 //!   ([`RAY_SPACE_GROUPS`]) and the proxy pool ([`RAY_PROXY_VERTICES`],
-//!   [`RAY_PROXY_INDICES`]); in WGSL, [`RAY_SURFACE_SNIPPET`].
+//!   [`RAY_PROXY_INDICES`]); in WGSL, [`RAY_ROWS_SNIPPET`] and
+//!   [`RAY_SURFACE_SNIPPET`]; and, as a
+//!   payload, the programs the rows' materials are evaluated by at hits
+//!   ([`RAY_PROGRAMS`]).
 //!
 //! No passes: a kind that reads meshes depends on this crate, never on the
 //! meshes' feature crates. With `host-rows`, the rows as SceneDB components
@@ -45,12 +48,21 @@ pub use rows::{
     SKIN_VERTICES, STATIC_OBJECTS, STATIC_OBJECT_OWNERS, VG_INSTANCES, VG_INSTANCE_ROWS,
 };
 
+/// The meshes' traced rows in WGSL (`//!use mesh_ray_rows`): the
+/// [`RayInstance`] row and its flags, [`RayTransform`]
+/// (`ray_transform_point`, `_vector`, `_normal`) and the space groups'
+/// decode (`ray_space_cull`). No bindings: what reads the rows alone (a pass
+/// binning hits by program) takes this one.
+pub const RAY_ROWS_SNIPPET: helio_core::shader::ShaderSnippet =
+    helio_core::wgsl_snippet!("//!use mesh_ray_rows", "shaders/ray_rows.wgsl");
+
 /// The meshes' surfaces as rays see them, for a tracer's WGSL
-/// (`//!use mesh_ray_surface`): the [`RayInstance`] row and its flags, the
-/// mesh pools' vertex decode, the proxy pool's, and `ray_triangle`, which
-/// fetches a hit's triangle by instance and primitive; [`RayTransform`]
-/// (`ray_transform_point`, `ray_transform_normal`) and the space groups'
-/// decode (`ray_space_cull`). The reader declares
+/// (`//!use mesh_ray_surface`, with [`RAY_ROWS_SNIPPET`] and the frame's ray
+/// stream snippet): the mesh pools' vertex decode, the proxy pool's,
+/// `ray_triangle`, which fetches a hit's triangle by instance and primitive,
+/// its outside (`ray_triangle_outside`, `mesh_ray_outside`), tangent frame
+/// (`ray_triangle_tangent`) and the normals a hit is oriented by
+/// (`mesh_ray_normals`). The reader declares
 /// the storage it reads under these names: `instances: array<RayInstance>`
 /// ([`RAY_INSTANCES`]), `vertices: array<u32>` and `indices: array<u32>`
 /// (the mesh pools, [`MESH_VERTICES`] / [`MESH_INDICES`]),
@@ -182,17 +194,16 @@ pub const RAY_PROXY_INDICES: &str = "ray_proxy_indices";
 /// Bytes of a proxy pool vertex: position, then UV.
 pub const RAY_PROXY_VERTEX_BYTES: u64 = 20;
 
-/// The surface of a traced section, for shading ray hits without a G-buffer
+/// A traced section, for shading ray hits without a G-buffer
 /// ([`RAY_INSTANCES`] rows, a hit's its instance's custom data plus its
 /// `geometry_index`): where its triangles are in the scene's mesh pools, its
-/// material, its TLAS instance (whose transform is
-/// [`RAY_INSTANCE_TRANSFORMS`]'s) and coordinate space, and its material's
-/// colours.
+/// material and the program that evaluates it, its TLAS instance (whose
+/// transform is [`RAY_INSTANCE_TRANSFORMS`]'s) and coordinate space.
 /// Triangle `p` of the instance is pool indices `first_index + 3p ..`
 /// (mesh-local), plus `base_vertex`, into `builtin_mesh_vertex`
-/// (`PackedVertex`). Hits are shaded without sampling textures:
-/// `base_color` is the material's factor times its base colour texture's
-/// mean (as the projection measured it). An instance with a nonzero
+/// (`PackedVertex`). A hit is shaded by its material, evaluated at the hit
+/// as the G-buffer's drawers evaluate it (the meshes' tracer's surface
+/// passes, by [`RayInstance::program`]). An instance with a nonzero
 /// `transmission` is a thin sheet (glass) its BLAS marks non-opaque: rays
 /// pass it, tinted.
 ///
@@ -205,8 +216,8 @@ pub const RAY_PROXY_VERTEX_BYTES: u64 = 20;
 /// An instance flagged [`RAY_INSTANCE_PROXY`] is traced through a proxy of
 /// its geometry (a coarse cut of a virtual-geometry asset): its triangles are
 /// in the frame's proxy pool ([`RAY_PROXY_VERTICES`]) instead, positions and UVs
-/// only, and a hit's normal is its triangle's face (the winding says
-/// outside).
+/// only; a hit's normal is its triangle's face (the winding says outside)
+/// and its tangent its triangle's UV directions.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RayInstance {
@@ -218,22 +229,84 @@ pub struct RayInstance {
     /// The material's row in the scene's `materials` (and its texture
     /// metadata's row).
     pub material: u32,
-    /// Linear RGB base colour: the material's factor times its base colour
-    /// texture's mean.
-    pub base_color: [f32; 4],
-    /// The radiance it gives off (RGB: colour times strength).
-    pub emissive: [f32; 3],
+    /// The linear RGB share of light it lets through (zero: opaque).
+    pub transmission: [f32; 3],
     /// Its TLAS instance: the row of [`RAY_INSTANCE_TRANSFORMS`] holding
     /// its object-to-frame transform.
     pub instance: u32,
-    /// The linear RGB share of light it lets through (zero: opaque).
-    pub transmission: [f32; 3],
     /// For a [`RAY_INSTANCE_SKINNED`] instance, its first vertex in the skin
-    /// cache ([`RAY_SKINNED_VERTICES`]): triangle corners and normals are read
-    /// there (mesh-local index plus this), UVs from the mesh pool as for any
-    /// mesh. Zero otherwise.
+    /// cache ([`RAY_SKINNED_VERTICES`]): triangle corners, normals and
+    /// tangents are read there (mesh-local index plus this), UVs and the
+    /// bitangent's sign from the mesh pool as for any mesh. Zero otherwise.
     pub skinned_vertex: u32,
+    /// The program that evaluates its material at a hit: an index of the
+    /// frame's [`RayPrograms`] ([`RAY_PROGRAMS`]); 0 the table-driven
+    /// evaluation ([`RayProgram::TABLE`]).
+    pub program: u32,
+    pub _pad: [u32; 2],
 }
+
+/// The program a material is evaluated by (the drawers' material key,
+/// `helio_mats::RadiantShaderKey` without its raster flags): its material
+/// class's template and, for a material graph, the graph's hash. A traced
+/// section's [`RayInstance::program`] names one of the frame's
+/// [`RayPrograms`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RayProgram {
+    pub template: u32,
+    pub graph_hash: u64,
+}
+
+impl RayProgram {
+    /// The default material class with no graph: the table-driven
+    /// evaluation every row's material falls back to (its row's factors and
+    /// textures), always program 0.
+    pub const TABLE: Self = Self {
+        template: 0,
+        graph_hash: 0,
+    };
+}
+
+/// The programs the traced sections' materials are evaluated by, indexed by
+/// [`RayInstance::program`]: entry 0 is always [`RayProgram::TABLE`]. The
+/// projection that lays the rows out publishes it each frame with the TLAS
+/// ([`RAY_PROGRAMS`]), so the tracer knows, without reading rows back, which
+/// programs a frame's hits may need and compiles them before they do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RayPrograms {
+    programs: Vec<RayProgram>,
+}
+
+impl Default for RayPrograms {
+    fn default() -> Self {
+        Self {
+            programs: vec![RayProgram::TABLE],
+        }
+    }
+}
+
+impl RayPrograms {
+    /// `program`'s index, added if new.
+    pub fn index(&mut self, program: RayProgram) -> u32 {
+        match self.programs.iter().position(|p| *p == program) {
+            Some(index) => index as u32,
+            None => {
+                self.programs.push(program);
+                (self.programs.len() - 1) as u32
+            }
+        }
+    }
+
+    /// The programs, by index.
+    pub fn programs(&self) -> &[RayProgram] {
+        &self.programs
+    }
+}
+
+/// The frame's [`RayPrograms`], published by the projection that writes
+/// [`RAY_INSTANCES`] beside the TLAS.
+pub const RAY_PROGRAMS: helio_core::PayloadContract<RayPrograms> =
+    helio_core::PayloadContract::new("ray_programs");
 
 /// [`RayInstance::flags`]: a skinned instance, its positions and normals
 /// in the skin cache at [`RayInstance::skinned_vertex`] (the pose its BLAS
