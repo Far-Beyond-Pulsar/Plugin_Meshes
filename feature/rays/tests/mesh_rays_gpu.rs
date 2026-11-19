@@ -2035,7 +2035,15 @@ fn diffuse_streams_skip_what_a_diffuse_consumer_does_not_read() {
 #[test]
 #[ignore = "a measurement; run by hand"]
 fn hit_surface_cost() {
-    let instance = wgpu::Instance::new(helio_core::wgpu_instance_descriptor());
+    let mut descriptor = helio_core::wgpu_instance_descriptor();
+    // Measurement: wgpu's indirect-call validation (a dispatch and two
+    // barriers before every indirect dispatch) off.
+    if std::env::var_os("BENCH_NO_INDIRECT_VALIDATION").is_some() {
+        descriptor
+            .flags
+            .remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+    }
+    let instance = wgpu::Instance::new(descriptor);
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         ..Default::default()
@@ -2115,34 +2123,30 @@ fn hit_surface_cost() {
         surfaces: buffers.surfaces.as_ref(),
     };
     let programs_shared = Arc::new(HitPrograms::new(&gpu.device, &gpu.queue, None));
-    println!("| Programs present | Bins | Diffuse (ms) | Full (ms) |");
-    println!("|---|---|---|---|");
-    // (what, programs present, program of quad k, a program present that
+    println!("| Programs present | Bins | Count | Prefix | Scatter | Binning | Shading, Diffuse | Shading, Full |");
+    println!("|---|---|---|---|---|---|---|---|");
+    // (what, programs present, program of quad k, programs present that
     // no quad uses).
-    let clear_coat = RayProgram {
-        template: helio_mats::MATERIAL_CLASS_CLEAR_COAT,
-        graph_hash: 0,
-    };
     type ProgramOf = Box<dyn Fn(u32) -> RayProgram>;
-    let cases: Vec<(&str, u32, ProgramOf, Option<RayProgram>)> = vec![
-        ("table alone", 1, Box::new(|_| RayProgram::TABLE), None),
+    let cases: Vec<(&str, u32, ProgramOf, Vec<RayProgram>)> = vec![
+        ("table alone", 1, Box::new(|_| RayProgram::TABLE), vec![]),
         (
-            "table, binned (an unused program)",
+            "table, an unused program present",
             2,
             Box::new(|_| RayProgram::TABLE),
-            Some(graph(1)),
+            vec![graph(1)],
         ),
         (
-            "table + clear coat",
-            2,
+            "64 present, 2 with hits",
+            64,
             Box::new(move |k| {
                 if k % 2 == 0 {
                     RayProgram::TABLE
                 } else {
-                    clear_coat
+                    graph(1)
                 }
             }),
-            None,
+            (2..64).map(graph).collect(),
         ),
         (
             "2 programs",
@@ -2154,7 +2158,7 @@ fn hit_surface_cost() {
                     graph(1)
                 }
             }),
-            None,
+            vec![],
         ),
         (
             "8 programs",
@@ -2166,7 +2170,7 @@ fn hit_surface_cost() {
                     graph(k % 8)
                 }
             }),
-            None,
+            vec![],
         ),
         (
             "64 programs",
@@ -2178,22 +2182,14 @@ fn hit_surface_cost() {
                     graph(k % 64)
                 }
             }),
-            None,
-        ),
-        (
-            "72 programs (8 past the bound)",
-            72,
-            Box::new(move |k| {
-                if k % 72 == 0 {
-                    RayProgram::TABLE
-                } else {
-                    graph(k % 72)
-                }
-            }),
-            None,
+            vec![],
         ),
     ];
+    let only = std::env::var("BENCH_ONLY").unwrap_or_default();
     for (what, present, program_of, unused) in cases {
+        if !only.is_empty() && !only.split(',').any(|o| what.starts_with(o)) {
+            continue;
+        }
         let quads: Vec<Quad> = (0..81u32)
             .map(|k| Quad {
                 base_color: Vec3::splat(0.8),
@@ -2207,7 +2203,7 @@ fn hit_surface_cost() {
             })
             .collect();
         let mut scene = scene(gpu, &quads);
-        if let Some(program) = unused {
+        for program in unused {
             scene.programs.index(program);
         }
         let table = textured_materials(gpu, &quad_rows(&quads, &[row]), &texture);
@@ -2229,7 +2225,7 @@ fn hit_surface_cost() {
             );
         }
         gpu.queue.submit([encoder.finish()]);
-        let mut row_out = Vec::new();
+        let mut row_out: Vec<[f64; 4]> = Vec::new();
         let mut bins = 0;
         for detail in [SurfaceDetail::Diffuse, SurfaceDetail::Full] {
             let mut surfaces =
@@ -2240,61 +2236,170 @@ fn hit_surface_cost() {
             programs_shared.wait();
             surfaces.set_programs(&gpu.device, Some(&scene.programs), write);
             surfaces.write_frame(1, |b, bytes| gpu.queue.write_buffer(b, 0, bytes));
+            // One frame whose bin counts come back, as a running stream's
+            // do: programs present without hits then take no bin.
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            surfaces.record(
+                &gpu.device,
+                &mut helio_core::CommandRecorder::from_encoder(&mut encoder),
+                bindings,
+                Some(scene.hits()),
+                Some(table.bindings(&views)),
+            );
+            gpu.queue.submit([encoder.finish()]);
+            for _ in 0..2 {
+                surfaces.set_programs(&gpu.device, Some(&scene.programs), write);
+                gpu.device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .unwrap();
+            }
+            surfaces.set_programs(&gpu.device, Some(&scene.programs), write);
+            surfaces.write_frame(1, |b, bytes| gpu.queue.write_buffer(b, 0, bytes));
             bins = surfaces.bin_count();
-            // Throughput: 64 frames of 5 runs each submitted back to back
-            // (pipelined, the GPU never idle), one timestamp before the
-            // first timed frame and one after the last; three such
-            // windows, the median taken.
-            const FRAMES: u32 = 64;
-            const RUNS: u32 = 5;
+            // 24 pipelined frames of 16 runs each (the GPU kept busy), the
+            // last two runs of each frame timed stage by stage. A pass's
+            // beginning timestamp may be written before the work ahead of
+            // it drains, so a stage is the time between the ends of passes:
+            // the count from the previous run's shading end, each later
+            // stage from the stage before; the median over the frames.
+            const FRAMES: u32 = 24;
+            const RUNS: u32 = 16;
             let queries = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: None,
                 ty: wgpu::QueryType::Timestamp,
-                count: 6,
+                count: FRAMES * 16,
             });
-            for window in 0..3u32 {
+            for frame in 0..FRAMES + 8 {
+                let mut encoder = gpu.device.create_command_encoder(&Default::default());
+                for run in 0..RUNS {
+                    let timed = frame >= 8 && run >= RUNS - 2;
+                    surfaces.set_stage_timestamps(
+                        timed.then(|| (queries.clone(), (frame - 8) * 16 + 8 * (run + 2 - RUNS))),
+                    );
+                    let mut cmds = helio_core::CommandRecorder::from_encoder(&mut encoder);
+                    surfaces.record(
+                        &gpu.device,
+                        &mut cmds,
+                        bindings,
+                        Some(scene.hits()),
+                        Some(table.bindings(&views)),
+                    );
+                }
+                gpu.queue.submit([encoder.finish()]);
+            }
+            surfaces.set_stage_timestamps(None);
+            let resolve = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: u64::from(FRAMES) * 128,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            encoder.resolve_query_set(&queries, 0..FRAMES * 16, &resolve, 0);
+            gpu.queue.submit([encoder.finish()]);
+            let stamps = read::<u64>(gpu, &resolve);
+            let period = f64::from(gpu.queue.get_timestamp_period());
+            // Per stage (count, prefix, scatter, shading), from pass ends:
+            // f[0..8] the run before, f[8..16] the timed run; an end is at
+            // 2 * stage + 1.
+            let binned = surfaces.bin_count() > 1;
+            let stage = |k: usize| {
+                let mut ms: Vec<f64> = stamps
+                    .chunks(16)
+                    .map(|f| {
+                        let end = |run: usize, stage: usize| f[8 * run + 2 * stage + 1];
+                        let (from, to) = match (binned, k) {
+                            (false, 3) => (end(0, 3), end(1, 3)),
+                            (false, _) => (0, 0),
+                            (true, 0) => (end(0, 3), end(1, 0)),
+                            (true, k) => (end(1, k - 1), end(1, k)),
+                        };
+                        to.saturating_sub(from) as f64 * period / 1e6
+                    })
+                    .collect();
+                ms.sort_by(f64::total_cmp);
+                ms[ms.len() / 2]
+            };
+            let run = {
+                let mut ms: Vec<f64> = stamps
+                    .chunks(16)
+                    .map(|f| f[15].saturating_sub(f[7]) as f64 * period / 1e6)
+                    .collect();
+                ms.sort_by(f64::total_cmp);
+                ms[ms.len() / 2]
+            };
+            eprintln!("{what} {detail:?}: a whole run {run:.3} ms");
+            if binned && std::env::var_os("BENCH_BIN_STAMPS").is_some() {
+                // Each bin in a pass of its own, its end stamped: a bin's
+                // time is its end less the bin before's (the median over
+                // frames of 16 runs, the last run stamped).
+                let n = surfaces.bin_count() as u32;
+                let queries = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: None,
+                    ty: wgpu::QueryType::Timestamp,
+                    count: FRAMES * n,
+                });
                 for frame in 0..FRAMES + 8 {
                     let mut encoder = gpu.device.create_command_encoder(&Default::default());
-                    if frame == 8 {
-                        encoder.write_timestamp(&queries, window * 2);
-                    }
-                    for _ in 0..RUNS {
-                        let mut cmds = helio_core::CommandRecorder::from_encoder(&mut encoder);
+                    for run in 0..RUNS {
+                        surfaces.set_bin_timestamps(
+                            (frame >= 8 && run == RUNS - 1)
+                                .then(|| (queries.clone(), (frame - 8) * n)),
+                        );
                         surfaces.record(
                             &gpu.device,
-                            &mut cmds,
+                            &mut helio_core::CommandRecorder::from_encoder(&mut encoder),
                             bindings,
                             Some(scene.hits()),
                             Some(table.bindings(&views)),
                         );
                     }
-                    if frame == FRAMES + 7 {
-                        encoder.write_timestamp(&queries, window * 2 + 1);
-                    }
                     gpu.queue.submit([encoder.finish()]);
                 }
+                surfaces.set_bin_timestamps(None);
+                let resolve = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: u64::from(FRAMES * n) * 8,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let mut encoder = gpu.device.create_command_encoder(&Default::default());
+                encoder.resolve_query_set(&queries, 0..FRAMES * n, &resolve, 0);
+                gpu.queue.submit([encoder.finish()]);
+                let stamps = read::<u64>(gpu, &resolve);
+                let per_bin: Vec<f64> = (1..n as usize)
+                    .map(|k| {
+                        let mut us: Vec<f64> = stamps
+                            .chunks(n as usize)
+                            .map(|f| f[k].saturating_sub(f[k - 1]) as f64 * period / 1e3)
+                            .collect();
+                        us.sort_by(f64::total_cmp);
+                        us[us.len() / 2]
+                    })
+                    .collect();
+                let mut sorted = per_bin.clone();
+                sorted.sort_by(f64::total_cmp);
+                eprintln!(
+                    "{what} {detail:?}: bins 1..{n} in passes of their own, us each: min {:.1} median {:.1} max {:.1} sum {:.1}; first 8 {:?}",
+                    sorted[0],
+                    sorted[sorted.len() / 2],
+                    sorted[sorted.len() - 1],
+                    per_bin.iter().sum::<f64>(),
+                    per_bin.iter().take(8).map(|u| (u * 10.0).round() / 10.0).collect::<Vec<_>>()
+                );
             }
-            let resolve = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: 48,
-                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            let mut encoder = gpu.device.create_command_encoder(&Default::default());
-            encoder.resolve_query_set(&queries, 0..6, &resolve, 0);
-            gpu.queue.submit([encoder.finish()]);
-            let stamps = read::<u64>(gpu, &resolve);
-            let period = f64::from(gpu.queue.get_timestamp_period());
-            let mut ms: Vec<f64> = stamps
-                .chunks(2)
-                .map(|p| p[1].saturating_sub(p[0]) as f64 * period / 1e6 / f64::from(FRAMES * RUNS))
-                .collect();
-            ms.sort_by(f64::total_cmp);
-            row_out.push(ms[ms.len() / 2]);
+            let stages = [stage(0), stage(1), stage(2), stage(3)];
+            row_out.push(stages);
         }
+        let [d, f] = [row_out[0], row_out[1]];
         println!(
-            "| {what} ({present}) | {bins} | {:.3} | {:.3} |",
-            row_out[0], row_out[1]
+            "| {what} ({present}) | {bins} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |",
+            d[0],
+            d[1],
+            d[2],
+            d[0] + d[1] + d[2],
+            d[3],
+            f[3]
         );
     }
 }

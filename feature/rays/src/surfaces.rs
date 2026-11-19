@@ -40,6 +40,7 @@
 //! dispatch no workgroups), each kernel over its own hits only.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use helio_core::compile::Compiling;
@@ -256,7 +257,13 @@ impl HitPrograms {
                     layout: Some(&bins_pipeline_layout),
                     module: &bins_module,
                     entry_point: Some(entry),
-                    compilation_options: Default::default(),
+                    // Every workgroup variable is written before it is
+                    // read (each lane clears its own counter; a base is
+                    // read only for a bin that counted): no zeroing pass.
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        zero_initialize_workgroup_memory: false,
+                        ..Default::default()
+                    },
                     cache: None,
                 },
             )
@@ -454,6 +461,19 @@ pub struct MeshHitSurfaces {
     /// This frame's bins: bin 0 the table-driven program, bin `k` the
     /// program of its entry.
     bins: Vec<ProgramPipelines>,
+    /// Bin `k`'s program (bin 0 the table's).
+    bin_programs: Vec<RayProgram>,
+    /// How many hits each program had in the last frame read back
+    /// ([`Self::set_programs`]): a program known to have had none takes no
+    /// bin (no dispatch) and its hits, if it gets some, shade by the table
+    /// for the frame or two before its count comes back.
+    hits_of: HashMap<RayProgram, u32>,
+    /// The bins' counts, copied each binned frame and read back without
+    /// waiting: three slots in flight.
+    readback: [Readback; 3],
+    readback_next: usize,
+    /// Measurement only: each bin in a pass of its own, its end stamped.
+    bin_timestamps: Option<(wgpu::QuerySet, u32)>,
     /// This frame's programs handed over, and those waiting for their
     /// graph's source (frame statistics).
     seen: usize,
@@ -465,6 +485,8 @@ pub struct MeshHitSurfaces {
     bin_args: wgpu::Buffer,
     /// The count pass's counter a bin.
     counters: wgpu::Buffer,
+    /// A profile's stage timestamps ([`Self::set_stage_timestamps`]).
+    timestamps: Option<(wgpu::QuerySet, u32)>,
     inputs: Option<(Vec<wgpu::Buffer>, wgpu::BindGroup, wgpu::BindGroup)>,
     materials: Option<((wgpu::Buffer, wgpu::Buffer, u64), wgpu::BindGroup)>,
 }
@@ -492,15 +514,23 @@ impl MeshHitSurfaces {
             remap: remap_buffer(device, 1),
             remap_rows: vec![0],
             bins: vec![table],
+            bin_programs: vec![RayProgram::TABLE],
+            hits_of: HashMap::new(),
+            readback: std::array::from_fn(|_| Readback::new(device)),
+            readback_next: 0,
+            bin_timestamps: None,
             seen: 0,
             waiting: 0,
             binning: None,
             bin_args: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Mesh hit bins"),
                 size: MAX_HIT_PROGRAMS as u64 * BIN_WORDS * 4,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }),
+            timestamps: None,
             counters: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Mesh hit bin counters"),
                 size: MAX_HIT_PROGRAMS as u64 * 4,
@@ -528,9 +558,11 @@ impl MeshHitSurfaces {
         programs: Option<&RayPrograms>,
         write: impl FnOnce(&wgpu::Buffer, u64, &[u8]),
     ) {
+        self.collect_counts();
         let list = programs.map_or(&[RayProgram::TABLE][..], RayPrograms::programs);
         let mut rows = vec![0u32; list.len().max(1)];
         self.bins.truncate(1);
+        self.bin_programs.truncate(1);
         self.seen = programs.map_or(0, |p| p.programs().len());
         self.waiting = 0;
         for (index, program) in list.iter().enumerate() {
@@ -538,9 +570,14 @@ impl MeshHitSurfaces {
                 self.waiting += usize::from(self.programs.waits_for_graph(*program));
                 continue;
             };
+            // A program last seen with no hits in this stream: no bin.
+            if self.hits_of.get(program) == Some(&0) {
+                continue;
+            }
             if self.bins.len() < MAX_HIT_PROGRAMS {
                 rows[index] = self.bins.len() as u32;
                 self.bins.push(pipelines);
+                self.bin_programs.push(*program);
             }
         }
         if rows != self.remap_rows {
@@ -550,6 +587,53 @@ impl MeshHitSurfaces {
             write(&self.remap, 0, bytemuck::cast_slice(&rows));
             self.remap_rows = rows;
         }
+    }
+
+    /// Reads the counts of the slots whose copies came back, and starts
+    /// mapping the slots copied last frame (submitted by now): never waits.
+    fn collect_counts(&mut self) {
+        for slot in &mut self.readback {
+            match slot.state.load(Ordering::Acquire) {
+                READBACK_MAPPED => {
+                    {
+                        let view = slot.buffer.slice(..).get_mapped_range();
+                        if let Ok(view) = view {
+                            let words: &[u32] = bytemuck::cast_slice(&view);
+                            for (k, program) in slot.programs.iter().enumerate().skip(1) {
+                                self.hits_of
+                                    .insert(*program, words[k * BIN_WORDS as usize + 4]);
+                            }
+                        }
+                    }
+                    slot.buffer.unmap();
+                    slot.state.store(READBACK_IDLE, Ordering::Release);
+                }
+                READBACK_COPIED => {
+                    slot.state.store(READBACK_MAPPING, Ordering::Release);
+                    let state = slot.state.clone();
+                    slot.buffer
+                        .slice(..)
+                        .map_async(wgpu::MapMode::Read, move |result| {
+                            state.store(
+                                if result.is_ok() {
+                                    READBACK_MAPPED
+                                } else {
+                                    READBACK_IDLE
+                                },
+                                Ordering::Release,
+                            );
+                        });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Measurement only: each bin shaded in a pass of its own whose end
+    /// is stamped at `base + k` (the bench's per-bin times).
+    #[doc(hidden)]
+    pub fn set_bin_timestamps(&mut self, stamps: Option<(wgpu::QuerySet, u32)>) {
+        self.bin_timestamps = stamps;
     }
 
     /// The bins this frame (1: every hit takes the table-driven program,
@@ -725,13 +809,23 @@ impl MeshHitSurfaces {
         else {
             return;
         };
-        let mut pass = cmds.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("Mesh hit surfaces"),
-            timestamp_writes: None,
-        });
-        pass.set_bind_group(1, Some(materials), &[]);
+        // Each stage a compute pass of its own, so a profile can time it
+        // ([`Self::set_stage_timestamps`]).
+        let timestamps = self.timestamps.as_ref();
+        let writes = |stage: u32| {
+            timestamps.map(|(query_set, base)| wgpu::ComputePassTimestampWrites {
+                query_set,
+                beginning_of_pass_write_index: Some(base + 2 * stage),
+                end_of_pass_write_index: Some(base + 2 * stage + 1),
+            })
+        };
         if self.bins.len() == 1 {
             // Every hit's program is the table-driven one: no binning.
+            let mut pass = cmds.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Mesh hit surfaces"),
+                timestamp_writes: writes(STAGE_SHADE),
+            });
+            pass.set_bind_group(1, Some(materials), &[]);
             pass.set_pipeline(self.bins[0].of(self.detail));
             pass.set_bind_group(
                 0,
@@ -741,18 +835,100 @@ impl MeshHitSurfaces {
             pass.dispatch_workgroups_indirect(stream.header, 0);
             return;
         }
-        pass.set_bind_group(0, Some(bins_group), &[]);
-        pass.set_pipeline(&programs.count);
-        pass.dispatch_workgroups_indirect(stream.header, 0);
-        pass.set_pipeline(&programs.offsets);
-        pass.dispatch_workgroups(1, 1, 1);
-        pass.set_pipeline(&programs.scatter);
-        pass.dispatch_workgroups_indirect(stream.header, 0);
-        pass.set_bind_group(1, Some(materials), &[]);
-        for (k, program) in self.bins.iter().enumerate() {
-            pass.set_pipeline(program.of(self.detail));
-            pass.set_bind_group(0, Some(surface_group), &[(k as u64 * BIN_STRIDE) as u32]);
-            pass.dispatch_workgroups_indirect(bins, k as u64 * BIN_WORDS * 4);
+        for (stage, pipeline) in [
+            (STAGE_COUNT, &programs.count),
+            (STAGE_OFFSETS, &programs.offsets),
+            (STAGE_SCATTER, &programs.scatter),
+        ] {
+            let mut pass = cmds.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Mesh hit bins"),
+                timestamp_writes: writes(stage),
+            });
+            pass.set_bind_group(0, Some(bins_group), &[]);
+            pass.set_pipeline(pipeline);
+            if stage == STAGE_OFFSETS {
+                pass.dispatch_workgroups(1, 1, 1);
+            } else {
+                pass.dispatch_workgroups_indirect(stream.header, 0);
+            }
+        }
+        if let Some((set, base)) = &self.bin_timestamps {
+            for (k, program) in self.bins.iter().enumerate() {
+                let mut pass = cmds.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Mesh hit surfaces"),
+                    timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                        query_set: set,
+                        beginning_of_pass_write_index: None,
+                        end_of_pass_write_index: Some(base + k as u32),
+                    }),
+                });
+                pass.set_bind_group(1, Some(materials), &[]);
+                pass.set_pipeline(program.of(self.detail));
+                pass.set_bind_group(0, Some(surface_group), &[(k as u64 * BIN_STRIDE) as u32]);
+                pass.dispatch_workgroups_indirect(bins, k as u64 * BIN_WORDS * 4);
+            }
+        } else {
+            let mut pass = cmds.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Mesh hit surfaces"),
+                timestamp_writes: writes(STAGE_SHADE),
+            });
+            pass.set_bind_group(1, Some(materials), &[]);
+            for (k, program) in self.bins.iter().enumerate() {
+                pass.set_pipeline(program.of(self.detail));
+                pass.set_bind_group(0, Some(surface_group), &[(k as u64 * BIN_STRIDE) as u32]);
+                pass.dispatch_workgroups_indirect(bins, k as u64 * BIN_WORDS * 4);
+            }
+        }
+        // The bins' counts, read back frames later, so programs with no
+        // hits take no bin.
+        let slot = &mut self.readback[self.readback_next];
+        if slot.state.load(Ordering::Acquire) == READBACK_IDLE {
+            cmds.copy_buffer_to_buffer(bins, 0, &slot.buffer, 0, slot.buffer.size());
+            slot.programs.clone_from(&self.bin_programs);
+            slot.state.store(READBACK_COPIED, Ordering::Release);
+            self.readback_next = (self.readback_next + 1) % self.readback.len();
+        }
+    }
+
+    /// Times each stage of the next records into `query_set` from index
+    /// `base` (8 timestamps: the count, the prefix, the scatter and the
+    /// shading kernels, a beginning and an end each; only the shading's on a
+    /// frame without binning): a profile's seam, `None` to stop.
+    pub fn set_stage_timestamps(&mut self, timestamps: Option<(wgpu::QuerySet, u32)>) {
+        self.timestamps = timestamps;
+    }
+}
+
+/// [`MeshHitSurfaces::set_stage_timestamps`]' stages.
+pub const STAGE_COUNT: u32 = 0;
+pub const STAGE_OFFSETS: u32 = 1;
+pub const STAGE_SCATTER: u32 = 2;
+pub const STAGE_SHADE: u32 = 3;
+
+const READBACK_IDLE: u8 = 0;
+const READBACK_COPIED: u8 = 1;
+const READBACK_MAPPING: u8 = 2;
+const READBACK_MAPPED: u8 = 3;
+
+/// A slot of the bins' counts on their way back to the CPU.
+struct Readback {
+    buffer: wgpu::Buffer,
+    /// Bin `k`'s program when the counts were copied.
+    programs: Vec<RayProgram>,
+    state: Arc<AtomicU8>,
+}
+
+impl Readback {
+    fn new(device: &wgpu::Device) -> Self {
+        Self {
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Mesh hit bin counts"),
+                size: MAX_HIT_PROGRAMS as u64 * BIN_WORDS * 4,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            programs: Vec::new(),
+            state: Arc::new(AtomicU8::new(READBACK_IDLE)),
         }
     }
 }
