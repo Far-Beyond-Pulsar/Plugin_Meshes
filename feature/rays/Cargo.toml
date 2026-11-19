@@ -1,0 +1,27 @@
+[package]
+name = "helio-pass-mesh-rays"
+version = "0.1.0"
+edition = "2021"
+description = "Helio pass: the meshes' tracer of ray streams (hardware ray queries against the frame's TLAS)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+helio-mesh-api = { workspace = true }
+helio-frame-api = { workspace = true }
+helio-feature-api = { workspace = true }
+helio-core = { workspace = true }
+helio-settings = { workspace = true }
+helio-mats = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+# The GPU tests: small scenes as a TLAS of their own, and a mesh scene's
+# graph with a ray stream consumer, its TLAS from the standalone projection.
+helio = { workspace = true }
+helio-presets = { workspace = true }
+helio-mesh-host = { workspace = true }
+helio-mats = { workspace = true, features = ["host-rows"] }
+pulsar_scenedb = { workspace = true }
+glam = { workspace = true }
+pollster = { version = "0.4" }

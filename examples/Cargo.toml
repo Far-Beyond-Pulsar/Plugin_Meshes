@@ -196,6 +196,7 @@ helio-light-host = { workspace = true }
 helio-light-api = { workspace = true }
 helio-mesh-host = { workspace = true }
 helio-pass-vg = { workspace = true }
+helio-pass-mesh-rays = { workspace = true }
 helio-mesh-api = { workspace = true }
 helio = { workspace = true }
 helio-bake = { workspace = true }

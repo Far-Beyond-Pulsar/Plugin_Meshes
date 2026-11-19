@@ -581,8 +581,8 @@ impl RenderPass for TransparentPass {
             helio_mesh_api::MESH_VERTICES.name(),
             helio_mats::MATERIALS.name(),
             helio_light_api::SCENE_LIGHTS.name(),
-            helio_mesh_api::BONE_PALETTE.name(),
-            helio_mesh_api::SKIN_VERTICES.name(),
+            helio_mesh_api::SKIN_CACHE_ROWS.name(),
+            helio_mesh_api::SKIN_CACHE.name(),
         ];
         LIST
     }
@@ -883,12 +883,12 @@ impl RenderPass for TransparentPass {
         // built once at construction time (mirrors `bind_group_1`'s pattern).
         let skin_buf = ctx
             .scene_buffers
-            .get(helio_mesh_api::SKIN_VERTICES.key())
+            .get(helio_mesh_api::SKIN_CACHE.key())
             .map(|h| h.buffer.clone())
             .unwrap_or_else(|| batch.instances.clone());
         let palette_buf = ctx
             .scene_buffers
-            .get(helio_mesh_api::BONE_PALETTE.key())
+            .get(helio_mesh_api::SKIN_CACHE_ROWS.key())
             .map(|h| h.buffer.clone())
             .unwrap_or_else(|| batch.instances.clone());
         let bg0_key = [
@@ -1039,6 +1039,8 @@ impl TransparentPass {
                 graph_wgsl,
                 &[
                     helio_mesh_api::DRAW_ROWS_SNIPPET,
+                    helio_mesh_api::SKINNING_SNIPPET,
+                    helio_frame_api::rays::stream::SNIPPET,
                     helio_light_api::LIGHT_LIST_SNIPPET,
                     helio_light_api::LIGHT_FORWARD_SNIPPET,
                     helio_frame_api::media::SNIPPET,

@@ -53,13 +53,13 @@ const IDENTITY: [[f32; 4]; 4] = [
 
 /// Instance `i` is the matrix scale `1 + 0.1 i`, translated by `(0, 0, 0.01 i)`
 /// (column-major, as `static_objects` stores it).
-fn object_row(i: u32) -> [f32; 63] {
+fn object_row(i: u32) -> [f32; 60] {
     let s = 1.0 + 0.1 * i as f32;
     let mut m = IDENTITY;
     m[0][0] = s;
     m[1][1] = s;
     m[3][2] = 0.01 * i as f32;
-    let mut row = [0f32; 63];
+    let mut row = [0f32; 60];
     row[4..20].copy_from_slice(cast_slice(&m));
     row
 }

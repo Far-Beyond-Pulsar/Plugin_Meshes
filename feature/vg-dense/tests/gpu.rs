@@ -260,7 +260,7 @@ fn run_nonrt_layout(
         object_row: 0,
     };
     let instances = buf(g, "instances", cast_slice(&[inst]));
-    let mut object = [0f32; 63];
+    let mut object = [0f32; 60];
     object[4..20].copy_from_slice(cast_slice(&IDENTITY));
     let objects = buf(g, "objects", cast_slice(&object));
     let frame = DenseFrame {

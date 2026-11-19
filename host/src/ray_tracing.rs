@@ -18,9 +18,26 @@
 //! surface is. A partial projection holds them; a full one
 //! ([`SceneDbRayTracing::new`], for consumers that take every candidate as
 //! glass or as opaque) still refuses them.
+//!
+//! Given an eye ([`SceneDbRayTracing::set_view`]), objects are culled as the
+//! engine world's projection culls them (`helio_pass_mesh_rays::RAY_TRACING`:
+//! past the culling radius and smaller than the culling angle, Unreal's
+//! ray-tracing culling); the eye's moves rescan only after it moved a
+//! twentieth of the radius. Without one, every object is traced. Each
+//! preparation adds the acceleration structures' stats to the renderer's
+//! frame stats once a host hands them over ([`SceneDbRayTracing::set_stats`]).
+//!
+//! Why this is a projection of its own: it reads the standalone hosts' scene
+//! model (`StaticObjectComponent` rows a host authors with their mesh and
+//! material slots), where the engine's world (`meshes_component::ray_scene`)
+//! reads mesh components placed by their owners' transform hierarchy, with
+//! material instances. The rows are different data, not one job done twice.
+//! The standalone model has no skinned meshes, so it traces none.
 use crate::ray_proxies::{Lookup, VgRayProxies, VgRayStats};
 use crate::{MeshComponent, RenderGroupComponent, StaticObjectComponent};
-use helio_core::{BlasGeometry, BlasManager, Movability, TlasInstanceInput, TlasManager};
+use helio_core::{
+    BlasGeometry, BlasManager, BlasSegment, Movability, TlasInstanceInput, TlasManager,
+};
 use helio_mats::host_rows::MaterialComponent;
 use helio_mesh_api::{
     RayInstance, RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_TWO_SIDED,
@@ -153,7 +170,21 @@ pub struct SceneDbRayTracing {
     /// Base colour textures' means: a hit's colour is its material's factor
     /// times its texture's mean.
     texture_means: crate::texture_means::TextureMeans,
+    /// The eye the culling tests from ([`Self::set_view`]), where the scan
+    /// last tested, the criterion and the objects it left out (by key: a
+    /// move re-tests them).
+    eye: Option<glam::DVec3>,
+    tested_at: Option<glam::DVec3>,
+    culling: helio_pass_mesh_rays::RayTracingSettings,
+    culled: HashMap<Entity, CasterKey>,
+    stats: Option<helio_core::FrameStats>,
 }
+
+/// How far past the culling thresholds a traced object stays traced.
+const CULLING_SLACK: f64 = 1.1;
+/// The share of the culling radius the eye moves before a rescan.
+const CULLING_RETEST: f64 = 0.05;
+
 impl SceneDbRayTracing {
     /// The scene's shadow casters, all of them: an object the projection
     /// cannot represent (masked or custom-shader materials, group or
@@ -200,7 +231,59 @@ impl SceneDbRayTracing {
             casters: Vec::new(),
             caster_slots: HashMap::new(),
             changes: Vec::new(),
+            eye: None,
+            tested_at: None,
+            culling: helio_pass_mesh_rays::RayTracingSettings::default(),
+            culled: HashMap::new(),
+            stats: None,
         }
+    }
+
+    /// Cull objects by `settings` from `eye` (world space) from the next
+    /// preparation on; `None` traces every object.
+    pub fn set_view(
+        &mut self,
+        eye: Option<glam::DVec3>,
+        settings: helio_pass_mesh_rays::RayTracingSettings,
+    ) {
+        if settings != self.culling || eye.is_some() != self.eye.is_some() {
+            self.culling = settings;
+            self.cursors = None;
+        }
+        self.eye = eye;
+        let retest = (settings.culling_radius * CULLING_RETEST).max(1.0);
+        if let (Some(eye), Some(at)) = (eye, self.tested_at) {
+            if at.distance(eye) > retest {
+                self.cursors = None;
+            }
+        }
+    }
+
+    /// Add each preparation's acceleration-structure stats to `stats` (a
+    /// renderer's `frame_stats()`).
+    pub fn set_stats(&mut self, stats: helio_core::FrameStats) {
+        self.stats = Some(stats);
+    }
+
+    /// The BLAS manager's counters.
+    pub fn blas_counters(&self) -> helio_core::BlasCounters {
+        self.blas.counters()
+    }
+
+    /// Objects the culling left out of the last build.
+    pub fn culled_count(&self) -> usize {
+        self.culled.len()
+    }
+
+    /// Whether `object` is traced from the eye: its world sphere within the
+    /// criterion (`slack` above 1 for one already traced).
+    fn traces(&self, object: &StaticObjectComponent, slack: f64) -> bool {
+        let Some(eye) = self.eye else {
+            return true;
+        };
+        let [x, y, z, r] = object.row().bounds.map(f64::from);
+        self.culling
+            .traces(glam::DVec3::new(x, y, z).distance(eye), r, slack)
     }
 
     /// Traces virtual-geometry instances (static objects whose mesh is an
@@ -249,6 +332,8 @@ impl SceneDbRayTracing {
     /// mesh entity to skip that hash: its BLAS is then built once and reused
     /// until SceneDB reallocates or replaces the mesh's geometry range.
     pub fn prepare(&mut self, world: &World) -> helio_core::Result<&wgpu::Tlas> {
+        // Compact the BLASes built in earlier frames (a few a frame).
+        self.blas.maintain(&self.queue);
         // Texture means that arrived change the instances' colours: rebuild.
         if self.texture_means.collect() {
             self.cursors = None;
@@ -273,6 +358,18 @@ impl SceneDbRayTracing {
             self.tlas.invalidate();
             self.cursors = None;
             return Err(error);
+        }
+        if let Some(stats) = &self.stats {
+            self.blas.report(stats);
+            self.tlas.report(stats);
+            stats.add_named(
+                helio_mesh_api::stats::RAY_INSTANCES,
+                self.instances.len() as u64,
+            );
+            stats.add_named(
+                helio_mesh_api::stats::RAY_INSTANCES_CULLED,
+                self.culled.len() as u64,
+            );
         }
         self.texture_means.dispatch(&self.device, &self.queue);
         Ok(self.tlas.tlas().expect("successful TLAS build"))
@@ -360,6 +457,13 @@ impl SceneDbRayTracing {
                     world.get::<StaticObjectComponent>(change.entity)
                 }
             };
+            // A culled object: a move that brings it in rescans.
+            if let Some(key) = self.culled.get(&change.entity) {
+                match object {
+                    Some(o) if CasterKey::of(o) == *key && !self.traces(o, 1.0) => continue,
+                    _ => return Ok(false),
+                }
+            }
             match (slot, object) {
                 // A non-caster changed and still is not one.
                 (None, None) => {
@@ -375,7 +479,9 @@ impl SceneDbRayTracing {
                         .get(&change.entity)
                         .is_some_and(|key| object.is_none_or(|o| CasterKey::of(o) == *key)) => {}
                 (Some(slot), Some(object))
-                    if self.projects(object) && CasterKey::of(object) == self.casters[slot].1 =>
+                    if self.projects(object)
+                        && CasterKey::of(object) == self.casters[slot].1
+                        && self.traces(object, CULLING_SLACK) =>
                 {
                     let transform = tlas_transform(object);
                     if self.instances[slot].transform != transform {
@@ -414,6 +520,8 @@ impl SceneDbRayTracing {
         self.casters.clear();
         self.caster_slots.clear();
         self.skipped.clear();
+        self.culled.clear();
+        self.tested_at = self.eye;
         let error = rt_error;
         if !self.partial {
             reject_unsupported_geometry(world, &self.untraced, self.vg.is_some())?;
@@ -447,6 +555,10 @@ impl SceneDbRayTracing {
         let mut has_transmission = false;
         for (object_entity, (object,)) in world.query::<(&StaticObjectComponent,)>() {
             if !self.projects(object) {
+                continue;
+            }
+            if !self.traces(object, 1.0) {
+                self.culled.insert(object_entity, CasterKey::of(object));
                 continue;
             }
             // An object the projection cannot represent: left out of a
@@ -583,20 +695,24 @@ impl SceneDbRayTracing {
                             .and_then(VgRayProxies::buffers)
                             .ok_or_else(|| error("missing proxy pool"))?;
                         self.blas
-                            .build_from_buffers_with_opacity(
+                            .build(
                                 id,
                                 &mut encoder,
-                                BlasGeometry {
-                                    revision: 0,
-                                    vertices,
-                                    first_vertex: range.first_vertex,
-                                    vertex_count: range.vertex_count,
-                                    vertex_stride: helio_mesh_api::RAY_PROXY_VERTEX_BYTES,
-                                    indices: Some(proxy_indices),
-                                    first_index: range.first_index,
-                                    index_count: range.index_count,
-                                },
-                                opaque,
+                                vec![BlasSegment {
+                                    geometry: BlasGeometry {
+                                        positions_revision: 0,
+                                        topology_revision: 0,
+                                        vertices,
+                                        first_vertex: range.first_vertex,
+                                        vertex_count: range.vertex_count,
+                                        vertex_stride: helio_mesh_api::RAY_PROXY_VERTEX_BYTES,
+                                        indices: Some(proxy_indices),
+                                        first_index: range.first_index,
+                                        index_count: range.index_count,
+                                    },
+                                    opaque,
+                                }],
+                                Movability::Static,
                             )
                             .map_err(|e| error(&e.to_string()))?;
                     }
@@ -632,42 +748,54 @@ impl SceneDbRayTracing {
                         // for in-place edits. A mesh that promises not to deform is
                         // never re-read: its BLAS key (buffer, ranges, opacity) still
                         // rebuilds it when SceneDB moves or replaces the allocation.
-                        let revision = if world
-                            .get::<Movability>(*entity)
-                            .is_none_or(|movability| movability.can_deform())
-                        {
-                            // Streaming hash's vectorized bulk path for large meshes.
-                            let mut hash = twox_hash::XxHash3_64::default();
-                            hash.write(bytemuck::cast_slice(&mesh.vertices));
-                            hash.write(bytemuck::cast_slice(&mesh.indices));
-                            hash.finish()
-                        } else {
-                            0
-                        };
+                        let movability = world.get::<Movability>(*entity).copied();
+                        // Positions and topology apart: a deforming mesh whose
+                        // positions alone changed is refit, not rebuilt.
+                        let (positions_revision, topology_revision) =
+                            if movability.is_none_or(|movability| movability.can_deform()) {
+                                // Streaming hash's vectorized bulk path for large meshes.
+                                let hash = |bytes: &[u8]| {
+                                    let mut hash = twox_hash::XxHash3_64::default();
+                                    hash.write(bytes);
+                                    hash.finish()
+                                };
+                                (
+                                    hash(bytemuck::cast_slice(&mesh.vertices)),
+                                    hash(bytemuck::cast_slice(&mesh.indices)),
+                                )
+                            } else {
+                                (0, 0)
+                            };
                         self.blas
-                            .build_from_buffers_with_opacity(
+                            .build(
                                 id,
                                 &mut encoder,
-                                BlasGeometry {
-                                    revision,
-                                    vertices: &vertices
-                                        .as_ref()
-                                        .ok_or_else(|| error("missing vertex pool"))?
-                                        .buffer,
-                                    first_vertex: vertex_range.offset,
-                                    vertex_count: vertex_range.count,
-                                    vertex_stride: std::mem::size_of::<helio_mesh_api::PackedVertex>()
-                                        as u64,
-                                    indices: Some(
-                                        &indices
+                                vec![BlasSegment {
+                                    geometry: BlasGeometry {
+                                        positions_revision,
+                                        topology_revision,
+                                        vertices: &vertices
                                             .as_ref()
-                                            .ok_or_else(|| error("missing index pool"))?
+                                            .ok_or_else(|| error("missing vertex pool"))?
                                             .buffer,
-                                    ),
-                                    first_index: index_range.offset,
-                                    index_count: index_range.count,
-                                },
-                                opaque,
+                                        first_vertex: vertex_range.offset,
+                                        vertex_count: vertex_range.count,
+                                        vertex_stride: std::mem::size_of::<
+                                            helio_mesh_api::PackedVertex,
+                                        >()
+                                            as u64,
+                                        indices: Some(
+                                            &indices
+                                                .as_ref()
+                                                .ok_or_else(|| error("missing index pool"))?
+                                                .buffer,
+                                        ),
+                                        first_index: index_range.offset,
+                                        index_count: index_range.count,
+                                    },
+                                    opaque,
+                                }],
+                                movability.unwrap_or(Movability::Static),
                             )
                             .map_err(|e| error(&e.to_string()))?;
                     }
@@ -683,7 +811,8 @@ impl SceneDbRayTracing {
                 material: object.material_slot,
                 base_color: row.base_color,
                 emissive: row.emissive,
-                transmission: [rgb[0], rgb[1], rgb[2], 0.0],
+                transmission: rgb,
+                skinned_vertex: 0,
             });
             self.caster_slots.insert(object_entity, self.casters.len());
             self.casters.push((object_entity, CasterKey::of(object)));
@@ -703,10 +832,11 @@ impl SceneDbRayTracing {
             .casters
             .iter()
             .map(|(_, key)| {
+                // The casters' masks rays select by (the frame's ray masks).
                 if key.flags & helio_mesh_api::INSTANCE_FLAG_MOVABLE != 0 {
-                    2
+                    helio_frame_api::rays::stream::MASK_MOVABLE
                 } else {
-                    1
+                    helio_frame_api::rays::stream::MASK_STATIC
                 }
             })
             .collect();

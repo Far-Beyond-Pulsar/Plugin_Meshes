@@ -26,7 +26,7 @@ struct TestMaterial {
 }
 
 const MOVABLE: u32 = 1 << 3;
-const STRIDE: usize = 224;
+const STRIDE: usize = 208;
 
 struct Rng(u64);
 impl Rng {
@@ -73,9 +73,6 @@ fn rows(rng: &mut Rng, count: usize) -> Vec<StaticObjectComponent> {
                 graph_hash_lo: material_slot,
                 graph_hash_hi: 0,
                 flags: if rng.next_u32() % 3 == 0 { MOVABLE } else { 0 },
-                skin_vertex_offset: 0,
-                bone_palette_offset: 0,
-                bone_palette_count: 0,
                 section_index: 0,
             }
         })

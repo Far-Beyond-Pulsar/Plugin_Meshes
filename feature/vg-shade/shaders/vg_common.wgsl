@@ -1,8 +1,8 @@
 // Shared helpers of the virtual-geometry shade modules. The includer declares
-// `static_objects: array<u32>` (the scene join's 252-byte rows as words) and
+// `static_objects: array<u32>` (the scene join's 240-byte rows as words) and
 // `coordinate_spaces: array<mat4x4<f32>>` before this text.
 
-const VGS_OBJ_WORDS: u32 = 63u;     // 252-byte StaticObjectRow
+const VGS_OBJ_WORDS: u32 = 60u;     // 240-byte StaticObjectRow
 const VGS_OBJ_MATERIAL_SLOT: u32 = 2u;
 const VGS_OBJ_TRANSFORM: u32 = 4u;
 const VGS_OBJ_PREV_TRANSFORM: u32 = 20u;

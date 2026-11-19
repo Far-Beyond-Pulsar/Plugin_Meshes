@@ -226,7 +226,7 @@ fn resources(g: &Gpu, s: &Scene) -> Resources {
         lod_error_scale: 1.0,
         object_row: 0,
     };
-    let mut object = [0f32; 63];
+    let mut object = [0f32; 60];
     object[4..20].copy_from_slice(&Mat4::IDENTITY.to_cols_array());
     let mut hw = [DrawIndirectArgs::default(); 4];
     hw[hw_bin_for_tris(s.hw_tris)] = DrawIndirectArgs {

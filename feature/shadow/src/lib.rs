@@ -75,7 +75,9 @@ pub fn caster_geometry() -> String {
         include_str!("../shaders/shadow.wgsl"),
         &[
             helio_light_api::SHADOW_ATLAS_SNIPPET,
+            helio_mesh_api::DRAW_ROWS_SNIPPET,
             helio_mesh_api::SKINNING_SNIPPET,
+            helio_frame_api::rays::stream::SNIPPET,
         ],
     )
     .into_owned()
@@ -549,8 +551,8 @@ impl RenderPass for ShadowPass {
             helio_mesh_api::MESH_INDICES.name(),
             helio_mesh_api::MESH_VERTICES.name(),
             helio_mats::MATERIALS.name(),
-            helio_mesh_api::BONE_PALETTE.name(),
-            helio_mesh_api::SKIN_VERTICES.name(),
+            helio_mesh_api::SKIN_CACHE_ROWS.name(),
+            helio_mesh_api::SKIN_CACHE.name(),
         ];
         LIST
     }
@@ -654,8 +656,8 @@ impl RenderPass for ShadowPass {
             return Ok(());
         };
         let desired = data.desired_matrices.unwrap_or(data.shadow_matrices);
-        let skin = ctx.scene_buffers.get(helio_mesh_api::SKIN_VERTICES.key());
-        let palette = ctx.scene_buffers.get(helio_mesh_api::BONE_PALETTE.key());
+        let skin = ctx.scene_buffers.get(helio_mesh_api::SKIN_CACHE.key());
+        let palette = ctx.scene_buffers.get(helio_mesh_api::SKIN_CACHE_ROWS.key());
         let key = [
             desired.clone(),
             batch.instances.clone(),

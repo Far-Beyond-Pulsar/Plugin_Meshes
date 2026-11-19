@@ -61,7 +61,7 @@
 //! Tier 1/2 drew there), the cull's `visible_clusters` (`{instance,
 //! cluster_slot}`), the `helio-vg-stream` page pool and `vg_asset_quant`
 //! decoded by the shared `helio_vg_format::DECODE_WGSL`, `vg_instances`, and the
-//! 252-byte `static_objects` rows. The `bin` kernel is dispatched indirectly as
+//! 240-byte `static_objects` rows. The `bin` kernel is dispatched indirectly as
 //! rows of 32768 workgroups of 64 threads (`args[3..6]`).
 //!
 //! # Contract for T9 / T10

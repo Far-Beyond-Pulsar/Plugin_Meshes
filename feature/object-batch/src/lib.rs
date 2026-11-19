@@ -78,9 +78,9 @@ struct RangeBlockUniformGpu {
 /// shape as `helio_mesh_api::GpuDrawCall`  /// for it since it never needs the typed version, only the byte layout for
 /// buffer sizing).
 const DRAW_CALL_BYTES: u64 = 20;
-/// Matches `shaders/object_batch.wgsl`'s `GpuInstanceDataOut` -- 224 bytes,
+/// Matches `shaders/object_batch.wgsl`'s `GpuInstanceDataOut` -- 208 bytes,
 /// see `helio_mesh_api::GpuInstanceData`'s own doc for the exact field breakdown.
-const INSTANCE_BYTES: u64 = 224;
+const INSTANCE_BYTES: u64 = 208;
 /// Matches `shaders/object_batch.wgsl`'s `GpuInstanceAabbOut` -- 32 bytes (min, pad, max, pad),
 /// the layout `indirect_dispatch.wgsl` reads as `GpuAabb`.
 const AABB_BYTES: u64 = 32;
@@ -1791,14 +1791,14 @@ mod tests {
     #[test]
     fn static_object_component_size_matches_wgsl_mirror() {
         // 4×u32 (16) + transform(64) + prev_transform(64) + normal_mat(48)
-        // + bounds(16) + 11×u32/i32/u32 (44) = 252 bytes -- see `object_batch
+        // + bounds(16) + 11×u32/i32/u32 (44) = 240 bytes -- see `object_batch
         // .wgsl`'s `StaticObjectRow` doc.
-        assert_eq!(std::mem::size_of::<StaticObjectRow>(), 252);
+        assert_eq!(std::mem::size_of::<StaticObjectRow>(), 240);
     }
 
     #[test]
     fn output_struct_sizes_match_wgsl() {
-        assert_eq!(INSTANCE_BYTES, 224);
+        assert_eq!(INSTANCE_BYTES, 208);
         assert_eq!(
             helio_mesh_api::draw_slots::INSTANCE_BYTES,
             std::mem::size_of::<GpuInstanceData>() as u64

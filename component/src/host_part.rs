@@ -2,7 +2,14 @@
 //! submits): the
 //! virtual-geometry host (builds, caches and streams the cluster assets of
 //! meshes whose owner has a `VirtualGeometryComponent`; its runtime feeds
-//! the VG passes) and the authored LOD selection.
+//! the VG passes), the authored LOD selection, the skin cache
+//! ([`crate::skin_cache`]: every drawer's and the ray-traced scene's skinned
+//! vertices) and the ray-traced scene ([`crate::ray_scene`]).
+//!
+//! Each frame, after the scene's GPU mirror is flushed, the skin cache's
+//! pass and the ray-traced scene's BLAS and TLAS builds are recorded into
+//! one encoder, in that order (the deforming BLASes refit from the vertices
+//! the pass wrote), and submitted before the frame renders.
 //!
 //! Its derivations run after the object joins and before the row joins, in
 //! this order: which VG assets are ready, which instances are VG-active,
@@ -27,6 +34,8 @@ pub struct MeshesHostPart {
     /// The ray-traced scene, made on the first frame (the renderer's
     /// device says whether it has ray queries).
     ray_scene: RayScene,
+    /// The skin cache, made with the renderer (its pipeline compiles then).
+    skin_cache: Option<crate::skin_cache::SkinCache>,
 }
 
 enum RayScene {
@@ -42,6 +51,21 @@ impl MeshesHostPart {
             virtual_geometry: VirtualGeometryHost::new(),
             settings_override: None,
             ray_scene: RayScene::Pending,
+            skin_cache: None,
+        }
+    }
+
+    /// The skin cache (after the renderer is built).
+    pub fn skin_cache(&self) -> Option<&crate::skin_cache::SkinCache> {
+        self.skin_cache.as_ref()
+    }
+
+    /// The ray-traced scene (after the first frame, with hardware ray
+    /// queries).
+    pub fn ray_scene(&self) -> Option<&crate::ray_scene::WorldRayScene> {
+        match &self.ray_scene {
+            RayScene::Ready(rays) => Some(rays),
+            _ => None,
         }
     }
 
@@ -135,7 +159,13 @@ impl RenderHostPart for MeshesHostPart {
                 context.transforms,
             )
         };
+        let skins = crate::skin_cache::SkinCache::new(device.clone());
+        let skin_buffers = skins.derivation();
+        self.skin_cache = Some(skins);
         vec![
+            // The skin cache's buffers, for the drawers (updated before the
+            // frame, in `publish_frame`).
+            Box::new(skin_buffers),
             self.virtual_geometry.asset_ready_derivation(device),
             self.virtual_geometry.instances_derivation(device),
             Box::new(AuthoredLodSelection::new(
@@ -174,9 +204,15 @@ impl RenderHostPart for MeshesHostPart {
         );
     }
 
-    /// The meshes' ray-traced scene (`crate::ray_scene`), on a device with
-    /// hardware ray queries: what the GI probes' mesh tracer reads.
-    fn publish_frame(&mut self, scene: &SharedScene, renderer: &mut helio::Renderer) {
+    /// The skin cache's pass for the posed skinned meshes, then the meshes'
+    /// ray-traced scene (`crate::ray_scene`, on a device with hardware ray
+    /// queries: what every ray stream's mesh tracer reads), refit from it.
+    fn publish_frame(
+        &mut self,
+        scene: &SharedScene,
+        renderer: &mut helio::Renderer,
+        camera: Option<&helio::Camera>,
+    ) {
         if matches!(self.ray_scene, RayScene::Pending) {
             self.ray_scene = match crate::ray_scene::WorldRayScene::new(
                 renderer.device().clone(),
@@ -192,12 +228,49 @@ impl RenderHostPart for MeshesHostPart {
                 }
             };
         }
-        let RayScene::Ready(rays) = &mut self.ray_scene else {
+        let Some(skins) = self.skin_cache.as_mut() else {
             return;
         };
-        rays.prepare(&scene.read().world, renderer.world_origin());
-        if let Some(scene_rays) = rays.scene_rays() {
-            renderer.set_scene_payload(&helio_frame_api::rays::SCENE_RAYS, Arc::new(scene_rays));
+        let device = renderer.device().clone();
+        let queue = renderer.queue().clone();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Meshes: skin cache and ray-traced scene"),
+        });
+        let scene = scene.read();
+        let settings = {
+            use engine_backend::subsystems::render::helio_renderer::project_settings;
+            helio_pass_mesh_rays::RayTracingSettings::from_settings(&project_settings::resolved(
+                &helio_pass_mesh_rays::RAY_TRACING,
+            ))
+        };
+        // Skinned only where the frame draws or traces them.
+        let view = camera.map(|camera| crate::skin_cache::SkinView {
+            eye: camera.eye,
+            view_proj: camera.view_proj_in(camera.eye),
+            rays: settings,
+        });
+        let skin_frame = skins.update(&scene.world, view.as_ref(), &queue, &mut encoder);
+        let stats = renderer.frame_stats().clone();
+        skins.report(&stats);
+        if let RayScene::Ready(rays) = &mut self.ray_scene {
+            rays.prepare(
+                &scene.world,
+                renderer.world_origin(),
+                camera.map_or(renderer.world_origin(), |camera| camera.eye),
+                settings,
+                skins,
+                &skin_frame,
+                &mut encoder,
+                &stats,
+            );
+        }
+        queue.submit([encoder.finish()]);
+        if let RayScene::Ready(rays) = &mut self.ray_scene {
+            rays.after_submit();
+            if let Some(scene_rays) = rays.scene_rays() {
+                renderer
+                    .set_scene_payload(&helio_frame_api::rays::SCENE_RAYS, Arc::new(scene_rays));
+            }
         }
     }
 

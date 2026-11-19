@@ -17,8 +17,8 @@
 //!   mesh asset reloads.
 //! - The plugin's Helio features: the object batch (first in the frame's
 //!   prepare slot), its culling around the depth pyramid, the drawers (the
-//!   G-buffer, shadow-caster, forward and transparent phases) and virtual
-//!   geometry.
+//!   G-buffer, shadow-caster, forward and transparent phases), virtual
+//!   geometry and the meshes' tracer of ray streams (`helio-pass-mesh-rays`).
 //!
 //! This crate registers nothing itself: the plugin's root crate
 //! (`meshes_plugin`) submits every registration above, in one place.
@@ -33,6 +33,7 @@ pub mod mesh_materials;
 pub mod mesh_spatial;
 pub mod ray_scene;
 pub mod records;
+pub mod skin_cache;
 pub mod vg_settings;
 pub mod virtual_geometry_host;
 pub mod virtual_geometry_instances;
@@ -44,7 +45,7 @@ use helio_pass_object_batch::scene_join::{SceneJoin, SceneJoinKeys};
 use pulsar_scenedb::gpu::BufferKey;
 use pulsar_scenedb::{Entity, World};
 
-/// The meshes' features.
+/// The meshes' features (the tracer of ray streams last: it adds no node).
 pub fn render_features() -> helio_feature_api::FeatureSet {
     helio_feature_api::FeatureSet::new()
         .with(helio_pass_object_batch::ObjectBatchFeature)
@@ -55,6 +56,7 @@ pub fn render_features() -> helio_feature_api::FeatureSet {
         .with(helio_pass_forward_lit::ForwardDrawers)
         .with(helio_pass_transparent::TransparentDrawers)
         .with(helio_pass_vg::VgFeature)
+        .with(helio_pass_mesh_rays::MeshRays)
 }
 
 /// The meshes' features read no project settings through the renderer
@@ -106,8 +108,6 @@ pub fn scene_join_keys(context: &ObjectJoinContext) -> SceneJoinKeys {
         mesh_bounds: BufferKey::of(MESH_BOUNDS_BUFFER),
         mesh_flags: BufferKey::of(MESH_FLAGS_BUFFER),
         section_handles: BufferKey::of("static_mesh_draw_sections::handles"),
-        skin_handles: BufferKey::of(SKELETAL_SKIN_HANDLES_BUFFER),
-        palette_handles: BufferKey::of(SKELETAL_PALETTE_HANDLES_BUFFER),
         mesh_sections: BufferKey::of(MESH_SECTIONS_BUFFER),
         material_row_handles: BufferKey::of("mesh_material_rows::handles"),
         material_rows: BufferKey::of(mesh_materials::MESH_MATERIAL_ROWS_BUFFER),

@@ -80,12 +80,14 @@ pub struct ShadowDirtyPass {
     /// Bind group (lazy; rebuilt whenever the `instances` or `shadow_mats` buffer
     /// pointer changes due to `GrowableBuffer` reallocation).
     bind_group: Option<wgpu::BindGroup>,
-    bind_group_key: Option<[wgpu::Buffer; 7]>,
+    bind_group_key: Option<[wgpu::Buffer; 8]>,
 
     /// Movable draws whose instances changed this frame (`Changed` in the
     /// shader), one entry each, and how many.
     changed_buf: wgpu::Buffer,
     changed_count_buf: wgpu::Buffer,
+    /// The skin cache's table when no skinned mesh publishes one.
+    no_skin_rows: wgpu::Buffer,
 }
 
 impl ShadowDirtyPass {
@@ -96,7 +98,12 @@ impl ShadowDirtyPass {
             device,
             "ShadowDirty Shader",
             helio_core::include_wgsl!("../shaders/shadow_dirty.wgsl"),
-            &[helio_light_api::SHADOW_ATLAS_SNIPPET],
+            &[
+                helio_light_api::SHADOW_ATLAS_SNIPPET,
+                helio_mesh_api::DRAW_ROWS_SNIPPET,
+                helio_mesh_api::SKINNING_SNIPPET,
+                helio_frame_api::rays::stream::SNIPPET,
+            ],
         );
 
         // ── Bind Group Layout ─────────────────────────────────────────────────
@@ -245,6 +252,17 @@ impl ShadowDirtyPass {
                     },
                     count: None,
                 },
+                // 14: the skin cache's instance table (skinned casters' poses)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
                 // 11: per-face dirty page masks
                 wgpu::BindGroupLayoutEntry {
                     binding: 11,
@@ -364,6 +382,12 @@ impl ShadowDirtyPass {
         Self {
             pipelines,
             changed_buf,
+            no_skin_rows: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ShadowDirty/NoSkinRows"),
+                size: std::mem::size_of::<helio_mesh_api::SkinCacheRow>() as u64,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }),
             changed_count_buf,
             bgl,
             uniform_buf,
@@ -485,6 +509,12 @@ impl RenderPass for ShadowDirtyPass {
             return Ok(());
         }
 
+        // Skinned casters' poses (an empty table without skinned meshes).
+        let skin_rows = ctx
+            .scene_buffers
+            .get(helio_mesh_api::SKIN_CACHE_ROWS.key())
+            .map_or(&self.no_skin_rows, |handle| &handle.buffer);
+
         // ── Lazy bind group rebuild on GrowableBuffer reallocation ─────────────
         let key = [
             batch.instances.clone(),
@@ -497,6 +527,7 @@ impl RenderPass for ShadowDirtyPass {
             coords.coordinate_spaces.clone(),
             batch.draw_counts_gpu.clone(),
             self.changed_buf.clone(),
+            skin_rows.clone(),
         ];
 
         if self.bind_group_key.as_ref() != Some(&key) {
@@ -509,6 +540,10 @@ impl RenderPass for ShadowDirtyPass {
                         wgpu::BindGroupEntry {
                             binding: 8,
                             resource: coords.coordinate_spaces.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 14,
+                            resource: skin_rows.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -609,5 +644,31 @@ impl RenderPass for ShadowDirtyPass {
         }
         ctx.end_gpu_scope(&mut cmds, "Shadow Dirty: detect");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The pass's shader resolves and validates with the snippets it is
+    /// built with (`ShadowDirtyPass::new`).
+    #[test]
+    fn the_shadow_dirty_shader_validates() {
+        let source = helio_core::shader::resolve_with(
+            include_str!("../shaders/shadow_dirty.wgsl"),
+            &[
+                helio_light_api::SHADOW_ATLAS_SNIPPET,
+                helio_mesh_api::DRAW_ROWS_SNIPPET,
+                helio_mesh_api::SKINNING_SNIPPET,
+                helio_frame_api::rays::stream::SNIPPET,
+            ],
+        );
+        let module = naga::front::wgsl::parse_str(&source)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{e:?}"));
     }
 }

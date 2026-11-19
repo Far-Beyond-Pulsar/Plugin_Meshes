@@ -29,19 +29,36 @@
 //! - **Spread out.** New BLASes are built under a per-frame triangle budget
 //!   (a mesh joins the TLAS once its BLAS is built), and mesh evaluations
 //!   under a per-frame count, so a level loading does not stall one frame on
-//!   thousands of builds. BLASes are not compacted: wgpu-core's
-//!   `Queue::compact_blas` takes `pending_writes` before
-//!   `command_indices`, the reverse of `Queue::present`, and deadlocks
-//!   against the editor UI presenting on the same device from its thread.
+//!   thousands of builds. Built BLASes are compacted a few a frame
+//!   (`BlasManager::maintain`): a level's BLASes shrink to their final size
+//!   over the frames after it loads.
 //!
-//! What it traces: every enabled, visible static mesh section whose
-//! material is opaque or a cut-out. Cut-outs are non-opaque segments flagged
+//! - **Skinned meshes** ([`SkeletalMeshComponent`]) are traced from the skin
+//!   cache ([`crate::skin_cache`]), the positions every drawer draws: a BLAS
+//!   per instance (they deform independently), `Movability::Dynamic`, refit
+//!   when the cache posed it (`positions_revision` is the cache's revision),
+//!   rebuilt on the acceleration policy's schedule, nothing when its pose
+//!   is unchanged. Refits are budgeted in triangles a frame
+//!   (`helio_pass_mesh_rays::RAY_TRACING`'s `skinned_refit_triangles`), nearest
+//!   first and the longest-waiting ahead of nearer ones; an instance over the
+//!   budget keeps last frame's BLAS (a frame stale, not wrong). Their rows
+//!   (`RAY_INSTANCE_SKINNED`) point the tracer at the cache, so a hit shades
+//!   from the skinned normal.
+//! - **Culled by distance and angle** (`RAY_TRACING`'s `culling_radius` and
+//!   `culling_angle`, Unreal's ray-tracing culling): an instance past the
+//!   radius whose bounding sphere spans less than the angle from the eye
+//!   leaves the TLAS (with a tenth of slack, so one at a threshold does not
+//!   flicker). The eye's moves re-test the traced instances only after it
+//!   has moved a twentieth of the radius.
+//!
+//! What it traces: every enabled, visible static or skinned mesh section
+//! whose material is opaque or a cut-out, within the culling criterion. Cut-outs are non-opaque segments flagged
 //! `RAY_INSTANCE_MASKED`, so a ray query tests their alpha as the raster
 //! does. Blended sections (glass) are left out: probe rays pass them. A
 //! material graph is traced as its resolved row (its fallback surface and
 //! its first texture's mean colour): rays cannot run a graph, so a hit's
 //! colour is that coarse surface, as with every material
-//! (`RayInstance::base_color`). Skinned meshes are not traced.
+//! (`RayInstance::base_color`).
 //!
 //! How others do it: Unreal's ray-tracing scene keeps one instance per
 //! primitive with a BLAS per mesh LOD whose segments are its sections (hit
@@ -54,19 +71,25 @@ use std::sync::Arc;
 
 use glam::{DMat4, DVec3};
 use helio_core::{BlasGeometry, BlasManager, BlasSegment, TlasInstanceInput, TlasManager};
+use helio_frame_api::rays::stream::{MASK_MOVABLE, MASK_STATIC};
 use helio_mats::instance::{MaterialInstanceComponent, row_of};
 use helio_mesh_api::{
-    RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_TWO_SIDED, RayInstance,
+    RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_SKINNED, RAY_INSTANCE_TWO_SIDED,
+    RayInstance,
 };
 use helio_mesh_host::ray_proxies::{Lookup, ProxyRange, VgRayProxies};
 use helio_mesh_host::texture_means::TextureMeans;
+use helio_pass_mesh_rays::RayTracingSettings;
 use pulsar_scene_model::attachments::ComponentOwner;
 use pulsar_scene_model::{Parent, Transform, Visibility};
 use pulsar_scenedb::gpu::{GpuMirrorHandle, SceneGpuStore, VarLenHandle};
 use pulsar_scenedb::{ChangeCursor, ChangeRead, ComponentChange, Entity, World};
 
-use crate::components::{MeshGeometryKey, StaticMeshComponent, StaticMeshDraw};
+use crate::components::{
+    MeshGeometryKey, SkeletalMeshComponent, StaticMeshComponent, StaticMeshDraw,
+};
 use crate::mesh_materials::MeshMaterials;
+use crate::skin_cache::{SkinCache, SkinCacheFrame};
 
 /// Triangles of new BLASes built a frame (at least one BLAS is).
 const BUILD_TRIANGLES_PER_FRAME: u64 = 1 << 20;
@@ -74,6 +97,11 @@ const BUILD_TRIANGLES_PER_FRAME: u64 = 1 << 20;
 const EVALUATIONS_PER_FRAME: usize = 256;
 /// Ancestors followed from a mesh's owner (as the transform hierarchy).
 const MAX_DEPTH: usize = 64;
+/// How far past the culling thresholds a traced instance stays traced.
+const CULLING_SLACK: f64 = 1.1;
+/// The share of the culling radius the eye moves before the traced
+/// instances are tested again.
+const CULLING_RETEST: f64 = 0.05;
 
 /// A BLAS: what geometry, and each segment's opacity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -86,6 +114,13 @@ enum BlasKey {
     },
     /// A virtual-geometry asset's proxy.
     Proxy { key: u64, opaque: bool },
+    /// A skinned instance's own deforming BLAS (its entity's bits), its
+    /// mesh and traced sections as a mesh's.
+    Skinned {
+        entity: u64,
+        geometry: u128,
+        sections: Vec<(u32, u32, bool)>,
+    },
 }
 
 /// Where a BLAS's triangles are, for its build.
@@ -97,6 +132,11 @@ enum Source {
         first_index: u32,
     },
     Proxy(ProxyRange),
+    /// A skinned instance's vertices in the skin cache (by its entity), its
+    /// indices in the mesh pool from `first_index`.
+    Skinned {
+        first_index: u32,
+    },
 }
 
 struct Blas {
@@ -106,6 +146,10 @@ struct Blas {
     state: BlasState,
     source: Source,
     triangles: u64,
+    /// A skinned BLAS: the skin cache revision it was last built from, and
+    /// the frames its refit has waited.
+    revision: u64,
+    waited: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -173,6 +217,14 @@ struct Traced {
     slot: Option<usize>,
     /// Its BLAS's triangles and their count, for the build.
     source_hint: (Source, u64),
+    /// Its world bounding sphere (centre, radius), for the culling.
+    center: DVec3,
+    radius: f64,
+    /// Its mesh-space bounding sphere.
+    bounds_local: [f32; 4],
+    /// Left out by the culling.
+    culled: bool,
+    skinned: bool,
 }
 
 /// A mesh the projection knows: its owner's ancestor chain (owner first),
@@ -185,6 +237,7 @@ struct Entry {
 /// The journals the projection follows.
 struct Cursors {
     meshes: ChangeCursor,
+    skeletal: ChangeCursor,
     mesh_materials: ChangeCursor,
     owners: ChangeCursor,
     materials: ChangeCursor,
@@ -197,6 +250,7 @@ impl Cursors {
     fn open(world: &World) -> Self {
         Self {
             meshes: world.open_change_cursor::<StaticMeshComponent>(),
+            skeletal: world.open_change_cursor::<SkeletalMeshComponent>(),
             mesh_materials: world.open_change_cursor::<MeshMaterials>(),
             owners: world.open_change_cursor::<ComponentOwner>(),
             materials: world.open_change_cursor::<MaterialInstanceComponent>(),
@@ -257,6 +311,15 @@ pub struct WorldRayScene {
     tlas_ok: bool,
     logged: Option<Stats>,
     warned: bool,
+    /// Traced skinned instances the culling keeps.
+    skinned: HashSet<Entity>,
+    /// The skin cache's vertices, published beside the TLAS.
+    skinned_vertices: Option<wgpu::Buffer>,
+    settings: RayTracingSettings,
+    /// The eye this frame, and where the traced instances were last tested.
+    eye: DVec3,
+    tested_at: Option<DVec3>,
+    culled: usize,
 }
 
 impl WorldRayScene {
@@ -299,17 +362,40 @@ impl WorldRayScene {
             tlas_ok: false,
             logged: None,
             warned: false,
+            skinned: HashSet::new(),
+            skinned_vertices: None,
+            settings: RayTracingSettings::default(),
+            eye: DVec3::ZERO,
+            tested_at: None,
+            culled: 0,
         })
     }
 
     /// Bring the TLAS up to date with `world`, in the frame whose world
-    /// origin is `origin`. Call after the world's GPU mirror is flushed (the
-    /// BLASes read the mirrored geometry).
-    pub fn prepare(&mut self, world: &World, origin: DVec3) {
+    /// origin is `origin` and whose eye is `eye` (world space), recording
+    /// its builds into `encoder` after the skin cache's pass (`skins`, which
+    /// did `skin_frame` this frame). Call after the world's GPU mirror is
+    /// flushed (the BLASes read the mirrored geometry); submit `encoder`,
+    /// then call [`Self::after_submit`]. Adds the acceleration structures'
+    /// stats to `stats`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare(
+        &mut self,
+        world: &World,
+        origin: DVec3,
+        eye: DVec3,
+        settings: RayTracingSettings,
+        skins: &SkinCache,
+        skin_frame: &SkinCacheFrame,
+        encoder: &mut wgpu::CommandEncoder,
+        stats: &helio_core::FrameStats,
+    ) {
         let Some(mirror) = world.gpu_mirror() else {
             return;
         };
         let store = mirror.store();
+        // Compact the BLASes built in earlier frames (a few a frame).
+        self.blas.maintain(&self.queue);
         // Proxies that came or went: re-evaluate everything.
         if self
             .vg
@@ -318,10 +404,19 @@ impl WorldRayScene {
         {
             self.cursors = None;
         }
+        // A new criterion re-tests every traced instance.
+        if settings != self.settings {
+            self.settings = settings;
+            self.tested_at = None;
+        }
+        self.eye = eye;
+        self.skinned_vertices = Some(skins.buffer().clone());
         let mut dirty = std::mem::take(&mut self.pending);
         let mut moved = HashSet::new();
         self.read_changes(world, &mut dirty, &mut moved);
         dirty.extend(self.waiting.drain());
+        // Skinned instances the cache moved or dropped: their rows follow.
+        dirty.extend(skin_frame.moved.iter().copied());
         // Texture means that arrived recolour the rows (from the cached
         // material rows: nothing is resolved again).
         if self.texture_means.collect() {
@@ -338,11 +433,25 @@ impl WorldRayScene {
             }
             evaluated += 1;
             moved.remove(&entity);
-            self.evaluate(world, mirror, store, entity);
+            self.evaluate(world, mirror, store, skins, entity);
         }
         for entity in moved {
             if !self.pending.contains(&entity) {
                 self.place(world, entity);
+            }
+        }
+        // The eye moved far enough: test every traced instance again.
+        let retest = (self.settings.culling_radius * CULLING_RETEST).max(1.0);
+        if self.tested_at.is_none_or(|at| at.distance(eye) > retest) {
+            self.tested_at = Some(eye);
+            let traced: Vec<Entity> = self
+                .entries
+                .iter()
+                .filter(|(_, e)| e.state.is_ok())
+                .map(|(entity, _)| *entity)
+                .collect();
+            for entity in traced {
+                self.cull(entity);
             }
         }
         if origin != self.origin {
@@ -353,19 +462,15 @@ impl WorldRayScene {
                 }
             }
         }
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("World RT acceleration"),
-            });
-        self.build_blases(store, &mut encoder);
+        self.build_blases(store, encoder);
+        self.refit_skinned(store, skins, encoder);
         self.admit_built();
         if self.rows_dirty {
             self.write_rows();
         }
         match self
             .tlas
-            .build_masked(&mut encoder, &self.instances, &self.blas, &self.masks)
+            .build_masked(encoder, &self.instances, &self.blas, &self.masks)
         {
             Ok(()) => {
                 self.tlas_ok = true;
@@ -381,9 +486,37 @@ impl WorldRayScene {
                 }
             }
         }
-        self.queue.submit([encoder.finish()]);
-        self.texture_means.dispatch(&self.device, &self.queue);
+        self.blas.report(stats);
+        self.tlas.report(stats);
+        stats.add_named(
+            helio_mesh_api::stats::RAY_INSTANCES,
+            self.slots.len() as u64,
+        );
+        stats.add_named(
+            helio_mesh_api::stats::RAY_INSTANCES_CULLED,
+            self.culled as u64,
+        );
         self.log_stats();
+    }
+
+    /// After the encoder [`Self::prepare`] recorded into is submitted.
+    pub fn after_submit(&mut self) {
+        self.texture_means.dispatch(&self.device, &self.queue);
+    }
+
+    /// The BLAS manager's counters (builds, refits, compactions).
+    pub fn blas_counters(&self) -> helio_core::BlasCounters {
+        self.blas.counters()
+    }
+
+    /// The TLAS manager's counters.
+    pub fn tlas_counters(&self) -> helio_core::TlasCounters {
+        self.tlas.counters()
+    }
+
+    /// How many instances the culling leaves out.
+    pub fn culled_count(&self) -> usize {
+        self.culled
     }
 
     /// The frame's ray-traced scene, after [`Self::prepare`].
@@ -399,6 +532,13 @@ impl WorldRayScene {
             rays = rays
                 .with(helio_mesh_api::RAY_PROXY_VERTICES, vertices.clone())
                 .with(helio_mesh_api::RAY_PROXY_INDICES, indices.clone());
+        }
+        if let Some(skinned) = self
+            .skinned_vertices
+            .as_ref()
+            .filter(|_| !self.skinned.is_empty())
+        {
+            rays = rays.with(helio_mesh_api::RAY_SKINNED_VERTICES, skinned.clone());
         }
         Some(rays)
     }
@@ -431,11 +571,32 @@ impl WorldRayScene {
                     read(&mut cursors.mesh_materials),
                     read(&mut cursors.owners),
                 ];
+                // A skinned mesh's pose changes reach it through the skin
+                // cache; its journal still says when it was added, removed
+                // or re-pointed at another mesh (re-evaluated: cheap).
+                let skeletal = read(&mut cursors.skeletal);
                 let materials = read(&mut cursors.materials);
                 let placed = [read(&mut cursors.visibility), read(&mut cursors.parents)];
                 let transforms = read(&mut cursors.transforms);
                 if complete {
                     dirty.extend(own.into_iter().flatten());
+                    for entity in skeletal {
+                        // A pose alone changes nothing here: only a new mesh
+                        // (or one not traced yet) re-evaluates.
+                        let geometry = world
+                            .get::<SkeletalMeshComponent>(entity)
+                            .map(|mesh| mesh.geometry_key.0);
+                        let traced = match self.entries.get(&entity).map(|e| &e.state) {
+                            Some(Ok(Traced {
+                                key: BlasKey::Skinned { geometry: g, .. },
+                                ..
+                            })) => Some(*g),
+                            _ => None,
+                        };
+                        if geometry.is_none() || traced != geometry {
+                            dirty.insert(entity);
+                        }
+                    }
                     for entity in placed.into_iter().flatten() {
                         dirty.extend(self.below.get(&entity).into_iter().flatten());
                     }
@@ -469,6 +630,11 @@ impl WorldRayScene {
                     .query::<&StaticMeshComponent>()
                     .map(|(entity, _)| entity),
             );
+            dirty.extend(
+                world
+                    .query::<&SkeletalMeshComponent>()
+                    .map(|(entity, _)| entity),
+            );
         }
     }
 
@@ -479,14 +645,24 @@ impl WorldRayScene {
         world: &World,
         mirror: &GpuMirrorHandle,
         store: &SceneGpuStore,
+        skins: &SkinCache,
         entity: Entity,
     ) {
         if let Some(old) = self.entries.remove(&entity) {
             self.forget(entity, old);
         }
-        let Some(entry) = self.entry(world, mirror, store, entity) else {
+        let Some(mut entry) = self.entry(world, mirror, store, skins, entity) else {
             return;
         };
+        if let Ok(traced) = &mut entry.state {
+            traced.culled =
+                !self
+                    .settings
+                    .traces(traced.center.distance(self.eye), traced.radius, 1.0);
+            if traced.culled {
+                self.culled += 1;
+            }
+        }
         for ancestor in &entry.chain {
             self.below.entry(*ancestor).or_default().insert(entity);
         }
@@ -497,20 +673,31 @@ impl WorldRayScene {
             Err(_) => {}
             Ok(traced) => {
                 let source = traced.source_hint;
+                let skinned = traced.skinned;
                 let blas = self.blases.entry(traced.key.clone()).or_insert_with(|| {
                     let id = self.next_id;
                     self.next_id += 1;
-                    self.build_queue.push_back(traced.key.clone());
+                    // Skinned BLASes are built by the refit budget.
+                    if !skinned {
+                        self.build_queue.push_back(traced.key.clone());
+                    }
                     Blas {
                         id,
                         users: 0,
                         state: BlasState::Queued,
                         source: source.0,
                         triangles: source.1,
+                        revision: 0,
+                        waited: 0,
                     }
                 });
                 blas.users += 1;
-                self.awaiting_blas.insert(entity);
+                if !traced.culled {
+                    self.awaiting_blas.insert(entity);
+                    if skinned {
+                        self.skinned.insert(entity);
+                    }
+                }
             }
         }
         self.entries.insert(entity, entry);
@@ -528,19 +715,15 @@ impl WorldRayScene {
         }
         self.waiting.remove(&entity);
         self.awaiting_blas.remove(&entity);
+        self.skinned.remove(&entity);
         let Ok(traced) = old.state else {
             return;
         };
+        if traced.culled {
+            self.culled -= 1;
+        }
         if let Some(slot) = traced.slot {
-            self.slots.swap_remove(slot);
-            self.instances.swap_remove(slot);
-            self.masks.swap_remove(slot);
-            if let Some(&moved) = self.slots.get(slot) {
-                if let Some(Ok(other)) = self.entries.get_mut(&moved).map(|e| &mut e.state) {
-                    other.slot = Some(slot);
-                }
-            }
-            self.rows_dirty = true;
+            self.leave_slot(slot);
         }
         if let Some(blas) = self.blases.get_mut(&traced.key) {
             blas.users -= 1;
@@ -551,20 +734,183 @@ impl WorldRayScene {
         }
     }
 
+    /// Take TLAS slot `slot`'s instance out (the last slot's moves in).
+    fn leave_slot(&mut self, slot: usize) {
+        self.slots.swap_remove(slot);
+        self.instances.swap_remove(slot);
+        self.masks.swap_remove(slot);
+        if let Some(&moved) = self.slots.get(slot) {
+            if let Some(Ok(other)) = self.entries.get_mut(&moved).map(|e| &mut e.state) {
+                other.slot = Some(slot);
+            }
+        }
+        self.rows_dirty = true;
+    }
+
+    /// Test the traced instance `entity` against the culling criterion at
+    /// this frame's eye: it leaves the TLAS when culled (a skinned one's own
+    /// BLAS is dropped), and waits for its BLAS to join again when not.
+    fn cull(&mut self, entity: Entity) {
+        let eye = self.eye;
+        let settings = self.settings;
+        let Some(Ok(traced)) = self.entries.get_mut(&entity).map(|e| &mut e.state) else {
+            return;
+        };
+        let slack = if traced.culled { 1.0 } else { CULLING_SLACK };
+        let culled = !settings.traces(traced.center.distance(eye), traced.radius, slack);
+        if culled == traced.culled {
+            return;
+        }
+        traced.culled = culled;
+        let (slot, skinned, key) = (traced.slot.take(), traced.skinned, traced.key.clone());
+        if culled {
+            self.culled += 1;
+            if let Some(slot) = slot {
+                self.leave_slot(slot);
+            }
+            self.awaiting_blas.remove(&entity);
+            self.skinned.remove(&entity);
+            if skinned {
+                if let Some(blas) = self.blases.get_mut(&key) {
+                    self.blas.remove_blas(blas.id);
+                    blas.state = BlasState::Queued;
+                }
+            }
+        } else {
+            self.culled -= 1;
+            self.awaiting_blas.insert(entity);
+            if skinned {
+                self.skinned.insert(entity);
+            }
+        }
+    }
+
     /// What the mesh `entity` traces now (`None`: it is no mesh).
     fn entry(
         &mut self,
         world: &World,
         mirror: &GpuMirrorHandle,
         store: &SceneGpuStore,
+        skins: &SkinCache,
         entity: Entity,
     ) -> Option<Entry> {
-        let mesh = world.get::<StaticMeshComponent>(entity)?;
         let link = world.get::<ComponentOwner>(entity)?;
         let owner = link.entity();
+        let state = if let Some(mesh) = world.get::<StaticMeshComponent>(entity) {
+            self.trace(world, mirror, store, entity, mesh, link, owner)
+        } else {
+            let mesh = world.get::<SkeletalMeshComponent>(entity)?;
+            self.trace_skinned(world, mirror, store, skins, entity, mesh, link, owner)
+        };
         let chain = chain_of(world, owner);
-        let state = self.trace(world, mirror, store, entity, mesh, link, owner);
         Some(Entry { chain, state })
+    }
+
+    /// Where `owner` places a mesh, if it draws: enabled, alive, visible.
+    fn placed(world: &World, link: &ComponentOwner, owner: Entity) -> Result<DMat4, Skip> {
+        if !link.is_enabled() || !world.is_alive(owner) {
+            return Err(Skip::Disabled);
+        }
+        if world
+            .get::<Visibility>(owner)
+            .is_some_and(|visibility| !visibility.visible)
+        {
+            return Err(Skip::Hidden);
+        }
+        pulsar_scene_model::hierarchy_transform::world_matrix_of(world, owner).ok_or(Skip::Disabled)
+    }
+
+    /// What the skinned mesh `entity` traces now: its traced sections, from
+    /// the skin cache (every section draws with the mesh's first material,
+    /// as its draw rows do).
+    #[allow(clippy::too_many_arguments)]
+    fn trace_skinned(
+        &mut self,
+        world: &World,
+        mirror: &GpuMirrorHandle,
+        store: &SceneGpuStore,
+        skins: &SkinCache,
+        entity: Entity,
+        mesh: &SkeletalMeshComponent,
+        link: &ComponentOwner,
+        owner: Entity,
+    ) -> Result<Traced, Skip> {
+        let world_matrix = Self::placed(world, link, owner)?;
+        if mesh.geometry_key == MeshGeometryKey::NONE || mesh.indices.is_empty() {
+            return Err(Skip::Unloaded);
+        }
+        let Some(indices) = SkeletalMeshComponent::indices_gpu_handle(store, entity.index()) else {
+            return Err(Skip::Unmirrored);
+        };
+        if indices.count as usize != mesh.indices.len() {
+            return Err(Skip::Unmirrored);
+        }
+        let Some(skin) = skins.instance(entity) else {
+            return Err(Skip::Unmirrored);
+        };
+        let Some(instances) = world.get::<MeshMaterials>(entity) else {
+            return Err(Skip::NoMaterials);
+        };
+        let material = *instances.0.first().ok_or(Skip::NoMaterials)?;
+        let surface = self
+            .surface(world, mirror, material)
+            .ok_or(Skip::NoMaterials)?;
+        if surface.blended {
+            return Err(Skip::Glass);
+        }
+        let sections: Vec<_> = mesh
+            .mesh_sections
+            .iter()
+            .filter(|s| {
+                s.index_count > 0
+                    && u64::from(s.first_index) + u64::from(s.index_count)
+                        <= u64::from(indices.count)
+            })
+            .collect();
+        if sections.is_empty() {
+            return Err(Skip::Unloaded);
+        }
+        let opaque = surface.flags & RAY_INSTANCE_MASKED == 0;
+        let (center, radius) = world_sphere(world_matrix, mesh.bounds_local);
+        Ok(Traced {
+            key: BlasKey::Skinned {
+                entity: entity_bits(entity),
+                geometry: mesh.geometry_key.0,
+                sections: sections
+                    .iter()
+                    .map(|s| (s.first_index, s.index_count, opaque))
+                    .collect(),
+            },
+            rows: sections
+                .iter()
+                .map(|s| RayInstance {
+                    first_index: indices.offset + s.first_index,
+                    base_vertex: skin.mesh_vertex,
+                    flags: RAY_INSTANCE_SKINNED | surface.flags,
+                    material: row_of(material),
+                    base_color: surface.base_color,
+                    emissive: surface.emissive,
+                    transmission: [0.0; 3],
+                    skinned_vertex: skin.cache_vertex,
+                })
+                .collect(),
+            materials: vec![material; sections.len()],
+            world: world_matrix,
+            movable: true,
+            proxy: None,
+            slot: None,
+            source_hint: (
+                Source::Skinned {
+                    first_index: indices.offset,
+                },
+                sections.iter().map(|s| u64::from(s.index_count / 3)).sum(),
+            ),
+            center,
+            radius,
+            bounds_local: mesh.bounds_local,
+            culled: false,
+            skinned: true,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -578,15 +924,7 @@ impl WorldRayScene {
         link: &ComponentOwner,
         owner: Entity,
     ) -> Result<Traced, Skip> {
-        if !link.is_enabled() || !world.is_alive(owner) {
-            return Err(Skip::Disabled);
-        }
-        if world
-            .get::<Visibility>(owner)
-            .is_some_and(|visibility| !visibility.visible)
-        {
-            return Err(Skip::Hidden);
-        }
+        let world_matrix = Self::placed(world, link, owner)?;
         if mesh.geometry_key == MeshGeometryKey::NONE || mesh.indices.is_empty() {
             return Err(Skip::Unloaded);
         }
@@ -604,8 +942,6 @@ impl WorldRayScene {
         let Some(instances) = world.get::<MeshMaterials>(entity) else {
             return Err(Skip::NoMaterials);
         };
-        let world_matrix = pulsar_scene_model::hierarchy_transform::world_matrix_of(world, owner)
-            .ok_or(Skip::Disabled)?;
         // The traced sections: each with its material instance and surface.
         let mut sections = Vec::new();
         for section in StaticMeshDraw::of(mesh).sections {
@@ -636,7 +972,8 @@ impl WorldRayScene {
                 material: row_of(material),
                 base_color: surface.base_color,
                 emissive: surface.emissive,
-                transmission: [0.0; 4],
+                transmission: [0.0; 3],
+                skinned_vertex: 0,
             };
         let lookup = match self.vg.as_mut() {
             Some(vg) => vg.lookup((vertices.offset, vertices.count)),
@@ -708,6 +1045,7 @@ impl WorldRayScene {
                 ),
             ),
         };
+        let (center, radius) = world_sphere(world_matrix, mesh.bounds_local);
         Ok(Traced {
             key,
             rows,
@@ -717,6 +1055,11 @@ impl WorldRayScene {
             proxy,
             slot: None,
             source_hint,
+            center,
+            radius,
+            bounds_local: mesh.bounds_local,
+            culled: false,
+            skinned: false,
         })
     }
 
@@ -735,9 +1078,11 @@ impl WorldRayScene {
             return;
         };
         traced.world = matrix;
+        (traced.center, traced.radius) = world_sphere(matrix, traced.bounds_local);
         if let Some(slot) = traced.slot {
             self.instances[slot].transform = tlas_transform(matrix, self.origin);
         }
+        self.cull(entity);
     }
 
     /// The traced rows' colours from the surfaces (texture means arrived).
@@ -801,7 +1146,8 @@ impl WorldRayScene {
                                 .iter()
                                 .map(|&(first, count, opaque)| BlasSegment {
                                     geometry: BlasGeometry {
-                                        revision: 0,
+                                        positions_revision: 0,
+                                        topology_revision: 0,
                                         vertices: &vertex_pool.buffer,
                                         first_vertex: vertices.offset,
                                         vertex_count: vertices.count,
@@ -817,7 +1163,7 @@ impl WorldRayScene {
                                 })
                                 .collect();
                         self.blas
-                            .build_segments(blas.id, encoder, segments)
+                            .build(blas.id, encoder, segments, helio_core::Movability::Static)
                             .map_err(|e| e.to_string())
                     }
                     _ => Err("the mesh pools are not registered".into()),
@@ -825,12 +1171,13 @@ impl WorldRayScene {
                 (BlasKey::Proxy { opaque, .. }, Source::Proxy(range)) => match proxies {
                     Some((vertices, indices)) => self
                         .blas
-                        .build_segments(
+                        .build(
                             blas.id,
                             encoder,
                             vec![BlasSegment {
                                 geometry: BlasGeometry {
-                                    revision: 0,
+                                    positions_revision: 0,
+                                    topology_revision: 0,
                                     vertices,
                                     first_vertex: range.first_vertex,
                                     vertex_count: range.vertex_count,
@@ -841,6 +1188,7 @@ impl WorldRayScene {
                                 },
                                 opaque: *opaque,
                             }],
+                            helio_core::Movability::Static,
                         )
                         .map_err(|e| e.to_string()),
                     None => Err("the proxy pool is missing".into()),
@@ -853,6 +1201,98 @@ impl WorldRayScene {
                     blas.state = BlasState::Failed;
                     tracing::warn!(
                         "Meshes: a ray-tracing BLAS could not be built ({error}); its meshes are not traced"
+                    );
+                }
+            }
+            budget = budget.saturating_sub(blas.triangles);
+            built_any = true;
+        }
+    }
+
+    /// Build or refit the skinned instances' BLASes whose pose the skin cache
+    /// changed, up to the frame's triangle budget: nearest first, an instance
+    /// that waited counting as nearer by its frames waited (none waits for
+    /// ever). The rest keep last frame's BLAS. An unchanged pose costs
+    /// nothing.
+    fn refit_skinned(
+        &mut self,
+        store: &SceneGpuStore,
+        skins: &SkinCache,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        if self.skinned.is_empty() {
+            return;
+        }
+        let Some(index_pool) = store.resolve_buffer_handle(helio_mesh_api::MESH_INDICES.key())
+        else {
+            return;
+        };
+        let eye = self.eye;
+        let mut due: Vec<(f64, Entity, BlasKey)> = Vec::new();
+        for entity in &self.skinned {
+            let (Some(Ok(traced)), Some(skin)) = (
+                self.entries.get(entity).map(|e| &e.state),
+                skins.instance(*entity),
+            ) else {
+                continue;
+            };
+            let Some(blas) = self.blases.get(&traced.key) else {
+                continue;
+            };
+            let current = blas.state == BlasState::Built && blas.revision == skin.revision;
+            if current || blas.state == BlasState::Failed {
+                continue;
+            }
+            let priority = traced.center.distance(eye) / f64::from(1 + blas.waited);
+            due.push((priority, *entity, traced.key.clone()));
+        }
+        due.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut budget = self.settings.skinned_refit_triangles;
+        let mut built_any = false;
+        for (_, entity, key) in due {
+            let skin = skins.instance(entity).expect("held above");
+            let Some(blas) = self.blases.get_mut(&key) else {
+                continue;
+            };
+            if built_any && blas.triangles > budget {
+                blas.waited = blas.waited.saturating_add(1);
+                continue;
+            }
+            let (BlasKey::Skinned { sections, .. }, Source::Skinned { first_index }) =
+                (&key, blas.source)
+            else {
+                continue;
+            };
+            let segments = sections
+                .iter()
+                .map(|&(first, count, opaque)| BlasSegment {
+                    geometry: BlasGeometry {
+                        positions_revision: skin.revision,
+                        topology_revision: 0,
+                        vertices: skins.buffer(),
+                        first_vertex: skin.cache_vertex,
+                        vertex_count: skin.vertex_count,
+                        vertex_stride: std::mem::size_of::<helio_mesh_api::SkinnedVertex>() as u64,
+                        indices: Some(&index_pool.buffer),
+                        first_index: first_index + first,
+                        index_count: count,
+                    },
+                    opaque,
+                })
+                .collect();
+            match self
+                .blas
+                .build(blas.id, encoder, segments, helio_core::Movability::Dynamic)
+            {
+                Ok(_) => {
+                    blas.state = BlasState::Built;
+                    blas.revision = skin.revision;
+                    blas.waited = 0;
+                }
+                Err(error) => {
+                    blas.state = BlasState::Failed;
+                    tracing::warn!(
+                        "Meshes: a skinned mesh's BLAS could not be built ({error}); it is not traced"
                     );
                 }
             }
@@ -887,8 +1327,12 @@ impl WorldRayScene {
                 transform: tlas_transform(traced.world, self.origin),
                 custom_data: 0,
             });
-            // The shadow casters' masks: static 1, movable 2.
-            self.masks.push(if traced.movable { 2 } else { 1 });
+            // The casters' masks rays select by (the frame's ray masks).
+            self.masks.push(if traced.movable {
+                MASK_MOVABLE
+            } else {
+                MASK_STATIC
+            });
             self.rows_dirty = true;
         }
     }
@@ -1007,10 +1451,13 @@ impl WorldRayScene {
             traced: self.slots.len(),
             rows: self.rows.len(),
             blases: self.blases.len(),
+            // Skinned BLASes of culled instances stay queued.
             queued: self
                 .blases
-                .values()
-                .filter(|b| b.state == BlasState::Queued)
+                .iter()
+                .filter(|(key, b)| {
+                    b.state == BlasState::Queued && !matches!(key, BlasKey::Skinned { .. })
+                })
                 .count(),
             failed: self
                 .blases
@@ -1062,6 +1509,25 @@ fn chain_of(world: &World, owner: Entity) -> Vec<Entity> {
         at = world.get::<Parent>(parent).map(|p| p.0);
     }
     chain
+}
+
+/// A mesh's world bounding sphere: its local sphere (`[x, y, z, r]`) through
+/// `matrix`, the radius by the largest axis scale.
+fn world_sphere(matrix: DMat4, local: [f32; 4]) -> (DVec3, f64) {
+    let [x, y, z, r] = local.map(f64::from);
+    let center = matrix.transform_point3(DVec3::new(x, y, z));
+    let scale = matrix
+        .x_axis
+        .truncate()
+        .length()
+        .max(matrix.y_axis.truncate().length())
+        .max(matrix.z_axis.truncate().length());
+    (center, r.max(0.0) * scale)
+}
+
+/// An entity as a key's bits (index and generation).
+fn entity_bits(entity: Entity) -> u64 {
+    (u64::from(entity.generation()) << 32) | u64::from(entity.index())
 }
 
 /// Row-major 3x4 TLAS transform of `matrix`, relative to `origin`.

@@ -41,8 +41,8 @@ use std::collections::HashMap;
 /// class `>= BIN_COUNT - 1`. Each bin runs its own pipeline (the template for
 /// that class).
 pub const BIN_COUNT: u32 = 16;
-/// Words per `static_objects` row (252 bytes).
-pub const OBJECT_ROW_WORDS: u32 = 63;
+/// Words per `static_objects` row (240 bytes).
+pub const OBJECT_ROW_WORDS: u32 = 60;
 /// Workgroups per dispatch row of the shade dispatches (`vg_bin.wgsl`).
 pub const SHADE_ROW_GROUPS: u32 = 32768;
 /// Marks "no VG pixel" in the vis payload and per-pixel material rows.
@@ -156,7 +156,11 @@ pub mod shader_source {
     pub fn shade_program(decode: &str) -> String {
         let gbuffer = GBUFFER_WGSL.replace("\r\n", "\n");
         // Globals (the camera is the prelude's).
-        let declarations = between(&gbuffer, "struct Globals {", "struct SkinVertex {");
+        let declarations = between(
+            &gbuffer,
+            "struct Globals {",
+            "// Whether the graph requested baked lighting",
+        );
         let velocity = between(&gbuffer, "fn compute_velocity", "@fragment");
         format!(
             "enable wgpu_binding_array;\n//!use helio_prelude\n{}\n//!use pbr_eval\n//!use material_row\n//!use material_surface\n{}\n{COMMON_WGSL}\n{decode}\n{declarations}\n{SHADE_WGSL}\n{velocity}",
@@ -228,7 +232,7 @@ pub mod shader_source {
 ///   (`R32Float`); optional.
 /// - `visible`: [`VgVisibleCluster`] rows (the cull's `visible_clusters`); `asset_quant`: `vg_asset_quant`;
 ///   `instances`: `GpuVgInstance` rows; `pages`: the page pool as `u32`s.
-/// - `static_objects`: the scene join's 252-byte rows. A cluster's material
+/// - `static_objects`: the scene join's 240-byte rows. A cluster's material
 ///   section index (`GpuCluster::material_slot`) selects row
 ///   `GpuVgInstance::object_row + section`: the join emits an instance's
 ///   sections as consecutive rows sharing one transform.
@@ -1545,7 +1549,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<VgVisibleCluster>(), 8);
         assert_eq!(std::mem::size_of::<VgShadeParams>(), 32);
         assert_eq!(std::mem::size_of::<VgShadeGlobals>(), 64);
-        assert_eq!(OBJECT_ROW_WORDS * 4, 252);
+        assert_eq!(OBJECT_ROW_WORDS * 4, 240);
     }
 
     // ── CPU reference of the barycentric reconstruction ──────────────────

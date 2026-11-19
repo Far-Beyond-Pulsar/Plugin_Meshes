@@ -127,6 +127,9 @@ impl Transmittance {
             &[
                 helio_mats::MATERIAL_ROW_SNIPPET,
                 helio_light_api::SHADOW_ATLAS_SNIPPET,
+                helio_mesh_api::DRAW_ROWS_SNIPPET,
+                helio_mesh_api::SKINNING_SNIPPET,
+                helio_frame_api::rays::stream::SNIPPET,
             ],
         );
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

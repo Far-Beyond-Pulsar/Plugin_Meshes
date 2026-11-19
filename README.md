@@ -31,6 +31,7 @@ draw phases and api crates.
 | `helio-pass-indirect-dispatch` | `feature/indirect-dispatch/` | Helio pass: builds the meshes' indirect draw arguments |
 | `helio-pass-object-batch` | `feature/object-batch/` | GPU-driven sort/group/batch pipeline: turns SceneDB's StaticObjectComponent rows into instances/draw_calls/material_class_ranges with zero per-frame CPU involvement |
 | `helio-pass-occlusion-cull` | `feature/occlusion-cull/` | Helio pass: Hi-Z occlusion culling of the mesh instances |
+| `helio-pass-mesh-rays` | `feature/rays/` | Helio pass: the meshes' tracer of ray streams (`helio_frame_api::rays::stream`): ray queries against the frame's TLAS, nearest hits with their surfaces and occlusion |
 | `helio-pass-shadow` | `feature/shadow/` | Helio pass: the meshes' shadow-caster drawer (opens the shadow-caster phase) |
 | `helio-pass-shadow-dirty` | `feature/shadow-dirty/` | Helio pass: which shadow views need redrawing |
 | `helio-pass-transparent` | `feature/transparent/` | Helio pass: the meshes' transparent drawer |
@@ -59,6 +60,24 @@ draw phases and api crates.
 - **Its standalone hosts also compose**: `helio-light-api, helio-light-host, helio-pass-billboard, helio-pass-deferred-light, helio-pass-hlfs, helio-pass-light-cull` (lights); `helio-mats, helio-pass-materials` (materials) (demos and GPU tests
   draw a whole scene; the plugin itself does not depend on these).
 
+## Skinning and the ray-traced scene
+
+- **The skin cache** (`meshes_component::skin_cache`): one compute pass
+  blends each posed skinned instance's palette into its vertices once a frame
+  (`helio_mesh_api::SKIN_CACHE`, its instance table `SKIN_CACHE_ROWS`), only
+  for the instances whose palette changed, keeping the previous positions for
+  motion vectors. Every drawer (G-buffer, shadow casters and transmittance,
+  forward, transparent, selection) reads it through `//!use mesh_skinning`;
+  no drawer blends a palette.
+- **The ray-traced scene**: the engine world's (`meshes_component::ray_scene`,
+  static and skinned meshes; a skinned instance has its own deforming BLAS,
+  refit from the cache under a triangle budget a frame) and the standalone
+  hosts' (`helio_mesh_host::ray_tracing`, `StaticObjectComponent` rows). Both
+  cull instances by distance and angle and report the acceleration
+  structures' stats; the settings are `helio_pass_mesh_rays::RAY_TRACING`
+  (`ray_tracing` in a project). Helio's `rendering.md`, "As built: Skinned
+  meshes, foliage and culling in the TLAS", has the design.
+
 ## Building and testing
 
 Like [Plugin_Physics](https://github.com/Far-Beyond-Pulsar/Plugin_Physics), this plugin's crates are members
@@ -69,8 +88,8 @@ only inside a Pulsar-Native checkout:
 ```bash
 git clone --recursive https://github.com/Far-Beyond-Pulsar/Pulsar-Native
 cd Pulsar-Native
-cargo check -p helio-android-demos -p helio-mesh-api -p helio-asset-compat -p meshes_component -p meshes_editor -p meshes_plugin --features meshes_plugin/editor -p meshes-examples -p helio-pass-forward-lit -p helio-pass-gbuffer -p helio-pass-indirect-dispatch -p helio-pass-object-batch -p helio-pass-occlusion-cull -p helio-pass-shadow -p helio-pass-shadow-dirty -p helio-pass-transparent -p helio-pass-vg -p helio-pass-vg-bvh -p helio-pass-vg-cull -p helio-pass-vg-dense -p helio-pass-vg-raster -p helio-pass-vg-shade -p helio-mesh-host -p helio-snapshot -p helio-vg-build -p helio-vg-format -p helio-vg-stream -p helio-web-demos --tests
-cargo test -p helio-mesh-api -p meshes_component -p meshes_plugin -p helio-pass-forward-lit -p helio-pass-gbuffer -p helio-pass-indirect-dispatch -p helio-pass-object-batch -p helio-pass-occlusion-cull -p helio-pass-shadow -p helio-pass-shadow-dirty -p helio-pass-transparent -p helio-pass-vg -p helio-pass-vg-bvh -p helio-pass-vg-cull -p helio-pass-vg-dense -p helio-pass-vg-raster -p helio-pass-vg-shade
+cargo check -p helio-android-demos -p helio-mesh-api -p helio-asset-compat -p meshes_component -p meshes_editor -p meshes_plugin --features meshes_plugin/editor -p meshes-examples -p helio-pass-forward-lit -p helio-pass-gbuffer -p helio-pass-indirect-dispatch -p helio-pass-object-batch -p helio-pass-occlusion-cull -p helio-pass-mesh-rays -p helio-pass-shadow -p helio-pass-shadow-dirty -p helio-pass-transparent -p helio-pass-vg -p helio-pass-vg-bvh -p helio-pass-vg-cull -p helio-pass-vg-dense -p helio-pass-vg-raster -p helio-pass-vg-shade -p helio-mesh-host -p helio-snapshot -p helio-vg-build -p helio-vg-format -p helio-vg-stream -p helio-web-demos --tests
+cargo test -p helio-mesh-api -p meshes_component -p meshes_plugin -p helio-pass-forward-lit -p helio-pass-gbuffer -p helio-pass-indirect-dispatch -p helio-pass-object-batch -p helio-pass-occlusion-cull -p helio-pass-mesh-rays -p helio-pass-shadow -p helio-pass-shadow-dirty -p helio-pass-transparent -p helio-pass-vg -p helio-pass-vg-bvh -p helio-pass-vg-cull -p helio-pass-vg-dense -p helio-pass-vg-raster -p helio-pass-vg-shade
 ```
 
 Suites that render real frames need a GPU; CI leaves them out by name

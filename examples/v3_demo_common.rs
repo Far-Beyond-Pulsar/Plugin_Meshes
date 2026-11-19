@@ -130,11 +130,19 @@ impl SceneRays {
     }
 
     /// Publishes this frame's to `renderer`: after flushing SceneDB, before
-    /// rendering.
-    pub fn publish(&mut self, world: &World, renderer: &mut Renderer) {
+    /// rendering `camera`'s frame (its eye culls what rays see, as the
+    /// engine's projection does: the project-default `RAY_TRACING`
+    /// criterion).
+    pub fn publish(&mut self, world: &World, renderer: &mut Renderer, camera: &helio::Camera) {
         let Some(projection) = &mut self.projection else {
             return;
         };
+        // Its acceleration-structure stats go to the renderer's frame stats.
+        projection.set_stats(renderer.frame_stats().clone());
+        projection.set_view(
+            Some(camera.eye),
+            helio_pass_mesh_rays::RayTracingSettings::default(),
+        );
         match projection.prepare(world) {
             Ok(_) => projection.publish(renderer),
             Err(error) => {

@@ -16,6 +16,8 @@ editor = ["dep:meshes_editor", "dep:ui_level_editor", "dep:ui_common", "dep:ui",
 [dependencies]
 # The meshes' api, re-exported for hosts and tests (`helio_mesh_api`).
 helio-mesh-api = { workspace = true }
+# The ray-traced scene's settings group (`helio_pass_mesh_rays::RAY_TRACING`).
+helio-pass-mesh-rays = { workspace = true }
 # The plugin gate and the registrations' collection.
 pulsar_plugins = { workspace = true }
 # The plugin's crates.

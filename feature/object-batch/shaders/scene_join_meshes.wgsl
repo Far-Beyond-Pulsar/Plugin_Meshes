@@ -46,25 +46,23 @@ struct MeshJoinUniforms {
 @group(0) @binding(7) var<storage, read> mesh_bounds: array<array<f32, 4>>;
 @group(0) @binding(8) var<storage, read> mesh_flags: array<u32>;
 @group(0) @binding(9) var<storage, read> section_handles: array<Handle>;
-@group(0) @binding(10) var<storage, read> skin_handles: array<Handle>;
-@group(0) @binding(11) var<storage, read> palette_handles: array<Handle>;
-@group(0) @binding(12) var<storage, read> sections: array<Section>;
-@group(0) @binding(13) var<storage, read_write> objects_out: array<StaticObjectRow>;
-@group(0) @binding(14) var<storage, read> material_keys: array<MaterialKey>;
+@group(0) @binding(10) var<storage, read> sections: array<Section>;
+@group(0) @binding(11) var<storage, read_write> objects_out: array<StaticObjectRow>;
+@group(0) @binding(12) var<storage, read> material_keys: array<MaterialKey>;
 // Per-owner heads then per-instance links of a linked list of the placed
 // instances each owner carries (`head + 1`, 0 ends the list), rebuilt by every
 // full join so a later moved-owner join can find an owner's instances.
-@group(0) @binding(15) var<storage, read_write> link: array<atomic<u32>>;
+@group(0) @binding(13) var<storage, read_write> link: array<atomic<u32>>;
 // Per object: the space (coordinate-space slot of its nearest rigid frame) it is
 // drawn in, zero for the world. Absent (a zero-length buffer) outside a hierarchy.
-@group(0) @binding(16) var<storage, read> spaces: array<u32>;
+@group(0) @binding(14) var<storage, read> spaces: array<u32>;
 // Per mesh instance: its slots' rows of the materials' table
 // (`MeshMaterialRows`), a range of `material_rows`.
-@group(0) @binding(17) var<storage, read> material_row_handles: array<Handle>;
-@group(0) @binding(18) var<storage, read> material_rows: array<u32>;
+@group(0) @binding(15) var<storage, read> material_row_handles: array<Handle>;
+@group(0) @binding(16) var<storage, read> material_rows: array<u32>;
 // Per object row: its owner entity plus one (`helio_mesh_api::STATIC_OBJECT_OWNERS`),
 // zero for a row nothing placed.
-@group(0) @binding(19) var<storage, read_write> owners_out: array<u32>;
+@group(0) @binding(17) var<storage, read_write> owners_out: array<u32>;
 
 /// The owner entity of instance `row` when the instance should draw, else
 /// `NO_OWNER`: attached and enabled, its recorded owner generation matches
@@ -114,10 +112,6 @@ fn cs_join_meshes(@builtin(global_invocation_id) gid: vec3<u32>) {
     let draws = section_handles[row];
     let vertices = vertex_handles[row];
     let indices = index_handles[row];
-    var skin = Handle(0u, 0u);
-    var palette = Handle(0u, 0u);
-    if row < arrayLength(&skin_handles) { skin = skin_handles[row]; }
-    if row < arrayLength(&palette_handles) { palette = palette_handles[row]; }
     if draws.count == 0u || vertices.count == 0u || indices.count == 0u {
         return;
     }
@@ -226,9 +220,6 @@ fn cs_join_meshes(@builtin(global_invocation_id) gid: vec3<u32>) {
             key.graph_hash_lo,
             key.graph_hash_hi,
             flags,
-            skin.offset - vertices.offset,
-            palette.offset,
-            palette.count / 2u,
             s,
         );
         if slot < arrayLength(&owners_out) {

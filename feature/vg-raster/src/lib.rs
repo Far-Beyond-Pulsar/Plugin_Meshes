@@ -47,7 +47,7 @@
 //! x`, guarded `< first + n`); the software `{first, count}` is read from the
 //! cull's `state` ranges (`sw_meta_offset_words`). Clusters are read straight
 //! from the `helio-vg-stream` page pool: a `cluster_slot` is `pool_slot << 11 |
-//! local`, and the `static_objects` rows are the 252-byte scene-join rows.
+//! local`, and the `static_objects` rows are the 240-byte scene-join rows.
 //!
 //! # Position stream encoding
 //!

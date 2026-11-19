@@ -1,3 +1,6 @@
+//!use mesh_draw_rows
+//!use mesh_skinning
+//!use frame_ray_stream
 //!use shadow_atlas
 //!use material_row
 // Coloured shadow transmittance — translucent casters (stained glass).
@@ -15,22 +18,6 @@
 // depth atlas, so a window deep inside a wall does not tint the courtyard in
 // front of it.
 
-struct GpuInstanceData {
-    transform:    mat4x4<f32>,
-    normal_mat_0: vec4<f32>,
-    normal_mat_1: vec4<f32>,
-    normal_mat_2: vec4<f32>,
-    bounds:       vec4<f32>,
-    prev_model:   mat4x4<f32>,
-    mesh_id:      u32,
-    material_id:  u32,
-    flags:        u32,
-    _pad:         u32,
-    skin_vertex_offset: u32,
-    bone_palette_offset: u32,
-    bone_palette_count: u32,
-    _skin_pad: u32,
-}
 
 struct FaceIndex {
     value: u32,
@@ -57,9 +44,9 @@ struct TransmitParams {
 @group(1) @binding(2) var<uniform>       params:        TransmitParams;
 
 @group(0) @binding(4) var<storage,read> dirty:array<u32>;
-struct SkinVertex { joints: vec4<u32>, weights: vec4<f32> }
-@group(0) @binding(5) var<storage, read> skin_vertices: array<SkinVertex>;
-@group(0) @binding(6) var<storage, read> bone_palette: array<mat4x4<f32>>;
+// The skin cache (`helio_mesh_api::SKIN_CACHE`, `mesh_skinning`).
+@group(0) @binding(5) var<storage, read> skin_cache: array<SkinnedVertex>;
+@group(0) @binding(6) var<storage, read> skin_cache_rows: array<SkinCacheRow>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -75,19 +62,7 @@ fn vs_main(
     @location(15)            slot:     u32,
 ) -> VsOut {
     let inst  = instances[slot];
-    var local_position = position;
-    if inst.bone_palette_count > 0u {
-        let skin = skin_vertices[vertex_index + inst.skin_vertex_offset];
-        var blended = mat4x4<f32>(vec4f(0.0), vec4f(0.0), vec4f(0.0), vec4f(0.0));
-        var total = 0.0;
-        for (var i = 0u; i < 4u; i = i + 1u) {
-            if skin.weights[i] > 0.0 && skin.joints[i] < inst.bone_palette_count {
-                blended += bone_palette[inst.bone_palette_offset + skin.joints[i]] * skin.weights[i];
-                total += skin.weights[i];
-            }
-        }
-        if total > 0.00001 { local_position = (blended * (1.0 / total) * vec4f(position, 1.0)).xyz; }
-    }
+    let local_position = mesh_skinned_position(inst, position, vertex_index);
     let space = coordinate_spaces[(inst.flags >> 8u) & 0xFFu];
     let world = space * (inst.transform * vec4<f32>(local_position, 1.0));
     var out: VsOut;

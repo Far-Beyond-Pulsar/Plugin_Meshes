@@ -259,6 +259,8 @@ impl ForwardLitPass {
                 graph_wgsl,
                 &[
                     helio_mesh_api::DRAW_ROWS_SNIPPET,
+                    helio_mesh_api::SKINNING_SNIPPET,
+                    helio_frame_api::rays::stream::SNIPPET,
                     helio_light_api::LIGHT_LIST_SNIPPET,
                     helio_light_api::LIGHT_FORWARD_SNIPPET,
                 ],
@@ -376,8 +378,8 @@ impl RenderPass for ForwardLitPass {
             helio_mesh_api::MESH_VERTICES.name(),
             helio_mats::MATERIALS.name(),
             helio_light_api::SCENE_LIGHTS.name(),
-            helio_mesh_api::BONE_PALETTE.name(),
-            helio_mesh_api::SKIN_VERTICES.name(),
+            helio_mesh_api::SKIN_CACHE_ROWS.name(),
+            helio_mesh_api::SKIN_CACHE.name(),
         ];
         LIST
     }
@@ -548,12 +550,12 @@ impl RenderPass for ForwardLitPass {
         let lights_ptr = lights_handle.map_or(usize::MAX, |handle| handle.epoch as usize);
         let skin_buffer = ctx
             .scene_buffers
-            .get(helio_mesh_api::SKIN_VERTICES.key())
+            .get(helio_mesh_api::SKIN_CACHE.key())
             .map(|h| h.buffer.clone())
             .unwrap_or_else(|| batch.instances.clone());
         let palette_buffer = ctx
             .scene_buffers
-            .get(helio_mesh_api::BONE_PALETTE.key())
+            .get(helio_mesh_api::SKIN_CACHE_ROWS.key())
             .map(|h| h.buffer.clone())
             .unwrap_or_else(|| batch.instances.clone());
 

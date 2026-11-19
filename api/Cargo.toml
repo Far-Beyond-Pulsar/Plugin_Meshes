@@ -28,4 +28,6 @@ pulsar_reflection = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The WGSL row tests: the frame's unit-vector packing the skin cache rows use.
+helio-frame-api = { workspace = true }
 naga = { version = "30", features = ["wgsl-in"] }

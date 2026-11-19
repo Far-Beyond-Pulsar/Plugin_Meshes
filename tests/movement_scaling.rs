@@ -458,9 +458,9 @@ fn the_moved_rows_path_matches_a_full_rebuild() {
         &bench.queue,
         &objects,
         &materials,
-        (objects.size() / 252) as u32,
+        (objects.size() / 240) as u32,
     );
-    const STRIDE: usize = 224;
+    const STRIDE: usize = 208;
     let by_position = |instances: &[u8]| {
         (0..live)
             .map(|i| {

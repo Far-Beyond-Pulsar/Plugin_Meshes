@@ -106,7 +106,7 @@ const GENERATION_ROW_BYTES: u64 = 4;
 const HANDLE_ROW_BYTES: u64 = 8;
 const OVERRIDE_ROW_BYTES: u64 = 8;
 /// A scene-join `static_objects` row (`StaticObjectComponent`).
-const OBJECT_ROW_BYTES: u64 = 252;
+const OBJECT_ROW_BYTES: u64 = std::mem::size_of::<helio_mesh_api::StaticObjectRow>() as u64;
 const WORKGROUP: u32 = 64;
 
 const _: () = assert!(std::mem::size_of::<VgAssetReadyRow>() as u64 == VG_ASSET_READY_ROW_BYTES);

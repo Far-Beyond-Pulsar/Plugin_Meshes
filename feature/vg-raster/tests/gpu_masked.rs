@@ -335,7 +335,7 @@ fn run(g: &Gpu, s: &Scene, alpha: &Alpha, software: bool) -> Run {
         object_row: 0,
     };
     // static_objects row 0: transform identity; word 2 = material slot 0.
-    let mut object = [0f32; 63];
+    let mut object = [0f32; 60];
     object[4..20].copy_from_slice(&Mat4::IDENTITY.to_cols_array());
     // Indirect: 4 opaque HW draws (empty) + the masked draw at offset 64.
     let mut hw = [DrawIndirectArgs::default(); 5];

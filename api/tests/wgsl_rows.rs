@@ -6,11 +6,13 @@ use helio_mesh_api::*;
 
 /// The storage `mesh_ray_surface` reads, as a reader declares it.
 const RAY_SURFACE_READER: &str = "//!use mesh_ray_surface
+//!use frame_ray_stream
 @group(0) @binding(0) var<storage, read> instances: array<RayInstance>;
 @group(0) @binding(1) var<storage, read> vertices: array<u32>;
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
 @group(0) @binding(3) var<storage, read> proxy_vertices: array<f32>;
 @group(0) @binding(4) var<storage, read> proxy_indices: array<u32>;
+@group(0) @binding(5) var<storage, read> skinned_vertices: array<u32>;
 @compute @workgroup_size(1)
 fn main() {
     let t = ray_triangle(instances[0], 0u);
@@ -30,7 +32,11 @@ fn main() {
 ";
 
 fn module(reader: &str, snippet: helio_core::shader::ShaderSnippet) -> naga::Module {
-    let source = helio_core::shader::resolve_with(reader, &[snippet]);
+    modules(reader, &[snippet])
+}
+
+fn modules(reader: &str, snippets: &[helio_core::shader::ShaderSnippet]) -> naga::Module {
+    let source = helio_core::shader::resolve_with(reader, snippets);
     let module = naga::front::wgsl::parse_str(&source)
         .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
     naga::valid::Validator::new(
@@ -69,7 +75,10 @@ fn constant(module: &naga::Module, name: &str) -> u32 {
 
 #[test]
 fn the_ray_surface_rows_match_the_rust() {
-    let m = module(RAY_SURFACE_READER, RAY_SURFACE_SNIPPET);
+    let m = modules(
+        RAY_SURFACE_READER,
+        &[RAY_SURFACE_SNIPPET, helio_frame_api::rays::stream::SNIPPET],
+    );
     assert_eq!(
         struct_size(&m, "RayInstance"),
         std::mem::size_of::<RayInstance>()
@@ -87,6 +96,45 @@ fn the_ray_surface_rows_match_the_rust() {
     assert_eq!(
         u64::from(constant(&m, "RAY_PROXY_FLOATS")) * 4,
         RAY_PROXY_VERTEX_BYTES
+    );
+    assert_eq!(constant(&m, "RAY_INSTANCE_SKINNED"), RAY_INSTANCE_SKINNED);
+    assert_eq!(
+        constant(&m, "SKINNED_VERTEX_WORDS") as usize * 4,
+        std::mem::size_of::<SkinnedVertex>()
+    );
+}
+
+/// The storage `mesh_skinning` reads, as a drawer declares it.
+const SKINNING_READER: &str = "//!use mesh_draw_rows
+//!use mesh_skinning
+//!use frame_ray_stream
+@group(0) @binding(0) var<storage, read> instances: array<GpuInstanceData>;
+@group(0) @binding(1) var<storage, read> skin_cache: array<SkinnedVertex>;
+@group(0) @binding(2) var<storage, read> skin_cache_rows: array<SkinCacheRow>;
+@compute @workgroup_size(1)
+fn main() {
+    let v = mesh_skinned_vertex(instances[0], 0u, vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
+    _ = v.previous + mesh_skinned_position(instances[0], vec3<f32>(0.0), 0u);
+}
+";
+
+#[test]
+fn the_skin_cache_rows_match_the_rust() {
+    let m = modules(
+        SKINNING_READER,
+        &[
+            DRAW_ROWS_SNIPPET,
+            SKINNING_SNIPPET,
+            helio_frame_api::rays::stream::SNIPPET,
+        ],
+    );
+    assert_eq!(
+        struct_size(&m, "SkinnedVertex"),
+        std::mem::size_of::<SkinnedVertex>()
+    );
+    assert_eq!(
+        struct_size(&m, "SkinCacheRow"),
+        std::mem::size_of::<SkinCacheRow>()
     );
 }
 
@@ -130,6 +178,7 @@ fn the_draw_rows_match_the_rust() {
         ),
         ("INSTANCE_FLAG_ALWAYS_VISIBLE", INSTANCE_FLAG_ALWAYS_VISIBLE),
         ("INSTANCE_FLAG_MOVABLE", INSTANCE_FLAG_MOVABLE),
+        ("INSTANCE_FLAG_SKINNED", INSTANCE_FLAG_SKINNED),
         (
             "INSTANCE_FLAG_CLASSIC_SUPPRESSED",
             INSTANCE_FLAG_CLASSIC_SUPPRESSED,

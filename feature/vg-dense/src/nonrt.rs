@@ -46,7 +46,7 @@ pub struct DenseNonRtInputs<'a> {
     pub asset_quant: &'a wgpu::Buffer,
     /// `GpuVgInstance` rows.
     pub vg_instances: &'a wgpu::Buffer,
-    /// The scene join's `static_objects` rows (252 B).
+    /// The scene join's `static_objects` rows (240 B).
     pub objects: &'a wgpu::Buffer,
 }
 

@@ -42,6 +42,8 @@ fn every_material_class_composes_into_every_mesh_program() {
     let rows = helio_pass_gbuffer::GBUFFER_PROGRAM_SNIPPETS;
     let lit = [
         helio_mesh_api::DRAW_ROWS_SNIPPET,
+        helio_mesh_api::SKINNING_SNIPPET,
+        helio_frame_api::rays::stream::SNIPPET,
         helio_light_api::LIGHT_LIST_SNIPPET,
         helio_light_api::LIGHT_FORWARD_SNIPPET,
     ];
@@ -97,7 +99,9 @@ fn depth_cutouts_validate_for_native_and_expanded_texture_bindings() {
             geometry,
             &[
                 helio_light_api::SHADOW_ATLAS_SNIPPET,
+                helio_mesh_api::DRAW_ROWS_SNIPPET,
                 helio_mesh_api::SKINNING_SNIPPET,
+                helio_frame_api::rays::stream::SNIPPET,
             ],
         );
         let native = helio_core::shader::resolve_with(

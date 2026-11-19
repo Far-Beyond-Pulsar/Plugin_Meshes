@@ -11,15 +11,15 @@
 //   vg_asset_quant helio-vg-stream `vg_asset_quant` (origin.xyz, step.w) by asset slot
 //   vg_visible     helio-pass-vg-cull `visible_clusters`: {instance, cluster_slot}
 //   vg_instances   `vg_instances` (GpuVgInstance rows)
-//   vg_objects     scene join `static_objects` (252-byte / 63-word rows)
+//   vg_objects     scene join `static_objects` (240-byte / 60-word rows)
 
 
 // Row of the scene join's `static_objects` buffer (`StaticObjectComponent`,
-// 63 words = 252 bytes). Only the transform (words 4..20) is read here.
+// 60 words = 240 bytes). Only the transform (words 4..20) is read here.
 struct VgObject {
     head:      array<u32, 4>,
     transform: array<array<f32, 4>, 4>,
-    rest:      array<u32, 43>,
+    rest:      array<u32, 40>,
 }
 
 struct VgRasterParams {

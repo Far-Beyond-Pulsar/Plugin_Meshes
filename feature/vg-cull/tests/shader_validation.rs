@@ -53,8 +53,8 @@ fn shader_struct_sizes_match_the_uploads() {
     assert_eq!(size("VgBvhNode"), 32);
     assert_eq!(size("VgBvhHeader"), 128);
     assert_eq!(size("PhaseParams"), 16);
-    // Scene-join row: 63 words, only `transform` (word 4) is read.
-    assert_eq!(size("StaticObjectRow"), 252);
+    // Scene-join row: 60 words, only `transform` (word 4) is read.
+    assert_eq!(size("StaticObjectRow"), 240);
 }
 
 #[test]

@@ -108,7 +108,7 @@ impl Default for VgCullConfig {
 /// | field | element |
 /// |---|---|
 /// | `instances` (`"vg_instances"`) | [`helio_vg_format::GpuVgInstance`] |
-/// | `objects` (`"static_objects"`) | 252-byte (63-word) scene-join row; `transform` is read via `GpuVgInstance::object_row` |
+/// | `objects` (`"static_objects"`) | 240-byte (60-word) scene-join row; `transform` is read via `GpuVgInstance::object_row` |
 /// | `stream` | the eight `helio-vg-stream` buffers (pool, residency, nodes, group refs, headers, bases, quant, feedback); the cull appends page requests / touches straight into `feedback` |
 /// | `tree` | `helio-pass-vg-bvh` outputs (`vg_gcbvh_*`); `None` for a run that seeds its instances ([`VgCullConfig::seeds_instances`]) |
 /// | `dense_mask` | one `u32` per 16x16 tile, row-major, nonzero = dense last frame |

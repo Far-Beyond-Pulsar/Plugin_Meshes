@@ -40,6 +40,7 @@ helio-pass-forward-lit = { workspace = true }
 helio-pass-gbuffer = { workspace = true }
 helio-pass-object-batch = { workspace = true }
 helio-pass-occlusion-cull = { workspace = true }
+helio-pass-mesh-rays = { workspace = true }
 helio-pass-shadow = { workspace = true }
 helio-pass-transparent = { workspace = true }
 helio-pass-vg = { workspace = true }
@@ -80,7 +81,7 @@ bytemuck = { workspace = true, features = ["derive"] }
 # Content-addressed asset identity (Pulsar-Native#632): xxh3-128 over decoded
 # mesh bytes for PMSH v1 backfill / non-native source paths, and as the
 # fallback path->id hash in `MeshAssetPath::content_id` (see mesh_cache.rs).
-twox-hash = { workspace = true }
+twox-hash = { workspace = true, features = ["xxhash3_64"] }
 profiling = { workspace = true }
 
 [dev-dependencies]

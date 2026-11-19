@@ -281,6 +281,7 @@ impl SelectionMaskPass {
             &[
                 helio_mesh_api::DRAW_ROWS_SNIPPET,
                 helio_mesh_api::SKINNING_SNIPPET,
+                helio_frame_api::rays::stream::SNIPPET,
             ],
         );
         let pipeline = helio_core::shader::create_render_pipeline(
@@ -354,8 +355,8 @@ impl RenderPass for SelectionMaskPass {
         const KEYS: &[&str] = &[
             helio_mesh_api::MESH_VERTICES.name(),
             helio_mesh_api::MESH_INDICES.name(),
-            helio_mesh_api::SKIN_VERTICES.name(),
-            helio_mesh_api::BONE_PALETTE.name(),
+            helio_mesh_api::SKIN_CACHE.name(),
+            helio_mesh_api::SKIN_CACHE_ROWS.name(),
         ];
         KEYS
     }
@@ -437,11 +438,11 @@ impl RenderPass for SelectionMaskPass {
             .map_or(&self.identity, |spaces| spaces.coordinate_spaces);
         let skin = ctx
             .scene_buffers
-            .get(helio_mesh_api::SKIN_VERTICES.key())
+            .get(helio_mesh_api::SKIN_CACHE.key())
             .map_or(&self.identity, |handle| &handle.buffer);
         let palette = ctx
             .scene_buffers
-            .get(helio_mesh_api::BONE_PALETTE.key())
+            .get(helio_mesh_api::SKIN_CACHE_ROWS.key())
             .map_or(&self.identity, |handle| &handle.buffer);
         let bound = vec![
             ctx.camera.clone(),

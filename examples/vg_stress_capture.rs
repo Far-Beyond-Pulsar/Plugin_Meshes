@@ -1273,7 +1273,7 @@ impl Capture {
             }
         }
         super::v3_demo_common::flush_scene_db(&s.scene_db, &s.queue);
-        s.rays.publish(&s.scene_db.world, &mut s.renderer);
+        s.rays.publish(&s.scene_db.world, &mut s.renderer, &camera);
         let view = &self.target.as_ref().expect("capture target").1;
         let started = std::time::Instant::now();
         if let Err(e) = s.renderer.render(&camera, view) {

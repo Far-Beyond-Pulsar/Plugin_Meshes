@@ -1,4 +1,7 @@
 //!use shadow_atlas
+//!use mesh_draw_rows
+//!use mesh_skinning
+//!use frame_ray_stream
 const MAX_FACES: u32 = 1536u;
 
 /// Minimum world-space displacement (metres) that counts as a "move".
@@ -7,33 +10,8 @@ const MOVE_EPSILON: f32 = 0.0001;
 
 // ── Structs ───────────────────────────────────────────────────────────────────
 
-/// Must match GpuInstanceData in libhelio/src/instance.rs (224 bytes).
-/// We only need the transform and bounds, so we read partial data.
-struct GpuInstance {
-    transform:    mat4x4f,  // model matrix, 64 bytes
-    normal_mat_0: vec4f,    // 16 bytes
-    normal_mat_1: vec4f,    // 16 bytes
-    normal_mat_2: vec4f,    // 16 bytes
-    bounds:       vec4f,    // xyz = world-space bounding sphere center, w = radius
-    prev_model:   mat4x4f,  // 64 bytes
-    mesh_id:      u32,
-    material_id:  u32,
-    flags:        u32,
-    object_row: u32,
-    skin_vertex_offset: u32,
-    bone_palette_offset: u32,
-    bone_palette_count: u32,
-    _skin_pad: u32,
-}
 
-/// Matches wgpu DrawIndexedIndirect layout (20 bytes).
-struct DrawIndexedIndirect {
-    index_count:    u32,
-    instance_count: u32,
-    first_index:    u32,
-    base_vertex:    i32,
-    first_instance: u32,
-}
+// `DrawIndexedIndirect` and `GpuInstanceData`: `mesh_draw_rows`.
 
 struct ShadowDirtyUniforms {
     /// Number of active shadow faces (= shadow_count from SceneResources).
@@ -46,7 +24,7 @@ struct ShadowDirtyUniforms {
 
 // ── Bindings ──────────────────────────────────────────────────────────────────
 
-@group(0) @binding(0) var<storage, read>         instances:      array<GpuInstance>;
+@group(0) @binding(0) var<storage, read>         instances:      array<GpuInstanceData>;
 @group(0) @binding(1) var<storage, read>          movable_draws:  array<DrawIndexedIndirect>;
 @group(0) @binding(2) var<storage, read_write>    prev_positions: array<Previous>;
 @group(0) @binding(3) var<storage, read>          shadow_matrices:    array<LightMatrix>;
@@ -74,6 +52,13 @@ struct Previous { bounds:vec4f, hash:vec4u }
 /// then rows 4-7; bit `row * 8 + column`, rows counted up from the bottom of
 /// clip space). `ShadowPass` clears a face's words once it has redrawn it.
 @group(0) @binding(11) var<storage, read_write> face_pages: array<atomic<u32>>;
+
+/// The skin cache's instance table (`helio_mesh_api::SKIN_CACHE_ROWS`): a
+/// skinned caster's `pose` changes when its silhouette does, which its
+/// transform alone does not show. (`skin_cache` is declared for the
+/// `mesh_skinning` snippet; this pass reads no vertex of it.)
+@group(0) @binding(14) var<storage, read> skin_cache_rows: array<SkinCacheRow>;
+@group(0) @binding(15) var<storage, read> skin_cache: array<SkinnedVertex>;
 
 /// Live draw calls in `movable_draws` this frame.
 fn movable_count()->u32 { return batch_counts[2]; }
@@ -237,6 +222,9 @@ fn detect(@builtin(global_invocation_id) gid:vec3u) {
         let space=spaces[(inst.flags>>8u)&255u];
         hash=hash_matrix(space*inst.transform,hash);
         hash=(hash^inst.flags^inst.mesh_id^inst.material_id)*16777619u;
+        if (inst.flags&INSTANCE_FLAG_SKINNED)!=0u && inst.mesh_id<arrayLength(&skin_cache_rows) {
+            hash=(hash^skin_cache_rows[inst.mesh_id].pose)*16777619u;
+        }
         // Bounds are world-relative to the instance's coordinate space.
         let center=(space*vec4f(inst.bounds.xyz,1)).xyz;
         let radius=inst.bounds.w*max(length(space[0].xyz),max(length(space[1].xyz),length(space[2].xyz)));

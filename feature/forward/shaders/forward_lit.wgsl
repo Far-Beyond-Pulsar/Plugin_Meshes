@@ -6,6 +6,8 @@
 //!use material_row
 //!use material_surface
 //!use mesh_draw_rows
+//!use mesh_skinning
+//!use frame_ray_stream
 
 // The meshes' forward program: lit in its drawer by the lights' forward
 // function. A material class's template (its surface function) is composed
@@ -38,9 +40,9 @@ struct Globals {
 @group(0) @binding(4) var<storage, read>    lights:            array<GpuLight>;
 @group(0) @binding(5) var<storage, read>    tile_light_lists:  array<u32>;
 @group(0) @binding(6) var<storage, read>    tile_light_counts: array<u32>;
-struct SkinVertex { joints: vec4<u32>, weights: vec4<f32> }
-@group(0) @binding(9) var<storage, read> skin_vertices: array<SkinVertex>;
-@group(0) @binding(10) var<storage, read> bone_palette: array<mat4x4<f32>>;
+// The skin cache (`helio_mesh_api::SKIN_CACHE`, `mesh_skinning`).
+@group(0) @binding(9) var<storage, read> skin_cache: array<SkinnedVertex>;
+@group(0) @binding(10) var<storage, read> skin_cache_rows: array<SkinCacheRow>;
 
 @group(1) @binding(0) var<storage, read>    materials:         array<GpuMaterial>;
 @group(1) @binding(1) var<storage, read>    material_textures: array<MaterialTextureData>;
@@ -74,27 +76,12 @@ fn decode_snorm8x4(packed: u32) -> vec3<f32> {
 @vertex
 fn vs_main(v: Vertex, @location(15) slot: u32, @builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     let inst       = instance_data[compacted_indices[slot]];
-    var local_position = v.position;
-    var local_normal = decode_snorm8x4(v.normal);
-    var local_tangent = decode_snorm8x4(v.tangent);
-    if inst.bone_palette_count > 0u {
-        let skin = skin_vertices[vertex_index + inst.skin_vertex_offset];
-        var blended = mat4x4<f32>(vec4f(0.0), vec4f(0.0), vec4f(0.0), vec4f(0.0));
-        var total = 0.0;
-        for (var i = 0u; i < 4u; i = i + 1u) {
-            if skin.weights[i] > 0.0 && skin.joints[i] < inst.bone_palette_count {
-                blended += bone_palette[inst.bone_palette_offset + skin.joints[i]] * skin.weights[i];
-                total += skin.weights[i];
-            }
-        }
-        if total > 0.00001 {
-            blended = blended * (1.0 / total);
-            local_position = (blended * vec4f(v.position, 1.0)).xyz;
-            let skin_normal = mat3x3<f32>(blended[0].xyz, blended[1].xyz, blended[2].xyz);
-            local_normal = normalize(skin_normal * local_normal);
-            local_tangent = normalize(skin_normal * local_tangent);
-        }
-    }
+    // A skinned instance's vertex from the skin cache; a rigid one's as it is.
+    let skinned = mesh_skinned_vertex(
+        inst, vertex_index, v.position, decode_snorm8x4(v.normal), decode_snorm8x4(v.tangent));
+    let local_position = skinned.position;
+    let local_normal = skinned.normal;
+    let local_tangent = skinned.tangent;
     let world_pos  = inst.transform * vec4<f32>(local_position, 1.0);
 
     let normal_mat = mat3x3<f32>(

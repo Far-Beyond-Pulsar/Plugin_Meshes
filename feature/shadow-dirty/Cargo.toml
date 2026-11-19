@@ -7,5 +7,10 @@ edition = "2021"
 helio-light-api = { workspace = true }
 helio-mesh-api = { workspace = true }
 helio-core = { workspace = true }
+helio-frame-api = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+# The shader validation test.
+naga = { version = "30.0.0", features = ["wgsl-in"] }
