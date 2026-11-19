@@ -59,8 +59,6 @@ use crate::{storage, StreamBindings};
 pub const MAX_HIT_PROGRAMS: usize = 64;
 /// `u32` words of a bin (`mesh_hit_bins.wgsl`).
 const BIN_WORDS: u64 = 8;
-/// Where the list starts, in words (`HIT_LIST`).
-const LIST_WORD: u64 = MAX_HIT_PROGRAMS as u64 * BIN_WORDS;
 /// The bin-table entry of a dispatch over every row of the stream.
 const UNBINNED: u32 = u32::MAX;
 /// The bin table's stride (the dynamic uniform offset alignment).
@@ -213,6 +211,7 @@ impl HitPrograms {
         let mut entries: Vec<_> = (0..12).map(|b| storage(b, b != 3)).collect();
         entries.push(uniform(12, false));
         entries.push(uniform(13, true));
+        entries.push(storage(14, true));
         let surface_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Mesh hit surfaces"),
             entries: &entries,
@@ -238,6 +237,8 @@ impl HitPrograms {
                 storage(4, false),
                 storage(5, false),
                 uniform(6, false),
+                storage(7, false),
+                storage(8, false),
             ],
         });
         let bins_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -363,6 +364,20 @@ impl HitPrograms {
         None
     }
 
+    /// Programs compiling and programs whose compile failed.
+    pub fn compile_states(&self) -> (usize, usize) {
+        let compiling = self
+            .compiling
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pending = compiling.values().filter(|job| job.is_pending()).count();
+        let failed = compiling
+            .values()
+            .filter(|job| job.failed().is_some())
+            .count();
+        (pending, failed)
+    }
+
     /// Blocks until every program asked for so far has compiled: for tests
     /// and offline tools, never a frame.
     pub fn wait(&self) {
@@ -418,9 +433,13 @@ pub struct MeshHitSurfaces {
     /// This frame's bins: bin 0 the table-driven program, bin `k` the
     /// program of its entry.
     bins: Vec<ProgramPipelines>,
-    /// The ranks and the bins with their list, for a stream of the
-    /// capacity they were made for.
+    /// The ranks and the list, for a stream of the capacity they were made
+    /// for.
     binning: Option<(u64, wgpu::Buffer, wgpu::Buffer)>,
+    /// Each bin's indirect arguments, list offset and count.
+    bin_args: wgpu::Buffer,
+    /// The count pass's counter a bin.
+    counters: wgpu::Buffer,
     inputs: Option<(Vec<wgpu::Buffer>, wgpu::BindGroup, wgpu::BindGroup)>,
     materials: Option<((wgpu::Buffer, wgpu::Buffer, u64), wgpu::BindGroup)>,
 }
@@ -449,6 +468,18 @@ impl MeshHitSurfaces {
             remap_rows: vec![0],
             bins: vec![table],
             binning: None,
+            bin_args: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Mesh hit bins"),
+                size: MAX_HIT_PROGRAMS as u64 * BIN_WORDS * 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+                mapped_at_creation: false,
+            }),
+            counters: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Mesh hit bin counters"),
+                size: MAX_HIT_PROGRAMS as u64 * 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }),
             inputs: None,
             materials: None,
         }
@@ -514,22 +545,19 @@ impl MeshHitSurfaces {
         };
         let capacity = (stream.rays.size() / 32).max(1);
         if self.binning.as_ref().is_none_or(|(c, _, _)| *c != capacity) {
-            let buffer = |label, words: u64| {
+            let buffer = |label| {
                 device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(label),
-                    size: words * 4,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+                    size: capacity * 4,
+                    usage: wgpu::BufferUsages::STORAGE,
                     mapped_at_creation: false,
                 })
             };
-            self.binning = Some((
-                capacity,
-                buffer("Mesh hit ranks", capacity),
-                buffer("Mesh hit bins", LIST_WORD + capacity),
-            ));
+            self.binning = Some((capacity, buffer("Mesh hit ranks"), buffer("Mesh hit list")));
             self.inputs = None;
         }
-        let (_, ranks, bins) = self.binning.as_ref().expect("made above");
+        let (_, ranks, list) = self.binning.as_ref().expect("made above");
+        let bins = &self.bin_args;
         let programs = &self.programs;
         let (proxy_vertices, proxy_indices) = scene
             .proxies
@@ -549,6 +577,7 @@ impl MeshHitSurfaces {
             skinned,
             bins,
             &self.remap,
+            list,
         ];
         if !self.inputs.as_ref().is_some_and(|(key, _, _)| {
             key.len() == buffers.len() && key.iter().zip(&buffers).all(|(a, b)| a == *b)
@@ -572,6 +601,10 @@ impl MeshHitSurfaces {
                     offset: 0,
                     size: wgpu::BufferSize::new(16),
                 }),
+            });
+            entries.push(wgpu::BindGroupEntry {
+                binding: 14,
+                resource: list.as_entire_binding(),
             });
             let surface_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Mesh hit surfaces"),
@@ -609,6 +642,14 @@ impl MeshHitSurfaces {
                     wgpu::BindGroupEntry {
                         binding: 6,
                         resource: self.frame.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: self.counters.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: list.as_entire_binding(),
                     },
                 ],
             });
@@ -797,6 +838,15 @@ impl RenderPass for MeshHitSurfacePass {
             ctx.registry
                 .get::<MaterialTextureBindings<'_>>(helio_mats::material_textures()),
         );
+        if let Some(stats) = ctx.stats() {
+            let (pending, failed) = self.surfaces.programs.compile_states();
+            stats.add_named(
+                helio_mesh_api::stats::HIT_BINS,
+                self.surfaces.bin_count() as u64,
+            );
+            stats.add_named(helio_mesh_api::stats::HIT_PROGRAMS_PENDING, pending as u64);
+            stats.add_named(helio_mesh_api::stats::HIT_PROGRAMS_FAILED, failed as u64);
+        }
         let mut cmds = ctx.graphics_cmds();
         self.surfaces.record(
             ctx.device,
@@ -889,8 +939,7 @@ mod shader_tests {
         }
         // The shaders' bin layout is this file's.
         assert!(text.contains(&format!("const HIT_BINS: u32 = {MAX_HIT_PROGRAMS}u;")));
-        assert!(text.contains(&format!("const HIT_LIST: u32 = {LIST_WORD}u;")));
+
         assert!(HIT_PROGRAM.contains(&format!("const HIT_BINS: u32 = {MAX_HIT_PROGRAMS}u;")));
-        assert!(HIT_PROGRAM.contains(&format!("const HIT_LIST: u32 = {LIST_WORD}u;")));
     }
 }

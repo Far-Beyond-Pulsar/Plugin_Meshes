@@ -130,6 +130,21 @@ pub struct ProxyLodCpu {
     pub cluster_pages: Vec<u32>,
     /// Distinct asset-local pages the clusters live in (sorted).
     pub pages: Vec<u32>,
+    /// The triangles by material section, in order: `indices` holds each
+    /// section's triangles together (`GpuCluster::material_slot` of their
+    /// clusters), so a tracer gives each section its material as a BLAS
+    /// segment.
+    pub sections: Vec<ProxySection>,
+}
+
+/// A material section of a proxy LOD: the asset's material slot (its mesh's
+/// section ordinal, `GpuCluster::material_slot`) and its triangles' range of
+/// [`ProxyLodCpu::indices`] (first index, index count).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProxySection {
+    pub material: u32,
+    pub first_index: u32,
+    pub index_count: u32,
 }
 
 impl ProxyLodCpu {
@@ -244,6 +259,8 @@ struct LodBuild {
     prim_map: Vec<u32>,
     clusters: Vec<u32>,
     cluster_pages: Vec<u32>,
+    /// Per proxy cluster: its material slot.
+    cluster_materials: Vec<u32>,
     /// Lattice coordinate and uv0 bits (zero without UVs) to vertex.
     weld: HashMap<([u32; 3], u32), u32>,
     over_cap: bool,
@@ -280,6 +297,7 @@ pub fn build_proxy(
             prim_map: Vec::new(),
             clusters: Vec::new(),
             cluster_pages: Vec::new(),
+            cluster_materials: Vec::new(),
             weld: HashMap::new(),
             over_cap: false,
         })
@@ -322,6 +340,7 @@ pub fn build_proxy(
                 let ordinal = lod.clusters.len() as u32;
                 lod.clusters.push(local);
                 lod.cluster_pages.push(page_id);
+                lod.cluster_materials.push(c.material_slot());
                 // Weld on the lattice coordinate: shared vertices decode
                 // bit-identically across clusters (asset-global lattice).
                 // With UVs, on the uv too: a seam's two sides stay apart.
@@ -357,6 +376,7 @@ pub fn build_proxy(
                     lod.prim_map = Vec::new();
                     lod.clusters = Vec::new();
                     lod.cluster_pages = Vec::new();
+                    lod.cluster_materials = Vec::new();
                     lod.weld = HashMap::new();
                 }
             }
@@ -386,15 +406,18 @@ pub fn build_proxy(
         let mut pages = lod.cluster_pages.clone();
         pages.sort_unstable();
         pages.dedup();
+        let (indices, prim_map, sections) =
+            by_section(&lod.indices, &lod.prim_map, &lod.cluster_materials);
         out.push(ProxyLodCpu {
             error: lod.error,
             positions: lod.positions,
             uvs: lod.uvs,
-            indices: lod.indices,
-            prim_map: lod.prim_map,
+            indices,
+            prim_map,
             clusters: lod.clusters,
             cluster_pages: lod.cluster_pages,
             pages,
+            sections,
         });
     }
     if out.is_empty() {
@@ -408,6 +431,36 @@ pub fn build_proxy(
         source_triangles,
         skipped_levels: skipped,
     })
+}
+
+/// `indices` and `prim_map` with each material section's triangles
+/// together (in the order of their sections' slots, stable within one), and
+/// the sections.
+fn by_section(
+    indices: &[u32],
+    prim_map: &[u32],
+    cluster_materials: &[u32],
+) -> (Vec<u32>, Vec<u32>, Vec<ProxySection>) {
+    let material = |t: usize| cluster_materials[(prim_map[t] >> VIS_TRI_BITS) as usize];
+    let mut order: Vec<usize> = (0..prim_map.len()).collect();
+    order.sort_by_key(|&t| material(t));
+    let mut sorted = Vec::with_capacity(indices.len());
+    let mut map = Vec::with_capacity(prim_map.len());
+    let mut sections: Vec<ProxySection> = Vec::new();
+    for t in order {
+        let m = material(t);
+        match sections.last_mut() {
+            Some(section) if section.material == m => section.index_count += 3,
+            _ => sections.push(ProxySection {
+                material: m,
+                first_index: sorted.len() as u32,
+                index_count: 3,
+            }),
+        }
+        sorted.extend_from_slice(&indices[3 * t..3 * t + 3]);
+        map.push(prim_map[t]);
+    }
+    (sorted, map, sections)
 }
 
 fn bounding_sphere(points: &[[f32; 3]]) -> [f32; 4] {

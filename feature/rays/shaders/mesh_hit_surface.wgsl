@@ -37,8 +37,9 @@ enable wgpu_binding_array;
 @group(0) @binding(9) var<storage, read> proxy_indices: array<u32>;
 @group(0) @binding(10) var<storage, read> skinned_vertices: array<u32>;
 // The bins (`mesh_hit_bins.wgsl`: each bin's dispatch, list offset and
-// count, then the list of ray rows).
+// count) and the list of ray rows, bin by bin.
 @group(0) @binding(11) var<storage, read> bins: array<u32>;
+@group(0) @binding(14) var<storage, read> list: array<u32>;
 // x: the tracer's id, y: the frame.
 @group(0) @binding(12) var<uniform> hit_frame: vec4<u32>;
 // x: the bin this dispatch shades, `HIT_UNBINNED` for every row of the
@@ -53,10 +54,9 @@ enable wgpu_binding_array;
 @group(1) @binding(3) var scene_textures: binding_array<texture_2d<f32>, 256>;
 
 // `mesh_hit_bins.wgsl`'s layout: a bin's words (dispatch x, y, z, list
-// offset, count, three unused), the bins, then the list.
+// offset, count, three unused).
 const HIT_BIN_WORDS: u32 = 8u;
 const HIT_BINS: u32 = 64u;
-const HIT_LIST: u32 = 512u;
 const HIT_UNBINNED: u32 = 0xffffffffu;
 // A bin's workgroups wrap at this many along x (`mesh_hit_bins.wgsl`).
 const HIT_ROW_GROUPS: u32 = 32768u;
@@ -129,7 +129,7 @@ fn mesh_hit_surface(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invo
     } else {
         let at = hit_bin.x * HIT_BIN_WORDS;
         if local >= bins[at + 4u] { return; }
-        i = bins[HIT_LIST + bins[at + 3u] + local];
+        i = list[bins[at + 3u] + local];
     }
     let hit = hits[i];
     let row = scene_hit_payload(hit);

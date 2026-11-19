@@ -2022,6 +2022,290 @@ fn diffuse_streams_skip_what_a_diffuse_consumer_does_not_read() {
     }
 }
 
+// ── Cost ────────────────────────────────────────────────────────────────────
+
+/// The surface passes' GPU cost on GI's stream shape (174,080 rays, all
+/// hitting meshes: 81 textured, normal-mapped quads), by programs present
+/// (1: the table-driven program alone, no binning; 2, 8, 64 and 72, past the
+/// bound) and detail, as median GPU milliseconds over 64 pipelined frames
+/// (timestamps around the surface passes alone, after four untimed runs of
+/// them in the same frame so the GPU runs at a loaded frame's clocks). Run
+/// by hand on a quiet GPU:
+/// `mesh_rays_gpu hit_surface_cost --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement; run by hand"]
+fn hit_surface_cost() {
+    let instance = wgpu::Instance::new(helio_core::wgpu_instance_descriptor());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }))
+    .unwrap();
+    let wanted = wgpu::Features::EXPERIMENTAL_RAY_QUERY
+        | wgpu::Features::TIMESTAMP_QUERY
+        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    if !adapter.features().contains(wanted) {
+        eprintln!("skipped: no ray queries or timestamps");
+        return;
+    }
+    let limits = adapter.limits();
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: wanted | (adapter.features() & helio_mats::BINDLESS_MATERIAL_FEATURES),
+        required_limits: wgpu::Limits {
+            max_buffer_size: limits.max_buffer_size.min(u32::MAX as u64),
+            ..limits
+        },
+        experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+        ..Default::default()
+    }))
+    .unwrap();
+    let gpu = Gpu {
+        device: Arc::new(device),
+        queue,
+    };
+    let gpu = &gpu;
+    // 81 quads in a 9x9 grid at z = 0, each 2 m, 2.5 m apart.
+    let texture = mip_texture(gpu, 256, |mip| {
+        [255 - (mip * 30) as u8, 128, (mip * 30) as u8, 255]
+    });
+    let mut row = material(0.6, 0.0);
+    row.tex_base_color = 0;
+    row.tex_normal = 0;
+    row.tex_roughness = 0;
+    row.flags = helio_mats::FLAG_HAS_NORMAL_MAP;
+    // Graph programs: each sets its own colour (registered sources).
+    let graph = |k: u32| RayProgram {
+        template: 0,
+        graph_hash: 0x6a5e_0000_0000_0000 | u64::from(k),
+    };
+    for k in 1..80 {
+        helio_mats::register_graph_source(
+            graph(k).graph_hash,
+            format!(
+                "/*RADIANT_GRAPH_DECLARATIONS*/\n\n/*RADIANT_GRAPH_BODY*/\nalbedo = vec4<f32>({:.3}, 0.5, 0.5, 1.0) * albedo;\n",
+                k as f32 / 80.0
+            ),
+        );
+    }
+    let lcg = std::cell::RefCell::new(Lcg(5));
+    let rays: Vec<SceneRay> = (0..174_080)
+        .map(|_| {
+            let mut lcg = lcg.borrow_mut();
+            let (qx, qy) = ((lcg.next() * 9.0) as u32, (lcg.next() * 9.0) as u32);
+            let x = qx as f32 * 2.5 + lcg.next() * 1.8 - 0.9;
+            let y = qy as f32 * 2.5 + lcg.next() * 1.8 - 0.9;
+            ray(
+                Vec3::new(x, y, 3.0),
+                Vec3::new(lcg.next() * 0.2 - 0.1, lcg.next() * 0.2 - 0.1, -1.0),
+                10.0,
+                0.004,
+                MASK_ALL,
+            )
+        })
+        .collect();
+    let stream = Stream::new("mesh_rays_cost", RayClass::Nearest, rays.len() as u32);
+    let buffers = StreamBuffers::new(&gpu.device, &stream);
+    gpu.queue
+        .write_buffer(&buffers.rays, 0, bytemuck::cast_slice(&rays));
+    buffers.set_count(&gpu.queue, rays.len() as u32);
+    let bindings = StreamBindings {
+        header: &buffers.header,
+        rays: &buffers.rays,
+        hits: &buffers.hits,
+        surfaces: buffers.surfaces.as_ref(),
+    };
+    let programs_shared = Arc::new(HitPrograms::new(&gpu.device, &gpu.queue, None));
+    println!("| Programs present | Bins | Diffuse (ms) | Full (ms) |");
+    println!("|---|---|---|---|");
+    // (what, programs present, program of quad k, a program present that
+    // no quad uses).
+    let clear_coat = RayProgram {
+        template: helio_mats::MATERIAL_CLASS_CLEAR_COAT,
+        graph_hash: 0,
+    };
+    type ProgramOf = Box<dyn Fn(u32) -> RayProgram>;
+    let cases: Vec<(&str, u32, ProgramOf, Option<RayProgram>)> = vec![
+        ("table alone", 1, Box::new(|_| RayProgram::TABLE), None),
+        (
+            "table, binned (an unused program)",
+            2,
+            Box::new(|_| RayProgram::TABLE),
+            Some(graph(1)),
+        ),
+        (
+            "table + clear coat",
+            2,
+            Box::new(move |k| {
+                if k % 2 == 0 {
+                    RayProgram::TABLE
+                } else {
+                    clear_coat
+                }
+            }),
+            None,
+        ),
+        (
+            "2 programs",
+            2,
+            Box::new(move |k| {
+                if k % 2 == 0 {
+                    RayProgram::TABLE
+                } else {
+                    graph(1)
+                }
+            }),
+            None,
+        ),
+        (
+            "8 programs",
+            8,
+            Box::new(move |k| {
+                if k % 8 == 0 {
+                    RayProgram::TABLE
+                } else {
+                    graph(k % 8)
+                }
+            }),
+            None,
+        ),
+        (
+            "64 programs",
+            64,
+            Box::new(move |k| {
+                if k % 64 == 0 {
+                    RayProgram::TABLE
+                } else {
+                    graph(k % 64)
+                }
+            }),
+            None,
+        ),
+        (
+            "72 programs (8 past the bound)",
+            72,
+            Box::new(move |k| {
+                if k % 72 == 0 {
+                    RayProgram::TABLE
+                } else {
+                    graph(k % 72)
+                }
+            }),
+            None,
+        ),
+    ];
+    for (what, present, program_of, unused) in cases {
+        let quads: Vec<Quad> = (0..81u32)
+            .map(|k| Quad {
+                base_color: Vec3::splat(0.8),
+                program: program_of(k),
+                transform: Mat4::from_translation(Vec3::new(
+                    (k % 9) as f32 * 2.5,
+                    (k / 9) as f32 * 2.5,
+                    0.0,
+                )),
+                ..Default::default()
+            })
+            .collect();
+        let mut scene = scene(gpu, &quads);
+        if let Some(program) = unused {
+            scene.programs.index(program);
+        }
+        let table = textured_materials(gpu, &quad_rows(&quads, &[row]), &texture);
+        // Trace once: the hits every surface frame reads.
+        let mut tracer =
+            MeshRayTracer::new(&gpu.device, &gpu.queue, RayClass::Nearest, MESHES).unwrap();
+        tracer.write_frame(1, |b, bytes| gpu.queue.write_buffer(b, 0, bytes));
+        let views = table.views(gpu);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        {
+            let mut cmds = helio_core::CommandRecorder::from_encoder(&mut encoder);
+            buffers.clear(&mut cmds);
+            tracer.record(
+                &gpu.device,
+                &mut cmds,
+                bindings,
+                Some(scene.rays()),
+                Some(table.bindings(&views)),
+            );
+        }
+        gpu.queue.submit([encoder.finish()]);
+        let mut row_out = Vec::new();
+        let mut bins = 0;
+        for detail in [SurfaceDetail::Diffuse, SurfaceDetail::Full] {
+            let mut surfaces =
+                MeshHitSurfaces::new(&gpu.device, programs_shared.clone(), detail, MESHES);
+            let write =
+                |b: &wgpu::Buffer, o: u64, bytes: &[u8]| gpu.queue.write_buffer(b, o, bytes);
+            surfaces.set_programs(&gpu.device, Some(&scene.programs), write);
+            programs_shared.wait();
+            surfaces.set_programs(&gpu.device, Some(&scene.programs), write);
+            surfaces.write_frame(1, |b, bytes| gpu.queue.write_buffer(b, 0, bytes));
+            bins = surfaces.bin_count();
+            const FRAMES: u32 = 64;
+            let queries = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: None,
+                ty: wgpu::QueryType::Timestamp,
+                count: FRAMES * 2,
+            });
+            for frame in 0..FRAMES + 8 {
+                let mut encoder = gpu.device.create_command_encoder(&Default::default());
+                let timed = frame >= 8;
+                // The same passes four times untimed first: the GPU kept
+                // busy, so its clocks are a loaded frame's, not an idle
+                // one's (a lone small dispatch a frame reads idle clocks).
+                for _ in 0..4 {
+                    let mut cmds = helio_core::CommandRecorder::from_encoder(&mut encoder);
+                    surfaces.record(
+                        &gpu.device,
+                        &mut cmds,
+                        bindings,
+                        Some(scene.hits()),
+                        Some(table.bindings(&views)),
+                    );
+                }
+                if timed {
+                    encoder.write_timestamp(&queries, (frame - 8) * 2);
+                }
+                {
+                    let mut cmds = helio_core::CommandRecorder::from_encoder(&mut encoder);
+                    surfaces.record(
+                        &gpu.device,
+                        &mut cmds,
+                        bindings,
+                        Some(scene.hits()),
+                        Some(table.bindings(&views)),
+                    );
+                }
+                if timed {
+                    encoder.write_timestamp(&queries, (frame - 8) * 2 + 1);
+                }
+                gpu.queue.submit([encoder.finish()]);
+            }
+            let resolve = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: u64::from(FRAMES) * 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            encoder.resolve_query_set(&queries, 0..FRAMES * 2, &resolve, 0);
+            gpu.queue.submit([encoder.finish()]);
+            let stamps = read::<u64>(gpu, &resolve);
+            let period = f64::from(gpu.queue.get_timestamp_period());
+            let mut ms: Vec<f64> = stamps
+                .chunks(2)
+                .map(|p| p[1].saturating_sub(p[0]) as f64 * period / 1e6)
+                .collect();
+            ms.sort_by(f64::total_cmp);
+            row_out.push(ms[ms.len() / 2]);
+        }
+        println!(
+            "| {what} ({present}) | {bins} | {:.3} | {:.3} |",
+            row_out[0], row_out[1]
+        );
+    }
+}
+
 // ── Coordinate spaces ───────────────────────────────────────────────────────
 
 /// Two quads at the same place in two coordinate spaces (`near_space` a
@@ -2266,18 +2550,44 @@ mod graph {
         MeshComponent::register_gpu_columns_growable(&store, 64, device);
         MaterialComponent::register_gpu_columns_growable(&store, 64, device);
         StaticObjectComponent::register_gpu_columns_growable(&store, 64, device);
-        scene_db
-            .world
-            .attach_gpu_mirror(pulsar_scenedb::gpu::GpuMirrorHandle::new(
-                Arc::new(store),
-                queue.clone(),
-            ));
+        // A texture store: the materials' table the drawers and the hit
+        // programs sample.
+        let textures = Arc::new(std::sync::RwLock::new(
+            pulsar_scenedb::gpu::TextureStore::new(16),
+        ));
+        scene_db.world.attach_gpu_mirror(
+            pulsar_scenedb::gpu::GpuMirrorHandle::new(Arc::new(store), queue.clone())
+                .with_texture_store(textures)
+                .unwrap(),
+        );
         scene_db
     }
 
     /// An axis-aligned box of half extent `half` at `centre` in `colour`,
     /// roughness 0.8.
     fn spawn_box(world: &mut pulsar_scenedb::World, centre: Vec3, half: Vec3, colour: [f32; 3]) {
+        spawn_box_with(
+            world,
+            centre,
+            half,
+            MaterialComponent::from(helio_mats::MaterialRow::new(
+                [colour[0], colour[1], colour[2], 1.0],
+                0.8,
+                0.0,
+                [0.0; 3],
+                0.0,
+            )),
+        );
+    }
+
+    /// An axis-aligned box of half extent `half` at `centre` drawn with
+    /// `row`: each face UV 0..1, its tangent along +u.
+    fn spawn_box_with(
+        world: &mut pulsar_scenedb::World,
+        centre: Vec3,
+        half: Vec3,
+        row: MaterialComponent,
+    ) {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         for axis in 0..3 {
@@ -2295,7 +2605,7 @@ mod graph {
                     vertices.push(helio_mesh_api::PackedVertex::from_components(
                         p.to_array(),
                         n.to_array(),
-                        [0.0; 2],
+                        [(a + 1.0) * 0.5, (b + 1.0) * 0.5],
                         u.to_array(),
                         1.0,
                     ));
@@ -2306,13 +2616,6 @@ mod graph {
         let mesh = world.spawn();
         world.insert(mesh, MeshComponent { vertices, indices });
         let material = world.spawn();
-        let row = MaterialComponent::from(helio_mats::MaterialRow::new(
-            [colour[0], colour[1], colour[2], 1.0],
-            0.8,
-            0.0,
-            [0.0; 3],
-            0.0,
-        ));
         world.insert(material, row);
         let store = world.gpu_mirror().cloned().unwrap();
         let vertex_range = MeshComponent::vertices_gpu_handle(store.store(), mesh.index()).unwrap();
@@ -2595,5 +2898,553 @@ mod graph {
             (all[1] - 999.5).abs() < 1e-2,
             "every object without an eye: {all:?}"
         );
+    }
+
+    // ── One surface, two encodings ─────────────────────────────────────────
+
+    /// The view the comparison renders.
+    const VIEW: u32 = 64;
+    /// The pixels it compares: every fourth, each with its four neighbours
+    /// (a sample counts only where all five meet the same section, clear of
+    /// silhouettes).
+    fn probe_pixels() -> Vec<[u32; 2]> {
+        let mut pixels = Vec::new();
+        for y in (4..VIEW - 4).step_by(4) {
+            for x in (4..VIEW - 4).step_by(4) {
+                for [dx, dy] in [[0i32, 0], [1, 0], [-1, 0], [0, 1], [0, -1]] {
+                    pixels.push([(x as i32 + dx) as u32, (y as i32 + dy) as u32]);
+                }
+            }
+        }
+        pixels
+    }
+
+    /// Camera rays through [`probe_pixels`] (a `Full` stream, each as wide
+    /// as its pixel), traced; then the G-buffer's surface at the same
+    /// pixels, decoded with the frame's `gbuffer_surface_at` and packed as a
+    /// hit's (`scene_surface_pack`), so both are read with one unpacker.
+    struct SurfaceProbe;
+
+    struct CameraRaysPass {
+        stream: Stream,
+        buffers: StreamBuffers,
+        writes: &'static [&'static str],
+    }
+
+    struct GBufferAtPixelsPass {
+        pipeline: wgpu::ComputePipeline,
+        layout: wgpu::BindGroupLayout,
+        pixels: wgpu::Buffer,
+        surfaces: wgpu::Buffer,
+    }
+
+    const GBUFFER_AT_PIXELS: &str = "//!use frame_ray_stream
+//!use frame_surface
+//!use frame_ray_surface
+@group(0) @binding(0) var albedo: texture_2d<f32>;
+@group(0) @binding(1) var normal: texture_2d<f32>;
+@group(0) @binding(2) var orm: texture_2d<f32>;
+@group(0) @binding(3) var emissive: texture_2d<f32>;
+@group(0) @binding(4) var sss: texture_2d<f32>;
+@group(0) @binding(5) var extra: texture_2d<f32>;
+@group(0) @binding(6) var<storage, read> pixels: array<vec2<u32>>;
+@group(0) @binding(7) var<storage, read_write> surfaces: array<SceneSurface>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= arrayLength(&pixels) { return; }
+    let dims = textureDimensions(albedo);
+    let p = vec2<i32>(pixels[id.x] * dims / vec2<u32>(64u));
+    let s = gbuffer_surface_at(GBufferSurfaceTexels(
+        textureLoad(albedo, p, 0), textureLoad(normal, p, 0), textureLoad(orm, p, 0),
+        textureLoad(emissive, p, 0), textureLoad(sss, p, 0), textureLoad(extra, p, 0)));
+    surfaces[id.x] = scene_surface_pack(s, s.normal);
+}
+";
+
+    /// What the deferred lighting reads the surface from: the G-buffer's
+    /// group (albedo, normal, ORM, emissive) and its SSS and extra targets.
+    const GBUFFER_SURFACE: [&str; 3] = [
+        helio_frame_api::gbuffer::GROUP,
+        helio_frame_api::gbuffer::SSS,
+        helio_frame_api::gbuffer::EXTRA,
+    ];
+
+    impl Feature for SurfaceProbe {
+        fn id(&self) -> &'static str {
+            "test.surface_probe"
+        }
+
+        fn register(&self, registrar: &mut FeatureRegistrar<'_>) {
+            registrar.node(
+                pass_node(
+                    "surface_probe",
+                    "Surface Probe",
+                    "Passes: Test",
+                    "Camera rays and the G-buffer at the same pixels.",
+                    |build| {
+                        let count = probe_pixels().len() as u32;
+                        let stream = Stream::new("mesh_rays_camera", RayClass::Nearest, count)
+                            .with_detail(SurfaceDetail::Full);
+                        let mut writes = vec![stream.header, stream.rays, stream.hits];
+                        writes.extend(stream.surfaces);
+                        build.graph.add_pass(Box::new(CameraRaysPass {
+                            buffers: StreamBuffers::new(build.env.device, &stream),
+                            writes: helio_frame_api::static_names(&writes),
+                            stream,
+                        }));
+                        stream::trace(build, &stream)?;
+                        let device = build.env.device;
+                        let texture = |binding| wgpu::BindGroupLayoutEntry {
+                            binding,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        };
+                        let buffer = |binding, read_only| wgpu::BindGroupLayoutEntry {
+                            binding,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        };
+                        let mut entries: Vec<_> = (0..6).map(texture).collect();
+                        entries.push(buffer(6, true));
+                        entries.push(buffer(7, false));
+                        let layout =
+                            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                                label: Some("gbuffer at pixels"),
+                                entries: &entries,
+                            });
+                        let pipeline_layout =
+                            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                                label: None,
+                                bind_group_layouts: &[Some(&layout)],
+                                immediate_size: 0,
+                            });
+                        let module = helio_core::shader::module_with(
+                            device,
+                            "gbuffer at pixels",
+                            GBUFFER_AT_PIXELS,
+                            &[
+                                helio_frame_api::rays::stream::SNIPPET,
+                                helio_frame_api::gbuffer::SURFACE_SNIPPET,
+                                helio_frame_api::rays::stream::SURFACE_SNIPPET,
+                            ],
+                        );
+                        let pipeline = helio_core::shader::create_compute_pipeline(
+                            device,
+                            wgpu::ComputePipelineDescriptor {
+                                label: Some("gbuffer at pixels"),
+                                layout: Some(&pipeline_layout),
+                                module: &module,
+                                entry_point: Some("main"),
+                                compilation_options: Default::default(),
+                                cache: None,
+                            },
+                        );
+                        let pixels: Vec<u32> = probe_pixels().into_iter().flatten().collect();
+                        let pixels = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("probe pixels"),
+                            contents: bytemuck::cast_slice(&pixels),
+                            usage: wgpu::BufferUsages::STORAGE,
+                        });
+                        let surfaces = device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("gbuffer surfaces at pixels"),
+                            size: u64::from(count) * 32,
+                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                            mapped_at_creation: false,
+                        });
+                        build.graph.add_pass(Box::new(GBufferAtPixelsPass {
+                            pipeline,
+                            layout,
+                            pixels,
+                            surfaces,
+                        }));
+                        Ok(())
+                    },
+                )
+                .once_per_frame()
+                .in_slot(Slot::Geometry, 50),
+            );
+        }
+    }
+
+    impl RenderPass for CameraRaysPass {
+        fn name(&self) -> &'static str {
+            "CameraRays"
+        }
+
+        fn writes(&self) -> &'static [&'static str] {
+            self.writes
+        }
+
+        fn prepare(&mut self, ctx: &PrepareContext) -> HelioResult<()> {
+            let camera = ctx.camera_data;
+            let inverse = Mat4::from_cols_array(&camera.inv_view_proj);
+            let eye = Vec3::from_slice(&camera.position_near[..3]);
+            let through = |x: f32, y: f32| {
+                let ndc = glam::Vec4::new(
+                    2.0 * x / VIEW as f32 - 1.0,
+                    1.0 - 2.0 * y / VIEW as f32,
+                    0.5,
+                    1.0,
+                );
+                let p = inverse * ndc;
+                (p.truncate() / p.w - eye).normalize()
+            };
+            let rays: Vec<SceneRay> = probe_pixels()
+                .iter()
+                .map(|&[x, y]| {
+                    // Where the raster sampled this pixel: its centre moved
+                    // by the frame's jitter (the basis is unjittered).
+                    let jitter = helio_core::temporal::ray_jitter_from_ndc(
+                        [camera.jitter_frame[0], camera.jitter_frame[1]],
+                        [VIEW, VIEW],
+                    );
+                    let (x, y) = (x as f32 + 0.5 + jitter[0], y as f32 + 0.5 + jitter[1]);
+                    let dir = through(x, y);
+                    // A pixel's angle: the cone the raster's derivatives span.
+                    let spread = angle(dir, through(x + 1.0, y));
+                    ray(eye, dir, 1000.0, spread, MASK_ALL)
+                })
+                .collect();
+            ctx.write_buffer(&self.buffers.rays, 0, bytemuck::cast_slice(&rays));
+            ctx.write_buffer(
+                &self.buffers.header,
+                0,
+                bytemuck::bytes_of(&stream::StreamHeader::of(rays.len() as u32)),
+            );
+            ctx.write_buffer(
+                &self.buffers.hits,
+                0,
+                bytemuck::cast_slice(&vec![SceneHit::default(); rays.len()]),
+            );
+            Ok(())
+        }
+
+        fn execute(&mut self, _ctx: &mut PassContext) -> HelioResult<()> {
+            Ok(())
+        }
+
+        fn publish<'a>(&self, frame: &mut helio_core::ResourceRegistry<'a>) {
+            self.buffers.publish(&self.stream, frame, "CameraRays");
+        }
+    }
+
+    impl RenderPass for GBufferAtPixelsPass {
+        fn name(&self) -> &'static str {
+            "GBufferAtPixels"
+        }
+
+        fn reads(&self) -> &'static [&'static str] {
+            &GBUFFER_SURFACE
+        }
+
+        fn execute(&mut self, ctx: &mut PassContext) -> HelioResult<()> {
+            let Some(group) = ctx.registry.read::<helio_core::ViewGroup<'_, 4>>(
+                helio_core::ResourceKey::new(helio_frame_api::gbuffer::GROUP),
+                "GBufferAtPixels",
+            ) else {
+                return Ok(());
+            };
+            let mut views: Vec<&wgpu::TextureView> = group.views.to_vec();
+            for name in [
+                helio_frame_api::gbuffer::SSS,
+                helio_frame_api::gbuffer::EXTRA,
+            ] {
+                let Some(view) = ctx.registry.get(helio_core::ResourceKey::new(name)) else {
+                    return Ok(());
+                };
+                views.push(view);
+            }
+            let mut entries: Vec<wgpu::BindGroupEntry<'_>> = views
+                .iter()
+                .enumerate()
+                .map(|(binding, view)| wgpu::BindGroupEntry {
+                    binding: binding as u32,
+                    resource: wgpu::BindingResource::TextureView(view),
+                })
+                .collect();
+            entries.push(wgpu::BindGroupEntry {
+                binding: 6,
+                resource: self.pixels.as_entire_binding(),
+            });
+            entries.push(wgpu::BindGroupEntry {
+                binding: 7,
+                resource: self.surfaces.as_entire_binding(),
+            });
+            let group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.layout,
+                entries: &entries,
+            });
+            let mut cmds = ctx.graphics_cmds();
+            let mut pass = cmds.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, Some(&group), &[]);
+            pass.dispatch_workgroups((probe_pixels().len() as u32).div_ceil(64), 1, 1);
+            Ok(())
+        }
+    }
+
+    /// An RGBA8 texture of `size` with mips box-filtered from `texel(x, y)`.
+    fn register_texture(
+        world: &pulsar_scenedb::World,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: u32,
+        texel: impl Fn(u32, u32) -> [u8; 4],
+    ) -> u32 {
+        let levels = size.ilog2() + 1;
+        let mut level: Vec<[f32; 4]> = (0..size * size)
+            .map(|i| texel(i % size, i / size).map(|c| f32::from(c)))
+            .collect();
+        let mut mips = Vec::new();
+        let mut side = size;
+        loop {
+            mips.push(
+                level
+                    .iter()
+                    .flat_map(|t| t.map(|c| c.round() as u8))
+                    .collect::<Vec<u8>>(),
+            );
+            if side == 1 {
+                break;
+            }
+            let half = side / 2;
+            level = (0..half * half)
+                .map(|i| {
+                    let (x, y) = (2 * (i % half), 2 * (i / half));
+                    let at = |x: u32, y: u32| level[(y * side + x) as usize];
+                    std::array::from_fn(|c| {
+                        (at(x, y)[c] + at(x + 1, y)[c] + at(x, y + 1)[c] + at(x + 1, y + 1)[c])
+                            / 4.0
+                    })
+                })
+                .collect();
+            side = half;
+        }
+        let descriptor = wgpu::TextureDescriptor {
+            label: Some("probe texture"),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: levels,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+        let levels: Vec<&[u8]> = mips.iter().map(Vec::as_slice).collect();
+        world
+            .gpu_mirror()
+            .unwrap()
+            .texture_store()
+            .unwrap()
+            .write()
+            .unwrap()
+            .register_mips(device, queue, &descriptor, &levels)
+            .unwrap()
+    }
+
+    /// The test of "one surface, two encodings": a view rendered through the
+    /// deferred graph and camera rays through the same pixels traced by the
+    /// meshes as a `Full` stream; the G-buffer's surface (decoded with the
+    /// frame's `gbuffer_surface_at`) and the hit's agree within the
+    /// encodings' quantisation in base colour, normal, roughness, metalness
+    /// and emission: a textured floor (a smooth gradient read at the
+    /// pixel's footprint), a normal-mapped metallic wall and an emissive
+    /// box.
+    #[test]
+    fn a_hit_s_surface_is_the_g_buffer_s_at_the_same_pixel() {
+        let instance = wgpu::Instance::new(helio_core::wgpu_instance_descriptor());
+        let Ok(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            }))
+        else {
+            return;
+        };
+        let features = helio::required_wgpu_features(helio::usable_adapter_features(&adapter));
+        if !features.contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
+            eprintln!("no ray queries: skipped");
+            return;
+        }
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: features,
+            required_limits: helio::required_wgpu_limits(adapter.limits()),
+            experimental_features: helio::required_experimental_features(features),
+            ..Default::default()
+        }))
+        .unwrap();
+        let (device, queue) = (Arc::new(device), Arc::new(queue));
+        let errors = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut scene = scene_db(&device, &queue);
+        let world = &mut scene.world;
+        let gradient = register_texture(world, &device, &queue, 64, |x, y| {
+            [(x * 4) as u8, (y * 4) as u8, 160, 255]
+        });
+        // A normal map tilted toward +u (alpha 1: no spread).
+        let bumps = register_texture(world, &device, &queue, 4, |_, _| [200, 128, 230, 255]);
+        let none = helio_mats::GpuMaterial::NO_TEXTURE;
+        let mut floor = helio_mats::MaterialRow::new([1.0; 4], 0.6, 0.0, [0.0; 3], 0.0);
+        floor.tex_base_color = gradient;
+        let mut wall = helio_mats::MaterialRow::new([0.2, 0.4, 0.8, 1.0], 0.3, 1.0, [0.0; 3], 0.0);
+        wall.tex_normal = bumps;
+        wall.flags |= helio_mats::FLAG_HAS_NORMAL_MAP;
+        let glow = helio_mats::MaterialRow::new([0.9; 4], 0.5, 0.0, [1.0, 0.5, 0.25], 3.0);
+        assert_eq!(glow.tex_base_color, none);
+        spawn_box_with(
+            world,
+            Vec3::new(0.0, -0.25, 0.0),
+            Vec3::new(4.0, 0.25, 4.0),
+            floor.into(),
+        );
+        spawn_box_with(
+            world,
+            Vec3::new(0.0, 1.5, -2.5),
+            Vec3::new(2.0, 1.5, 0.25),
+            wall.into(),
+        );
+        spawn_box_with(
+            world,
+            Vec3::new(1.2, 0.5, -0.5),
+            Vec3::new(0.4, 0.5, 0.4),
+            glow.into(),
+        );
+        // The G-buffer at the view's own size: a pixel is a texel.
+        let config = helio::RendererConfig::new(VIEW, VIEW, wgpu::TextureFormat::Rgba8Unorm)
+            .with_render_scale(1.0);
+        let mut renderer =
+            helio::RendererBuilder::new(config.clone(), scene.world.gpu_mirror().cloned().unwrap())
+                .with_graph(helio_mesh_host::presets::with(
+                    helio_presets::Preset::Deferred,
+                    &helio_feature_api::FeatureSet::new().with(SurfaceProbe),
+                ))
+                .with_external_device()
+                .build(
+                    device.clone(),
+                    queue.clone(),
+                    config.width,
+                    config.height,
+                    config.surface_format,
+                );
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: VIEW,
+                height: VIEW,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.surface_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let camera = helio::Camera::perspective_look_at(
+            Vec3::new(0.3, 2.2, 4.0),
+            Vec3::new(0.2, 0.6, -1.0),
+            Vec3::Y,
+            1.0,
+            1.0,
+            0.1,
+            100.0,
+        );
+        let mut rays = SceneDbRayTracing::partial(device.clone(), queue.clone());
+        for _ in 0..4 {
+            scene.world.flush_gpu_mirror(&queue);
+            rays.prepare(&scene.world).unwrap();
+            rays.publish(&mut renderer);
+            renderer.render(&camera, &view).unwrap();
+            // The hit programs compile off the frame: wait for them between
+            // frames, as a host's loading screen does.
+            while helio_core::compile::in_flight() > 0 {
+                std::thread::yield_now();
+            }
+        }
+        let probe = renderer.find_pass::<CameraRaysPass>().unwrap();
+        let hits = read_from::<SceneHit>(&device, &queue, &probe.buffers.hits);
+        let traced =
+            read_from::<SceneSurface>(&device, &queue, probe.buffers.surfaces.as_ref().unwrap());
+        let gbuffer = renderer.find_pass::<GBufferAtPixelsPass>().unwrap();
+        let raster = read_from::<SceneSurface>(&device, &queue, &gbuffer.surfaces);
+        let drawn = raster.iter().filter(|s| s.base_color != 0).count();
+        let traced_count = hits.iter().filter(|h| h.t > 0.0).count();
+        eprintln!(
+            "{drawn} G-buffer samples drawn, {traced_count} rays hit, of {}",
+            hits.len()
+        );
+        let mut compared = [0usize; 3];
+        for (sample, five) in hits.chunks(5).enumerate() {
+            let row = payload::row(&five[0]);
+            if five.iter().any(|h| h.t <= 0.0 || payload::row(h) != row) {
+                continue;
+            }
+            let k = sample * 5;
+            let (hit, gb) = (&traced[k], &raster[k]);
+            let what = format!("sample {sample} (row {row})");
+            let (a, b) = (hit.base_color(), gb.base_color());
+            for c in 0..4 {
+                // RGBA8 both; a texel's mip may differ by a level.
+                assert!(
+                    (a[c] - b[c]).abs() <= 3.0 / 255.0,
+                    "{what}: base colour/metallic {a:?} vs {b:?}"
+                );
+            }
+            assert!(
+                (hit.roughness() - gb.roughness()).abs() <= 2.0 / 255.0,
+                "{what}: roughness {} vs {}",
+                hit.roughness(),
+                gb.roughness()
+            );
+            let (n_hit, n_gb) = (
+                Vec3::from(stream::unpack_unit(hit.normal)),
+                Vec3::from(stream::unpack_unit(gb.normal)),
+            );
+            assert!(
+                angle(n_hit, n_gb) < 0.01,
+                "{what}: normal {n_hit} vs {n_gb}"
+            );
+            let (e_hit, e_gb) = (
+                Vec3::from(stream::unpack_radiance(hit.emissive)),
+                Vec3::from(stream::unpack_radiance(gb.emissive)),
+            );
+            assert!(
+                (e_hit - e_gb).abs().max_element() <= 0.02 * e_gb.max_element() + 1e-3,
+                "{what}: emission {e_hit} vs {e_gb}"
+            );
+            let kind = if e_gb.max_element() > 0.5 {
+                2
+            } else if b[3] > 0.5 {
+                1
+            } else {
+                0
+            };
+            compared[kind] += 1;
+        }
+        eprintln!(
+            "compared: floor {}, metallic wall {}, emissive box {}",
+            compared[0], compared[1], compared[2]
+        );
+        assert!(
+            compared.iter().all(|&n| n >= 3),
+            "too few clear samples of a surface: {compared:?}"
+        );
+        let error = pollster::block_on(errors.pop());
+        assert!(error.is_none(), "{error:?}");
     }
 }

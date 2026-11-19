@@ -157,9 +157,9 @@ pub struct SceneDbRayTracing {
     /// change nothing.
     skipped: HashMap<Entity, CasterKey>,
     geometry_ids: HashMap<(u64, bool), u64>,
-    /// BLAS identities of virtual-geometry proxies, by proxy key and
-    /// opacity.
-    proxy_ids: HashMap<(u64, bool), u64>,
+    /// BLAS identities of virtual-geometry proxies' sections, by proxy key,
+    /// section and opacity.
+    proxy_ids: HashMap<(u64, u32, bool), u64>,
     next_geometry_id: u64,
     /// Virtual-geometry instances' proxies ([`Self::with_virtual_geometry`]).
     vg: Option<VgRayProxies>,
@@ -368,6 +368,10 @@ impl SceneDbRayTracing {
             stats.add_named(
                 helio_mesh_api::stats::RAY_INSTANCES_CULLED,
                 self.culled.len() as u64,
+            );
+            stats.add_named(
+                helio_mesh_api::stats::RAY_PROGRAMS,
+                self.programs.programs().len() as u64,
             );
         }
         Ok(self.tlas.tlas().expect("successful TLAS build"))
@@ -702,14 +706,25 @@ impl SceneDbRayTracing {
                 Lookup::Pending => unsupported!("virtual geometry whose proxy is not built yet"),
                 Lookup::Proxy(..) if transmits => unsupported!("transmitting virtual geometry"),
                 Lookup::Proxy(key, range) => {
-                    let id = match self.proxy_ids.get(&(key, opaque)) {
+                    // The object draws one section of its asset (its row's
+                    // `section_index`): it traces that section of the proxy.
+                    let section = object.section_index;
+                    let Some(part) = self.vg.as_ref().and_then(|vg| {
+                        vg.sections(key)
+                            .iter()
+                            .find(|s| s.material == section)
+                            .copied()
+                    }) else {
+                        unsupported!("a virtual-geometry section its proxy holds no triangles of")
+                    };
+                    let id = match self.proxy_ids.get(&(key, section, opaque)) {
                         Some(id) => *id,
                         None => {
                             let id = self.next_geometry_id;
                             self.next_geometry_id = id
                                 .checked_add(1)
                                 .ok_or_else(|| error("BLAS identity exhausted"))?;
-                            self.proxy_ids.insert((key, opaque), id);
+                            self.proxy_ids.insert((key, section, opaque), id);
                             id
                         }
                     };
@@ -733,8 +748,8 @@ impl SceneDbRayTracing {
                                         vertex_count: range.vertex_count,
                                         vertex_stride: helio_mesh_api::RAY_PROXY_VERTEX_BYTES,
                                         indices: Some(proxy_indices),
-                                        first_index: range.first_index,
-                                        index_count: range.index_count,
+                                        first_index: range.first_index + part.first_index,
+                                        index_count: part.index_count,
                                     },
                                     opaque,
                                 }],
@@ -744,7 +759,7 @@ impl SceneDbRayTracing {
                     }
                     (
                         id,
-                        range.first_index,
+                        range.first_index + part.first_index,
                         range.first_vertex,
                         RAY_INSTANCE_PROXY,
                     )

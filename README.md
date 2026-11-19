@@ -31,7 +31,7 @@ draw phases and api crates.
 | `helio-pass-indirect-dispatch` | `feature/indirect-dispatch/` | Helio pass: builds the meshes' indirect draw arguments |
 | `helio-pass-object-batch` | `feature/object-batch/` | GPU-driven sort/group/batch pipeline: turns SceneDB's StaticObjectComponent rows into instances/draw_calls/material_class_ranges with zero per-frame CPU involvement |
 | `helio-pass-occlusion-cull` | `feature/occlusion-cull/` | Helio pass: Hi-Z occlusion culling of the mesh instances |
-| `helio-pass-mesh-rays` | `feature/rays/` | Helio pass: the meshes' tracer of ray streams (`helio_frame_api::rays::stream`): ray queries against the frame's TLAS culled by the ray's coordinate space (`RAY_SPACE_GROUPS`), nearest hits and occlusion, and a surface pass writing the meshes' hits' `SceneSurface` from the instances' transforms (`RAY_INSTANCE_TRANSFORMS`) |
+| `helio-pass-mesh-rays` | `feature/rays/` | Helio pass: the meshes' tracer of ray streams (`helio_frame_api::rays::stream`): ray queries against the frame's TLAS culled by the ray's coordinate space (`RAY_SPACE_GROUPS`), nearest hits and occlusion, and the surface passes: each hit's material evaluated by its program (the drawers' template and graph composed into the meshes' hit program, textures at the ray cone's footprint) over the hits binned by program |
 | `helio-pass-shadow` | `feature/shadow/` | Helio pass: the meshes' shadow-caster drawer (opens the shadow-caster phase) |
 | `helio-pass-shadow-dirty` | `feature/shadow-dirty/` | Helio pass: which shadow views need redrawing |
 | `helio-pass-transparent` | `feature/transparent/` | Helio pass: the meshes' transparent drawer |
@@ -77,6 +77,14 @@ draw phases and api crates.
   structures' stats; the settings are `helio_pass_mesh_rays::RAY_TRACING`
   (`ray_tracing` in a project). Helio's `rendering.md`, "As built: Skinned
   meshes, foliage and culling in the TLAS", has the design.
+- **Materials at hits**: each traced row names the program its material is
+  evaluated by (`RayInstance::program`, an index of the `RAY_PROGRAMS`
+  payload both projections publish with the TLAS). The tracer's surface
+  passes (`helio_pass_mesh_rays::surfaces`) run the table-driven program, or
+  bin the hits by program and run each compiled program over its own hits;
+  a program not compiled yet or past `MAX_HIT_PROGRAMS` shades by the
+  table. Helio's `rendering.md`, "Materials at mesh hits", has the design
+  and the costs.
 
 ## Building and testing
 
