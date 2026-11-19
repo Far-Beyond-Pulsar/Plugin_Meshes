@@ -5,7 +5,6 @@ enable wgpu_binding_array;
 //!use mesh_ray_rows
 //!use mesh_ray_surface
 //!use specular_aa
-//!use pbr_eval
 //!use material_row
 //!use material_surface
 //!use material_gradients
