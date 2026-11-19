@@ -308,17 +308,27 @@ impl HitPrograms {
 
     /// What `program` compiles from.
     fn source(&self, program: RayProgram) -> Source {
-        let Some(template) = template_of(self.templates.as_ref(), program.template).or_else(|| {
-            // The built-in classes without a registry; a custom class
-            // without its registry is the table's.
-            (program.template < helio_mats::FIRST_CUSTOM_MATERIAL_CLASS)
-                .then(|| {
-                    helio_mats::RadiantTemplateRegistry::new()
-                        .get(program.template)
-                        .cloned()
+        let Some(template) = template_of(self.templates.as_ref(), program.template)
+            .or_else(|| {
+                // The built-in classes without a registry; a custom class
+                // without its registry is the table's.
+                (program.template < helio_mats::FIRST_CUSTOM_MATERIAL_CLASS)
+                    .then(|| {
+                        helio_mats::RadiantTemplateRegistry::new()
+                            .get(program.template)
+                            .cloned()
+                    })
+                    .flatten()
+            })
+            // A class no registry holds with a graph (a material graph's own
+            // class, `MATERIAL_CLASS_CUSTOM`): the graph over the default
+            // class's template, as the drawers compose it.
+            .or_else(|| {
+                (program.graph_hash != 0).then(|| {
+                    template_of(self.templates.as_ref(), 0).unwrap_or_else(default_template)
                 })
-                .flatten()
-        }) else {
+            })
+        else {
             return Source::Table;
         };
         if program.graph_hash == 0 {
