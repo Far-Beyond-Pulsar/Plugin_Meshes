@@ -1,5 +1,4 @@
 enable wgpu_binding_array;
-//!use pbr_eval
 //!use material_row
 //!use specular_aa
 //!use material_surface

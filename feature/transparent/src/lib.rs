@@ -1043,6 +1043,7 @@ impl TransparentPass {
                     helio_frame_api::rays::stream::SNIPPET,
                     helio_light_api::LIGHT_LIST_SNIPPET,
                     helio_light_api::LIGHT_FORWARD_SNIPPET,
+                    helio_frame_api::gbuffer::BSDF_SNIPPET,
                     helio_frame_api::media::SNIPPET,
                 ],
                 helio_mats::MaterialBindingConfig::for_device(device),
