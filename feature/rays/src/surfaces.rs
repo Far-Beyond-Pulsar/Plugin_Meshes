@@ -364,6 +364,17 @@ impl HitPrograms {
         None
     }
 
+    /// Whether `program` waits for its graph's source (not registered yet).
+    fn waits_for_graph(&self, program: RayProgram) -> bool {
+        program.graph_hash != 0
+            && !self
+                .compiling
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&program)
+            && matches!(self.source(program), Source::Waiting)
+    }
+
     /// Programs compiling and programs whose compile failed.
     pub fn compile_states(&self) -> (usize, usize) {
         let compiling = self
@@ -433,6 +444,10 @@ pub struct MeshHitSurfaces {
     /// This frame's bins: bin 0 the table-driven program, bin `k` the
     /// program of its entry.
     bins: Vec<ProgramPipelines>,
+    /// This frame's programs handed over, and those waiting for their
+    /// graph's source (frame statistics).
+    seen: usize,
+    waiting: usize,
     /// The ranks and the list, for a stream of the capacity they were made
     /// for.
     binning: Option<(u64, wgpu::Buffer, wgpu::Buffer)>,
@@ -467,6 +482,8 @@ impl MeshHitSurfaces {
             remap: remap_buffer(device, 1),
             remap_rows: vec![0],
             bins: vec![table],
+            seen: 0,
+            waiting: 0,
             binning: None,
             bin_args: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Mesh hit bins"),
@@ -504,8 +521,11 @@ impl MeshHitSurfaces {
         let list = programs.map_or(&[RayProgram::TABLE][..], RayPrograms::programs);
         let mut rows = vec![0u32; list.len().max(1)];
         self.bins.truncate(1);
+        self.seen = programs.map_or(0, |p| p.programs().len());
+        self.waiting = 0;
         for (index, program) in list.iter().enumerate() {
             let Some(pipelines) = self.programs.ready(device, *program) else {
+                self.waiting += usize::from(self.programs.waits_for_graph(*program));
                 continue;
             };
             if self.bins.len() < MAX_HIT_PROGRAMS {
@@ -846,6 +866,14 @@ impl RenderPass for MeshHitSurfacePass {
             );
             stats.add_named(helio_mesh_api::stats::HIT_PROGRAMS_PENDING, pending as u64);
             stats.add_named(helio_mesh_api::stats::HIT_PROGRAMS_FAILED, failed as u64);
+            stats.add_named(
+                helio_mesh_api::stats::HIT_PROGRAMS_SEEN,
+                self.surfaces.seen as u64,
+            );
+            stats.add_named(
+                helio_mesh_api::stats::HIT_PROGRAMS_WAITING,
+                self.surfaces.waiting as u64,
+            );
         }
         let mut cmds = ctx.graphics_cmds();
         self.surfaces.record(

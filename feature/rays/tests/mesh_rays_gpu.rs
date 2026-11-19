@@ -2027,10 +2027,10 @@ fn diffuse_streams_skip_what_a_diffuse_consumer_does_not_read() {
 /// The surface passes' GPU cost on GI's stream shape (174,080 rays, all
 /// hitting meshes: 81 textured, normal-mapped quads), by programs present
 /// (1: the table-driven program alone, no binning; 2, 8, 64 and 72, past the
-/// bound) and detail, as median GPU milliseconds over 64 pipelined frames
-/// (timestamps around the surface passes alone, after four untimed runs of
-/// them in the same frame so the GPU runs at a loaded frame's clocks). Run
-/// by hand on a quiet GPU:
+/// bound) and detail, as GPU milliseconds a run of the passes
+/// (the throughput of the surface passes alone, recorded five times a frame
+/// over 64 pipelined frames so the GPU never idles and runs at a loaded
+/// frame's clocks; three windows, the median). Run by hand on a quiet GPU:
 /// `mesh_rays_gpu hit_surface_cost --ignored --nocapture`.
 #[test]
 #[ignore = "a measurement; run by hand"]
@@ -2241,60 +2241,53 @@ fn hit_surface_cost() {
             surfaces.set_programs(&gpu.device, Some(&scene.programs), write);
             surfaces.write_frame(1, |b, bytes| gpu.queue.write_buffer(b, 0, bytes));
             bins = surfaces.bin_count();
+            // Throughput: 64 frames of 5 runs each submitted back to back
+            // (pipelined, the GPU never idle), one timestamp before the
+            // first timed frame and one after the last; three such
+            // windows, the median taken.
             const FRAMES: u32 = 64;
+            const RUNS: u32 = 5;
             let queries = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: None,
                 ty: wgpu::QueryType::Timestamp,
-                count: FRAMES * 2,
+                count: 6,
             });
-            for frame in 0..FRAMES + 8 {
-                let mut encoder = gpu.device.create_command_encoder(&Default::default());
-                let timed = frame >= 8;
-                // The same passes four times untimed first: the GPU kept
-                // busy, so its clocks are a loaded frame's, not an idle
-                // one's (a lone small dispatch a frame reads idle clocks).
-                for _ in 0..4 {
-                    let mut cmds = helio_core::CommandRecorder::from_encoder(&mut encoder);
-                    surfaces.record(
-                        &gpu.device,
-                        &mut cmds,
-                        bindings,
-                        Some(scene.hits()),
-                        Some(table.bindings(&views)),
-                    );
+            for window in 0..3u32 {
+                for frame in 0..FRAMES + 8 {
+                    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+                    if frame == 8 {
+                        encoder.write_timestamp(&queries, window * 2);
+                    }
+                    for _ in 0..RUNS {
+                        let mut cmds = helio_core::CommandRecorder::from_encoder(&mut encoder);
+                        surfaces.record(
+                            &gpu.device,
+                            &mut cmds,
+                            bindings,
+                            Some(scene.hits()),
+                            Some(table.bindings(&views)),
+                        );
+                    }
+                    if frame == FRAMES + 7 {
+                        encoder.write_timestamp(&queries, window * 2 + 1);
+                    }
+                    gpu.queue.submit([encoder.finish()]);
                 }
-                if timed {
-                    encoder.write_timestamp(&queries, (frame - 8) * 2);
-                }
-                {
-                    let mut cmds = helio_core::CommandRecorder::from_encoder(&mut encoder);
-                    surfaces.record(
-                        &gpu.device,
-                        &mut cmds,
-                        bindings,
-                        Some(scene.hits()),
-                        Some(table.bindings(&views)),
-                    );
-                }
-                if timed {
-                    encoder.write_timestamp(&queries, (frame - 8) * 2 + 1);
-                }
-                gpu.queue.submit([encoder.finish()]);
             }
             let resolve = gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
-                size: u64::from(FRAMES) * 16,
+                size: 48,
                 usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
             let mut encoder = gpu.device.create_command_encoder(&Default::default());
-            encoder.resolve_query_set(&queries, 0..FRAMES * 2, &resolve, 0);
+            encoder.resolve_query_set(&queries, 0..6, &resolve, 0);
             gpu.queue.submit([encoder.finish()]);
             let stamps = read::<u64>(gpu, &resolve);
             let period = f64::from(gpu.queue.get_timestamp_period());
             let mut ms: Vec<f64> = stamps
                 .chunks(2)
-                .map(|p| p[1].saturating_sub(p[0]) as f64 * period / 1e6)
+                .map(|p| p[1].saturating_sub(p[0]) as f64 * period / 1e6 / f64::from(FRAMES * RUNS))
                 .collect();
             ms.sort_by(f64::total_cmp);
             row_out.push(ms[ms.len() / 2]);
@@ -3303,7 +3296,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let mut wall = helio_mats::MaterialRow::new([0.2, 0.4, 0.8, 1.0], 0.3, 1.0, [0.0; 3], 0.0);
         wall.tex_normal = bumps;
         wall.flags |= helio_mats::FLAG_HAS_NORMAL_MAP;
-        let glow = helio_mats::MaterialRow::new([0.9; 4], 0.5, 0.0, [1.0, 0.5, 0.25], 3.0);
+        // The emissive box's material class has a template of its own
+        // (clear coat, no coat): its hits shade by that program, binned
+        // apart from the table-driven ones.
+        let mut glow = helio_mats::MaterialRow::new([0.9; 4], 0.5, 0.0, [1.0, 0.5, 0.25], 3.0);
+        glow.material_class = helio_mats::MATERIAL_CLASS_CLEAR_COAT;
         assert_eq!(glow.tex_base_color, none);
         spawn_box_with(
             world,
@@ -3376,6 +3373,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 std::thread::yield_now();
             }
         }
+        let bins = renderer.frame_stats().latest().get("meshes.hit_bins");
+        assert_eq!(
+            bins,
+            Some(2),
+            "the hits are not binned by their programs (the table's and the clear coat's)"
+        );
         let probe = renderer.find_pass::<CameraRaysPass>().unwrap();
         let hits = read_from::<SceneHit>(&device, &queue, &probe.buffers.hits);
         let traced =
