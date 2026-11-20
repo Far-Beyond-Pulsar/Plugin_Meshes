@@ -1,8 +1,8 @@
 enable wgpu_binding_array;
-//!use pbr_eval
 //!use material_row
 //!use specular_aa
 //!use material_surface
+//!use frame_surface
 
 // The material table for cut-out-aware depth drawers (shadow casters): the
 // materials' bindings (group 1, the G-buffer's layout) and the cut-out test

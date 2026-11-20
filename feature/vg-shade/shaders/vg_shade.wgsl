@@ -70,24 +70,12 @@ const FLAG_CONTENT_REMAPS: u32 = 32u;
 @group(2) @binding(7) var out_extra: texture_storage_2d<rgba16float, write>;
 @group(2) @binding(8) var out_velocity: texture_storage_2d<rgba16float, write>;
 
-// Screen-space UV derivatives of the pixel being shaded (analytic, from the
-// exact barycentrics of the neighbouring pixel centres). `sample_texture`
-// reads them through `vg_slot_grad`: compute shaders have no implicit
-// derivatives, so the sampling call is rewritten to `textureSampleGrad`.
-var<private> vg_duv_dx: vec2<f32>;
-var<private> vg_duv_dy: vec2<f32>;
-// The same for the geometric normal (`specular_aa.wgsl`'s `dpdx(n)` /
-// `dpdy(n)`, rewritten to these: its turn across the pixel).
-var<private> vg_dn_dx: vec3<f32>;
-var<private> vg_dn_dy: vec3<f32>;
-
-fn vg_slot_grad(slot: MaterialTextureSlot, d: vec2<f32>) -> vec2<f32> {
-    // The linear part of `select_uv` (scale, rotation); the offset drops out.
-    let scaled = d * slot.offset_scale.zw;
-    let s = slot.rotation.x;
-    let c = slot.rotation.y;
-    return vec2<f32>(scaled.x * c - scaled.y * s, scaled.x * s + scaled.y * c);
-}
+// The pixel's screen-space UV derivatives and the geometric normal's
+// (analytic, from the exact barycentrics of the neighbouring pixel centres)
+// are the materials' explicit gradients (`//!use material_gradients`:
+// `material_duv_dx` / `_dy`, `material_dn_dx` / `_dy`): compute shaders have
+// no implicit derivatives, so the composed program is lowered to read every
+// texture at them (`helio_mats::shader::explicit_gradients`).
 
 override BIN: u32 = 0u;
 
@@ -159,8 +147,8 @@ fn vg_shade(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_inde
     let bx = vgs_bary(c0, c1, c2, vgs_pixel_ndc(centre + vec2<f32>(1.0, 0.0), size));
     let by = vgs_bary(c0, c1, c2, vgs_pixel_ndc(centre + vec2<f32>(0.0, 1.0), size));
     let uv_c = a0.uv0 * bc.x + a1.uv0 * bc.y + a2.uv0 * bc.z;
-    vg_duv_dx = (a0.uv0 * bx.x + a1.uv0 * bx.y + a2.uv0 * bx.z) - uv_c;
-    vg_duv_dy = (a0.uv0 * by.x + a1.uv0 * by.y + a2.uv0 * by.z) - uv_c;
+    material_duv_dx = (a0.uv0 * bx.x + a1.uv0 * bx.y + a2.uv0 * bx.z) - uv_c;
+    material_duv_dy = (a0.uv0 * by.x + a1.uv0 * by.y + a2.uv0 * by.z) - uv_c;
 
     let nm0 = vgs_obj_vec4(row_word + VGS_OBJ_NORMAL_MAT);
     let nm1 = vgs_obj_vec4(row_word + VGS_OBJ_NORMAL_MAT + 4u);
@@ -173,8 +161,8 @@ fn vg_shade(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_inde
     input.world_position = w0 * b.x + w1 * b.y + w2 * b.z;
     input.world_normal = normalize(normal_mat * (a0.normal * b.x + a1.normal * b.y + a2.normal * b.z));
     let n_c = normalize(normal_mat * (a0.normal * bc.x + a1.normal * bc.y + a2.normal * bc.z));
-    vg_dn_dx = normalize(normal_mat * (a0.normal * bx.x + a1.normal * bx.y + a2.normal * bx.z)) - n_c;
-    vg_dn_dy = normalize(normal_mat * (a0.normal * by.x + a1.normal * by.y + a2.normal * by.z)) - n_c;
+    material_dn_dx = normalize(normal_mat * (a0.normal * bx.x + a1.normal * bx.y + a2.normal * bx.z)) - n_c;
+    material_dn_dy = normalize(normal_mat * (a0.normal * by.x + a1.normal * by.y + a2.normal * by.z)) - n_c;
     input.world_tangent = normalize(model_mat3 * (a0.tangent * b.x + a1.tangent * b.y + a2.tangent * b.z));
     input.bitangent_sign = a0.bitangent_sign;
     input.tex_coords = a0.uv0 * b.x + a1.uv0 * b.y + a2.uv0 * b.z;
@@ -204,21 +192,25 @@ fn vg_shade(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_inde
             material_input.world_normal = turn * input.world_normal;
             material_input.world_tangent = turn * input.world_tangent;
             material_input.view_position = (unmap * vec4f(cam.position_near.xyz, 1.0)).xyz;
-            vg_dn_dx = turn * vg_dn_dx;
-            vg_dn_dy = turn * vg_dn_dy;
+            material_dn_dx = turn * material_dn_dx;
+            material_dn_dy = turn * material_dn_dy;
             content_to_drawn = transpose(turn);
         }
     }
-    let surface = radiant_eval_surface(material, material_tex, material_input);
+    var surface = radiant_eval_surface(material, material_tex, material_input);
+    // The material shades in its content's space; the G-buffer holds the
+    // drawn space's normal.
+    surface.normal = content_to_drawn * surface.normal;
 
     // Debug views (cluster/triangle ids included) are written by `vg_debug.wgsl`
-    // after this pass, only while one is selected.
-    textureStore(out_albedo, px, vec4<f32>(surface.albedo.rgb, surface.alpha));
-    textureStore(out_normal, px, vec4<f32>(content_to_drawn * surface.normal, surface.specular_f0.r));
-    textureStore(out_orm, px, vec4<f32>(surface.ao, surface.roughness, surface.metallic, surface.specular_f0.g));
-    textureStore(out_emissive, px, vec4<f32>(surface.emissive, surface.specular_f0.b));
-    textureStore(out_sss, px, vec4<f32>(surface.subsurface_color, surface.subsurface_radius));
-    textureStore(out_extra, px, vec4<f32>(surface.roughness_aniso_x, surface.roughness_aniso_y,
-                                          surface.aniso_rotation, f32(surface.flags)));
+    // after this pass, only while one is selected. The frame's G-buffer
+    // encoding of the surface (`gbuffer_surface_texels`, `//!use frame_surface`).
+    let t = gbuffer_surface_texels(surface);
+    textureStore(out_albedo, px, t.albedo);
+    textureStore(out_normal, px, t.normal);
+    textureStore(out_orm, px, t.orm);
+    textureStore(out_emissive, px, t.emissive);
+    textureStore(out_sss, px, t.sss);
+    textureStore(out_extra, px, t.extra);
     textureStore(out_velocity, px, compute_velocity(input));
 }

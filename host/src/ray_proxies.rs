@@ -9,10 +9,14 @@
 //! ([`ProxyOptions::trace`]: at most 1 % of its bounding radius off the
 //! surface, at most 32 Ki triangles), built on worker threads from the
 //! asset's bytes ([`ProxyCache`]) the first time an object uses it, shared
-//! by all its instances. Ray hits on it are shaded as the object's material
+//! by all its instances. Its triangles are grouped by the asset's material
+//! sections ([`VgRayProxies::sections`], `helio_vg_stream::ProxySection`),
+//! so a projection makes each section a BLAS segment with its own row and
+//! material: a ray hit on it is shaded as its section's material is
 //! (`RayInstance` rows flagged [`helio_mesh_api::RAY_INSTANCE_PROXY`], the
-//! face's winding as its normal); its vertices keep their uv0, so an
-//! alpha-tested material is tested on it as on a classic mesh.
+//! face's winding as its normal, the tangent from its uv0); its vertices
+//! keep their uv0, so an alpha-tested material is tested on it, and its
+//! textures read, as on a classic mesh.
 //!
 //! The proxies live in one pool of packed vertices (position, then uv0) and
 //! indices (the proxy pool a frame publishes, `helio_mesh_api::RAY_PROXY_VERTICES`), used directly as BLAS input
@@ -112,6 +116,8 @@ impl Pool {
 
 struct Proxy {
     range: ProxyRange,
+    /// Its material sections, their ranges relative to `range.first_index`.
+    sections: Vec<helio_vg_stream::ProxySection>,
     source_triangles: u32,
 }
 
@@ -199,6 +205,15 @@ impl VgRayProxies {
             self.cache.request(*key, source.clone(), self.frame);
         }
         Lookup::Pending
+    }
+
+    /// The material sections of proxy `key` (none for a proxy not in the
+    /// pool): each section's triangles from `first_index` relative to its
+    /// [`ProxyRange::first_index`].
+    pub fn sections(&self, key: u64) -> &[helio_vg_stream::ProxySection] {
+        self.proxies
+            .get(&key)
+            .map_or(&[], |p| p.sections.as_slice())
     }
 
     /// After a build: the proxies its objects use. The others are dropped.
@@ -327,6 +342,7 @@ impl VgRayProxies {
                 key,
                 Proxy {
                     range,
+                    sections: lod.sections.clone(),
                     source_triangles: build.source_triangles,
                 },
             );

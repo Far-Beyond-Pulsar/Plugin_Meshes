@@ -32,3 +32,19 @@ pub const RAY_INSTANCES: &str = "meshes.ray_instances";
 /// Instances the ray-tracing culling left out this frame (past the culling
 /// radius and smaller than the culling angle).
 pub const RAY_INSTANCES_CULLED: &str = "meshes.ray_instances_culled";
+/// Programs the ray-traced scene's rows name this frame
+/// (`crate::RAY_PROGRAMS`), the table-driven one included.
+pub const RAY_PROGRAMS: &str = "meshes.ray_programs";
+/// Bins the meshes' hit surfaces ran in this frame, summed over the ray
+/// streams (one a stream when every hit takes the table-driven program).
+pub const HIT_BINS: &str = "meshes.hit_bins";
+/// Hit programs compiling (off the frame) this frame.
+pub const HIT_PROGRAMS_PENDING: &str = "meshes.hit_programs_pending";
+/// Hit programs whose compile failed (their hits shade by the table).
+pub const HIT_PROGRAMS_FAILED: &str = "meshes.hit_programs_failed";
+/// Programs the meshes' hit surfaces were handed this frame (the
+/// `crate::RAY_PROGRAMS` payload's), summed over the ray streams.
+pub const HIT_PROGRAMS_SEEN: &str = "meshes.hit_programs_seen";
+/// Hit programs waiting for their material graph's source to be registered
+/// (their hits shade by the table meanwhile).
+pub const HIT_PROGRAMS_WAITING: &str = "meshes.hit_programs_waiting";
