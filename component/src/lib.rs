@@ -171,7 +171,8 @@ pub fn mesh_local_bounds(world: &World, object: Entity) -> Option<(glam::Vec3, g
     local
 }
 
-/// A local ray against `object`'s enabled meshes' triangles.
+/// A local ray against `object`'s enabled meshes' triangles: their full
+/// geometry, also while an instance shows its virtual-geometry fallback.
 pub fn mesh_hit(
     world: &World,
     object: Entity,
@@ -182,7 +183,8 @@ pub fn mesh_hit(
         world, object,
     );
     let has_geometry = meshes.iter().any(|(_, mesh)| {
-        mesh.vertices.len() >= 3 && (mesh.indices.is_empty() || mesh.indices.len() >= 3)
+        let (vertices, indices) = (mesh.source_vertices(), mesh.source_indices());
+        vertices.len() >= 3 && (indices.is_empty() || indices.len() >= 3)
     });
     if !has_geometry {
         return None;
@@ -191,13 +193,13 @@ pub fn mesh_hit(
         meshes
             .into_iter()
             .filter_map(|(_, mesh)| {
-                if mesh.vertices.len() < 3 {
+                if mesh.source_vertices().len() < 3 {
                     return None;
                 }
                 mesh_spatial::raycast_mesh(
-                    mesh.geometry_key,
-                    &mesh.vertices,
-                    &mesh.indices,
+                    mesh.source_key(),
+                    mesh.source_vertices(),
+                    mesh.source_indices(),
                     origin,
                     direction,
                 )
@@ -207,14 +209,16 @@ pub fn mesh_hit(
     )
 }
 
-/// Every enabled mesh triangle in `world`, in its owner's local space.
+/// Every enabled mesh triangle in `world`, in its owner's local space (each
+/// mesh's full geometry).
 pub fn mesh_triangles(world: &World, visit: &mut dyn FnMut(Entity, [glam::Vec3; 3]) -> bool) {
     for (_, owner, mesh) in
         pulsar_scene_model::attachments::enabled_components::<StaticMeshComponent>(world)
     {
-        for triangle in mesh.indices.chunks_exact(3) {
+        let vertices = mesh.source_vertices();
+        for triangle in mesh.source_indices().chunks_exact(3) {
             let corner = |index: u32| {
-                mesh.vertices
+                vertices
                     .get(index as usize)
                     .map(|vertex| glam::Vec3::from_array(vertex.position))
             };

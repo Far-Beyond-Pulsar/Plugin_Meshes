@@ -808,6 +808,17 @@ fn shadow_membership_hash(value: u32, salt: u32) -> u32 {
     return x ^ (x >> 16u);
 }
 
+/// A static caster's identity in the cached atlas's membership fingerprint:
+/// its row and the geometry it draws, so a caster whose geometry changed in
+/// place (a reimport, a mesh swapping between its full geometry and its
+/// virtual-geometry fallback) redraws the static layer as one that came or
+/// went does.
+fn shadow_caster_identity(sorted: u32, row: StaticObjectRow) -> u32 {
+    return shadow_membership_hash(sorted, 0x27d4eb2fu)
+        ^ shadow_membership_hash(row.first_index, 0x165667b1u)
+        ^ shadow_membership_hash(row.index_count ^ bitcast<u32>(row.vertex_offset), 0xd3a2646cu);
+}
+
 @compute @workgroup_size(WG)
 fn cs_shadow_partition(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -827,7 +838,7 @@ fn cs_shadow_partition(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Moving glass casts no coloured shadow (the transmittance layer is
         // cached with the static atlas); it never casts an opaque one.
         if (row.flags & INSTANCE_FLAG_MOVABLE) == 0u {
-            let identity = sorted_indices_sp[i];
+            let identity = shadow_caster_identity(sorted_indices_sp[i], row);
             atomicXor(&shadow_counts[3], shadow_membership_hash(identity, 0x9e3779b9u));
             atomicXor(&shadow_counts[4], shadow_membership_hash(identity, 0x85ebca6bu));
             let slot = atomicAdd(&shadow_counts[2], 1u);
@@ -837,7 +848,7 @@ fn cs_shadow_partition(@builtin(global_invocation_id) gid: vec3<u32>) {
         let slot = atomicAdd(&shadow_counts[1], 1u);
         shadow_movable_indirect[slot] = entry;
     } else {
-        let identity = sorted_indices_sp[i];
+        let identity = shadow_caster_identity(sorted_indices_sp[i], row);
         atomicXor(&shadow_counts[3], shadow_membership_hash(identity, 0x9e3779b9u));
         atomicXor(&shadow_counts[4], shadow_membership_hash(identity, 0x85ebca6bu));
         let slot = atomicAdd(&shadow_counts[0], 1u);

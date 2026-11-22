@@ -467,6 +467,8 @@ fn skeletal_mesh_draw_dispatch(
     let draw = StaticMeshDraw {
         bounds_local: component.bounds_local,
         flags: helio_mesh_api::INSTANCE_FLAG_MOVABLE | helio_mesh_api::INSTANCE_FLAG_SKINNED,
+        // Skinned meshes are never virtual geometry.
+        vg_asset: [0; 4],
         sections,
     };
     pulsar_scenedb::gpu::write_derived_row(mirror, row, &draw, is_new_insert);

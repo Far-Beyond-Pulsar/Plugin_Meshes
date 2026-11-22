@@ -18,7 +18,8 @@
 //!
 //! * every static-mesh instance the scene join placed (`static_objects`, whose
 //!   flags say whether the instance asked for virtual geometry,
-//!   `static_mesh_draw_sections::handles`, `builtin_mesh_vertex::handles`),
+//!   `static_mesh_draw_sections::handles`, and each instance's asset identity,
+//!   `static_mesh_draw_vg_asset`),
 //! * the optional [`VirtualGeometryComponent`](crate::components::VirtualGeometryComponent)
 //!   of the instance's owner object (`vg_instance_overrides` rows, linked to
 //!   owners through `component_owners`), and
@@ -64,11 +65,13 @@
 //!
 //! # `vg_asset_ready` (published by `helio-vg-stream`)
 //!
-//! Sorted ascending by `vertex_offset`, 16-byte [`VgAssetReadyRow`] rows,
-//! keyed by the **interned vertex range** (`builtin_mesh_vertex::handles`
-//! offset) of the mesh asset: the one identity a static-mesh instance carries
-//! on the GPU. Rows past the last asset are [`VgAssetReadyRow::PADDING`]
-//! (`vertex_offset == u32::MAX`, so they sort last). `asset_slot` is the
+//! Sorted ascending by content id, 32-byte [`VgAssetReadyRow`] rows, keyed
+//! by the **content id of the mesh's full geometry** (`StaticMeshDraw::vg_asset`,
+//! `static_mesh_draw_vg_asset`): the identity a static-mesh instance carries
+//! on the GPU for its virtual geometry, the same whether it shows its full
+//! geometry or its fallback. Rows past the last asset are
+//! [`VgAssetReadyRow::PADDING`]
+//! (an all-ones content, so they sort last). `asset_slot` is the
 //! slot in the stream's asset table that [`GpuVgInstance::asset_slot`]
 //! indexes; [`VG_ASSET_READY_FLAG_READY`] is set once the asset's `.vgeo` root
 //! pages and hierarchy are resident.
@@ -103,10 +106,12 @@ pub const VG_INSTANCE_ROW_BYTES: u64 = 16;
 pub const VG_INSTANCE_COUNT_ROW_BYTES: u64 = 16;
 pub const LOD_SUPPRESSED_ROW_BYTES: u64 = 4;
 pub const CLASSIC_SUPPRESSED_ROW_BYTES: u64 = 4;
-pub const VG_ASSET_READY_ROW_BYTES: u64 = 16;
+pub const VG_ASSET_READY_ROW_BYTES: u64 = 32;
 const OWNER_ROW_BYTES: u64 = 12;
 const GENERATION_ROW_BYTES: u64 = 4;
 const HANDLE_ROW_BYTES: u64 = 8;
+/// A `static_mesh_draw_vg_asset` row: a content id as four `u32` words.
+const VG_ASSET_ROW_BYTES: u64 = 16;
 const OVERRIDE_ROW_BYTES: u64 = 8;
 /// A scene-join `static_objects` row (`StaticObjectComponent`).
 const OBJECT_ROW_BYTES: u64 = std::mem::size_of::<helio_mesh_api::StaticObjectRow>() as u64;
@@ -130,8 +135,9 @@ pub struct VgInstanceKeys {
     pub overrides: BufferKey,
     /// Static-mesh instances' section ranges (`static_mesh_draw_sections::handles`).
     pub section_handles: BufferKey,
-    /// Static-mesh instances' interned vertex ranges (`builtin_mesh_vertex::handles`).
-    pub vertex_handles: BufferKey,
+    /// Static-mesh instances' asset identities (`static_mesh_draw_vg_asset`:
+    /// the content id of each one's full geometry, four `u32` words).
+    pub vg_assets: BufferKey,
 }
 
 impl VgInstanceKeys {
@@ -144,7 +150,7 @@ impl VgInstanceKeys {
             override_handles: BufferKey::of("vg_instance_overrides::handles"),
             overrides: BufferKey::of("vg_instance_overrides"),
             section_handles: BufferKey::of("static_mesh_draw_sections::handles"),
-            vertex_handles: BufferKey::of("builtin_mesh_vertex::handles"),
+            vg_assets: BufferKey::of(crate::components::MESH_VG_ASSET_BUFFER),
         }
     }
 }
@@ -418,7 +424,7 @@ impl SceneDerivation for VirtualGeometryInstances {
         let override_handles = self.input(inputs, keys.override_handles, HANDLE_ROW_BYTES);
         let overrides = self.input(inputs, keys.overrides, OVERRIDE_ROW_BYTES);
         let section_handles = self.input(inputs, keys.section_handles, HANDLE_ROW_BYTES);
-        let vertex_handles = self.input(inputs, keys.vertex_handles, HANDLE_ROW_BYTES);
+        let vg_assets = self.input(inputs, keys.vg_assets, VG_ASSET_ROW_BYTES);
         let objects = self.input(inputs, OBJECTS_KEY, OBJECT_ROW_BYTES);
         let asset_ready = self.input(inputs, VG_ASSET_READY_KEY, VG_ASSET_READY_ROW_BYTES);
         let enabled = self.control.enabled();
@@ -442,7 +448,7 @@ impl SceneDerivation for VirtualGeometryInstances {
                 override_handles,
                 overrides,
                 section_handles,
-                vertex_handles,
+                vg_assets,
                 objects,
                 asset_ready,
             ],
@@ -470,13 +476,13 @@ impl SceneDerivation for VirtualGeometryInstances {
                 Some(owners),
                 Some(generations),
                 Some(section_handles),
-                Some(vertex_handles),
+                Some(vg_assets),
                 Some(objects),
             ) = (
                 owners,
                 generations,
                 section_handles,
-                vertex_handles,
+                vg_assets,
                 objects,
             ) {
                 let empty = &self.empty;
@@ -513,7 +519,7 @@ impl SceneDerivation for VirtualGeometryInstances {
                         entry(0, &self.uniforms),
                         entry(1, &owners.buffer),
                         entry(5, &section_handles.buffer),
-                        entry(6, &vertex_handles.buffer),
+                        entry(6, &vg_assets.buffer),
                         entry(7, &objects.buffer),
                         entry(8, asset_ready),
                         entry(9, &self.by_owner.buffer),
@@ -616,8 +622,12 @@ mod tests {
     #[test]
     fn padding_rows_sort_last_and_never_match() {
         let pad = VgAssetReadyRow::PADDING;
-        assert_eq!(pad.vertex_count, 0);
-        assert!(pad.vertex_offset > 0x00ff_ffff);
+        assert_eq!(pad.flags & VG_ASSET_READY_FLAG_READY, 0, "never ready");
+        let real = VgAssetReadyRow {
+            content: VgAssetReadyRow::content_words([u64::MAX - 1, u64::MAX]),
+            ..VgAssetReadyRow::PADDING
+        };
+        assert!(pad.sort_key() > real.sort_key());
     }
 
     #[test]

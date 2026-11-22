@@ -136,6 +136,86 @@ impl pulsar_scenedb::handle_ledger::ContentAddressed for MeshGeometryKey {
     }
 }
 
+/// Mesh geometry held once and shared: what an instance's
+/// `vertices`/`indices`/`mesh_sections` hold, under `key`.
+#[derive(Debug, Default)]
+pub struct MeshGeometry {
+    pub key: MeshGeometryKey,
+    pub vertices: Vec<PackedVertex>,
+    pub indices: Vec<u32>,
+    pub sections: Vec<MeshSection>,
+}
+
+impl MeshGeometry {
+    /// Bytes its vertices and indices take on the GPU.
+    pub fn gpu_bytes(&self) -> u64 {
+        (self.vertices.len() * std::mem::size_of::<PackedVertex>() + self.indices.len() * 4) as u64
+    }
+}
+
+/// A mesh's full geometry, kept on the CPU while its instance's
+/// `vertices`/`indices` hold its virtual-geometry fallback
+/// ([`StaticMeshComponent::full_geometry`]): the source to show again when
+/// the instance stops using virtual geometry.
+#[derive(Clone)]
+pub enum FullGeometry {
+    /// The mesh asset's loaded payload (shared with the world's asset
+    /// cache), under the key its binding gave it.
+    Asset {
+        key: MeshGeometryKey,
+        mesh: std::sync::Arc<LoadedMesh>,
+    },
+    /// Geometry its writer filled in (a generated mesh), shared by the
+    /// instances that showed it.
+    Owned(std::sync::Arc<MeshGeometry>),
+}
+
+impl FullGeometry {
+    pub fn key(&self) -> MeshGeometryKey {
+        match self {
+            Self::Asset { key, .. } => *key,
+            Self::Owned(geometry) => geometry.key,
+        }
+    }
+
+    pub fn vertices(&self) -> &[PackedVertex] {
+        match self {
+            Self::Asset { mesh, .. } => &mesh.upload.geometry.vertices,
+            Self::Owned(geometry) => &geometry.vertices,
+        }
+    }
+
+    pub fn indices(&self) -> &[u32] {
+        match self {
+            Self::Asset { mesh, .. } => &mesh.upload.geometry.indices,
+            Self::Owned(geometry) => &geometry.indices,
+        }
+    }
+
+    pub fn sections(&self) -> &[MeshSection] {
+        match self {
+            Self::Asset { mesh, .. } => &mesh.upload.sections,
+            Self::Owned(geometry) => &geometry.sections,
+        }
+    }
+
+    /// Bytes its vertices and indices take on the GPU while shown.
+    pub fn gpu_bytes(&self) -> u64 {
+        (self.vertices().len() * std::mem::size_of::<PackedVertex>() + self.indices().len() * 4)
+            as u64
+    }
+}
+
+impl std::fmt::Debug for FullGeometry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FullGeometry")
+            .field("key", &self.key())
+            .field("vertices", &self.vertices().len())
+            .field("indices", &self.indices().len())
+            .finish()
+    }
+}
+
 /// The SceneDB asset kind of mesh files. A mesh asset's source is its
 /// file's absolute path.
 pub const MESH_ASSET_KIND: &str = "mesh";
@@ -402,6 +482,9 @@ fn bind_mesh_asset(component: &mut StaticMeshComponent, view: &AssetView) {
         return;
     };
     component.bounds_local = mesh.bounds_local;
+    // The asset's geometry replaces whatever the instance showed (its
+    // fallback included); the virtual-geometry host cuts a new one.
+    component.full_geometry = None;
     component.vertices = mesh.upload.geometry.vertices.clone();
     component.indices = mesh.upload.geometry.indices.clone();
     component.material_slots =
@@ -425,6 +508,7 @@ fn clear_mesh_geometry(component: &mut StaticMeshComponent) {
     component.mesh_sections.clear();
     component.material_slot_metadata.clear();
     component.geometry_key = MeshGeometryKey::NONE;
+    component.full_geometry = None;
 }
 
 /// Points `component` at the mesh asset its `mesh_asset` names. The world
@@ -1202,6 +1286,74 @@ pub struct StaticMeshComponent {
     /// have different real extents and must not collapse to the same bound.
     #[serde(skip)]
     pub bounds_local: [f32; 4],
+
+    /// The mesh's full geometry while `vertices`/`indices`/`mesh_sections`
+    /// hold its virtual-geometry fallback instead, `None` otherwise. The
+    /// virtual-geometry host swaps the fallback in once it is cut, so the
+    /// full geometry leaves the GPU (the interned ranges are freed with
+    /// their last reference) and only the fallback stays for what draws
+    /// classic geometry: the instance until its clusters are ready, shadows,
+    /// rays. Turning `virtual_geometry` off shows the full geometry again
+    /// from here; a binding of the mesh asset replaces both. Picking and the
+    /// cluster build read the full geometry ([`Self::source_vertices`]).
+    #[serde(skip)]
+    pub full_geometry: Option<FullGeometry>,
+}
+
+impl StaticMeshComponent {
+    /// The content key of the mesh's full geometry: [`Self::geometry_key`],
+    /// or while the instance shows its fallback, the full geometry's. The
+    /// identity of the mesh's virtual-geometry asset.
+    pub fn source_key(&self) -> MeshGeometryKey {
+        self.full_geometry
+            .as_ref()
+            .map_or(self.geometry_key, FullGeometry::key)
+    }
+
+    /// The mesh's full vertices (not the fallback's).
+    pub fn source_vertices(&self) -> &[PackedVertex] {
+        self.full_geometry
+            .as_ref()
+            .map_or(&self.vertices, FullGeometry::vertices)
+    }
+
+    /// The mesh's full indices (not the fallback's).
+    pub fn source_indices(&self) -> &[u32] {
+        self.full_geometry
+            .as_ref()
+            .map_or(&self.indices, FullGeometry::indices)
+    }
+
+    /// The mesh's full material sections (not the fallback's).
+    pub fn source_sections(&self) -> &[MeshSection] {
+        self.full_geometry
+            .as_ref()
+            .map_or(&self.mesh_sections, FullGeometry::sections)
+    }
+
+    /// Show `fallback` in place of the full geometry, keeping the full one in
+    /// [`Self::full_geometry`] (`full` gives it the first time).
+    pub fn show_fallback(&mut self, fallback: &MeshGeometry, full: impl FnOnce(&mut Self) -> FullGeometry) {
+        if self.full_geometry.is_none() {
+            let kept = full(self);
+            self.full_geometry = Some(kept);
+        }
+        self.vertices = fallback.vertices.clone();
+        self.indices = fallback.indices.clone();
+        self.mesh_sections = fallback.sections.clone();
+        self.geometry_key = fallback.key;
+    }
+
+    /// Show the full geometry again (a no-op unless the fallback shows).
+    pub fn show_full_geometry(&mut self) {
+        let Some(full) = self.full_geometry.take() else {
+            return;
+        };
+        self.vertices = full.vertices().to_vec();
+        self.indices = full.indices().to_vec();
+        self.mesh_sections = full.sections().to_vec();
+        self.geometry_key = full.key();
+    }
 }
 
 #[register_scene_props_applier]
@@ -1317,14 +1469,19 @@ fn decode_static_mesh_component(data: &serde_json::Value) -> Result<StaticMeshCo
 /// (the properties panel's mesh picker, a script) points the component at
 /// the newly named mesh asset, which the world loads and binds, and takes
 /// that asset's defaults (virtual geometry). A whole-value write (`None`)
-/// rebinds but keeps the value's own settings. Writes to any other property
-/// change nothing here.
+/// rebinds but keeps the value's own settings. Turning `virtual_geometry`
+/// off shows the full geometry again at once, from the copy kept while the
+/// fallback showed (only its GPU residency changes). Writes to any other
+/// property change nothing here.
 fn static_mesh_property_written(component: &mut StaticMeshComponent, property: Option<&str>) {
     match property {
         None => attach_mesh_asset(component),
         Some("mesh_asset") => {
             attach_mesh_asset(component);
             seed_from_asset_settings(component);
+        }
+        Some("virtual_geometry") if !component.virtual_geometry => {
+            component.show_full_geometry();
         }
         _ => {}
     }

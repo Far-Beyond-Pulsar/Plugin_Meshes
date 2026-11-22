@@ -3,6 +3,7 @@
 
 use engine_backend::scene::ObjectJoinRegistration;
 use engine_backend::scene::game_hooks::ContentReportRegistration;
+use engine_backend::services::memory_owners::MemoryOwnerRegistration;
 use engine_backend::scene::{ClassSpec, ComponentsBuilder};
 use engine_backend::subsystems::render::helio_renderer::{
     ContentGeometryRegistration, RenderHostPartRegistration,
@@ -135,6 +136,15 @@ pub(crate) fn build(p: &mut pulsar_plugins::PluginBuilder) {
         origin: p.origin(),
         key: "meshes",
         report: meshes_component::content_report,
+    });
+
+    // Each virtual-geometry asset's memory, for the Memory Explorer: its
+    // classic geometry, its fallback and its resident pages.
+    p.add(MemoryOwnerRegistration {
+        origin: p.origin(),
+        owner: "Virtual geometry",
+        columns: meshes_component::virtual_geometry_host::MEMORY_COLUMNS,
+        rows: meshes_component::virtual_geometry_host::memory_rows,
     });
 
     // The `project.virtual_geometry` settings.

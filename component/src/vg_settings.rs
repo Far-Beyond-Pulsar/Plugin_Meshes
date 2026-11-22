@@ -133,6 +133,12 @@ pub struct VirtualGeometrySettings {
     /// it costs under 0.02 ms.
     pub tier3: bool,
     pub debug_view: VirtualGeometryDebugView,
+    /// Error bound of a mesh's fallback, as a fraction of its bounding
+    /// radius: the classic stand-in an instance keeps on the GPU while its
+    /// full classic geometry is released (drawn until its virtual geometry
+    /// is ready, and by shadows and rays). The project default; a mesh asset
+    /// may set its own (`MeshAssetSettings::vg_fallback_error`).
+    pub fallback_relative_error: f32,
 }
 
 impl Default for VirtualGeometrySettings {
@@ -148,12 +154,16 @@ impl Default for VirtualGeometrySettings {
             two_phase_occlusion: true,
             tier3: false,
             debug_view: VirtualGeometryDebugView::None,
+            fallback_relative_error: helio_vg_stream::ProxyOptions::DEFAULT_RELATIVE_ERROR,
         }
     }
 }
 
 impl VirtualGeometrySettings {
     pub const TAU_RANGE: (f32, f32) = (0.1, 16.0);
+    /// A fallback's error bound, as a fraction of its mesh's bounding radius:
+    /// from 0.01 % (close to the source) to 25 % (a rough silhouette).
+    pub const FALLBACK_RELATIVE_ERROR_RANGE: (f32, f32) = (0.0001, 0.25);
     pub const PREFETCH_FACTOR_RANGE: (f32, f32) = (1.0, 8.0);
     pub const TILE_DENSITY_LIMIT_RANGE: (f32, f32) = (0.0, 256.0);
     pub const DENSE_SENSITIVITY_RANGE: (f32, f32) = (0.125, 8.0);
@@ -203,6 +213,9 @@ impl VirtualGeometrySettings {
             debug_view: text("debug_view")
                 .and_then(|value| VirtualGeometryDebugView::parse(&value))
                 .unwrap_or(defaults.debug_view),
+            fallback_relative_error: get("fallback_relative_error")
+                .and_then(|value| value.as_float().ok())
+                .map_or(defaults.fallback_relative_error, |value| value as f32),
         }
         .sanitized()
     }
@@ -239,6 +252,11 @@ impl VirtualGeometrySettings {
             Self::DENSE_SENSITIVITY_RANGE,
             defaults.dense_sensitivity,
         );
+        self.fallback_relative_error = finite_in(
+            self.fallback_relative_error,
+            Self::FALLBACK_RELATIVE_ERROR_RANGE,
+            defaults.fallback_relative_error,
+        );
         let (budget_min, budget_max) = Self::PAGE_BUDGET_RANGE_MB;
         self.page_budget_mb = self.page_budget_mb.clamp(budget_min, budget_max);
         self.max_visible_clusters = self
@@ -263,6 +281,7 @@ pub fn schema() -> NamespaceSchema {
     let (density_min, density_max) = VirtualGeometrySettings::TILE_DENSITY_LIMIT_RANGE;
     let (sens_min, sens_max) = VirtualGeometrySettings::DENSE_SENSITIVITY_RANGE;
     let (budget_min, budget_max) = VirtualGeometrySettings::PAGE_BUDGET_RANGE_MB;
+    let (fallback_min, fallback_max) = VirtualGeometrySettings::FALLBACK_RELATIVE_ERROR_RANGE;
     NamespaceSchema::new(
         "Virtual Geometry",
         "Cluster-based mesh rendering for static meshes",
@@ -410,6 +429,24 @@ pub fn schema() -> NamespaceSchema {
         .field_type(FieldType::Checkbox),
     )
     .setting(
+        "fallback_relative_error",
+        SchemaEntry::new(
+            "How far, as a fraction of a mesh's bounding radius, the classic stand-in of a virtual-geometry mesh may be from its surface. Only the stand-in stays in video memory beside the cluster pages; it is drawn until the clusters are ready, and by shadows and rays. A mesh asset can set its own in the mesh viewer",
+            f64::from(defaults.fallback_relative_error),
+        )
+        .label("Fallback Error (fraction of radius)")
+        .page("Rendering / Virtual Geometry")
+        .field_type(FieldType::NumberInput {
+            min: Some(f64::from(fallback_min)),
+            max: Some(f64::from(fallback_max)),
+            step: Some(0.001),
+        })
+        .validator(Validator::float_range(
+            f64::from(fallback_min),
+            f64::from(fallback_max),
+        )),
+    )
+    .setting(
         "debug_view",
         SchemaEntry::new(
             "Visualise virtual geometry internals",
@@ -503,6 +540,36 @@ mod tests {
             .tau_pixels
             .is_finite()
         );
+    }
+
+    #[test]
+    fn the_fallback_error_reads_saves_and_clamps() {
+        let defaults = VirtualGeometrySettings::default();
+        assert_eq!(
+            defaults.fallback_relative_error,
+            helio_vg_stream::ProxyOptions::DEFAULT_RELATIVE_ERROR
+        );
+        let read = |value: f64| {
+            lookup(HashMap::from([(
+                "fallback_relative_error",
+                ConfigValue::from(value),
+            )]))
+            .fallback_relative_error
+        };
+        assert_eq!(read(0.05), 0.05);
+        let (lo, hi) = VirtualGeometrySettings::FALLBACK_RELATIVE_ERROR_RANGE;
+        assert_eq!(read(0.0), lo);
+        assert_eq!(read(4.0), hi);
+        let cfg: &'static ConfigManager = Box::leak(Box::new(ConfigManager::new()));
+        let handle = cfg.register(NS, OWNER, schema()).expect("register");
+        handle
+            .set("fallback_relative_error", 0.02_f64)
+            .expect("fallback error");
+        assert_eq!(
+            VirtualGeometrySettings::from_config(cfg).fallback_relative_error,
+            0.02
+        );
+        assert!(handle.set("fallback_relative_error", 0.5_f64).is_err());
     }
 
     #[test]

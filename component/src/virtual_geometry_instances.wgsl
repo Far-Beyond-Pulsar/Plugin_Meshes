@@ -16,12 +16,14 @@ struct Override {
     lod_error_scale: f32,
 }
 
-/// `meshes_component::virtual_geometry_instances::VgAssetReadyRow`.
+/// `helio_vg_format::VgAssetReadyRow` (32 bytes).
 struct AssetReady {
-    vertex_offset: u32,
-    vertex_count: u32,
+    // The asset's content id, low word first.
+    content: vec4<u32>,
     asset_slot: u32,
     flags: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 struct Uniforms {
@@ -46,7 +48,9 @@ const UNIFORM_SCALE_TOLERANCE: f32 = 1.0e-3;
 @group(0) @binding(3) var<storage, read> override_handles: array<Handle>;
 @group(0) @binding(4) var<storage, read> override_pool: array<Override>;
 @group(0) @binding(5) var<storage, read> section_handles: array<Handle>;
-@group(0) @binding(6) var<storage, read> vertex_handles: array<Handle>;
+// Per static-mesh instance: the content id of its full geometry (its
+// virtual-geometry asset), `StaticMeshDraw::vg_asset`.
+@group(0) @binding(6) var<storage, read> vg_assets: array<vec4<u32>>;
 @group(0) @binding(7) var<storage, read> objects: array<StaticObjectRow>;
 @group(0) @binding(8) var<storage, read> asset_ready: array<AssetReady>;
 // Per object entity: (override flags | OVERRIDE_PRESENT, bitcast scale), or
@@ -60,23 +64,35 @@ const UNIFORM_SCALE_TOLERANCE: f32 = 1.0e-3;
 // Per static_objects row: set for every section row of a VG-active instance.
 @group(0) @binding(14) var<storage, read_write> classic_suppressed: array<atomic<u32>>;
 
-/// Rows of `asset_ready` are sorted ascending by `vertex_offset`; padding rows
-/// carry `vertex_offset == 0xffffffff` and sort last.
-fn find_asset(vertex_offset: u32) -> u32 {
+/// Whether content id `a` sorts before `b`, both read as a `u128` whose
+/// word 3 is the most significant (`VgAssetReadyRow::sort_key`).
+fn content_less(a: vec4<u32>, b: vec4<u32>) -> bool {
+    if a.w != b.w { return a.w < b.w; }
+    if a.z != b.z { return a.z < b.z; }
+    if a.y != b.y { return a.y < b.y; }
+    return a.x < b.x;
+}
+
+/// Rows of `asset_ready` are sorted ascending by content id; padding rows
+/// carry an all-ones content, sort last and are never ready. A zero content
+/// (no geometry) names no asset.
+fn find_asset(content: vec4<u32>) -> u32 {
+    if all(content == vec4<u32>(0u)) {
+        return NO_ASSET;
+    }
     let n = arrayLength(&asset_ready);
     var low = 0u;
     var high = n;
     loop {
         if low >= high { break; }
         let mid = low + (high - low) / 2u;
-        if asset_ready[mid].vertex_offset < vertex_offset {
+        if content_less(asset_ready[mid].content, content) {
             low = mid + 1u;
         } else {
             high = mid;
         }
     }
-    if low < n && asset_ready[low].vertex_offset == vertex_offset
-        && asset_ready[low].vertex_count != 0u {
+    if low < n && all(asset_ready[low].content == content) {
         return low;
     }
     return NO_ASSET;
@@ -136,7 +152,7 @@ fn cs_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (u.flags & 1u) == 0u {
         return;
     }
-    if row >= arrayLength(&section_handles) || row >= arrayLength(&vertex_handles)
+    if row >= arrayLength(&section_handles) || row >= arrayLength(&vg_assets)
         || row >= arrayLength(&owners) {
         return;
     }
@@ -158,13 +174,10 @@ fn cs_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (object.flags & INSTANCE_FLAG_VIRTUAL_GEOMETRY) == 0u {
         return;
     }
-    // Asset readiness (root pages resident), found by the instance's interned
-    // vertex range.
-    let vertices = vertex_handles[row];
-    if vertices.count == 0u {
-        return;
-    }
-    let asset = find_asset(vertices.offset);
+    // Asset readiness (root pages resident), found by the content id of the
+    // instance's full geometry: whether it shows that geometry or its
+    // fallback, the asset is the same.
+    let asset = find_asset(vg_assets[row]);
     if asset == NO_ASSET || (asset_ready[asset].flags & ASSET_READY_BIT) == 0u {
         return;
     }
