@@ -13,6 +13,13 @@ pub const WGSL: &str = include_str!("../shaders/vg_format.wgsl");
 pub const CLUSTER_MAX_TRIS: u32 = 128;
 pub const CLUSTER_MAX_VERTS: u32 = 128;
 pub const CLUSTER_MIN_TRIS: u32 = 32;
+/// Default of the overdraw valve's limit: triangles per covered pixel one
+/// 16x16 screen tile may hold before the clusters over it are coarsened.
+/// Measured on the museum and forest (RTX 4090, 1280x720, revision-13 caches):
+/// off, the overview selects 203M triangles in 29 ms of GPU; at 16 it selects
+/// 26M in 9.6 ms, and 32 measures the same within 3%, so the valve only acts
+/// on the pathological tiles (sub-pixel foliage) it exists for.
+pub const DEFAULT_TILE_DENSITY_LIMIT: f32 = 16.0;
 /// Streaming page size in bytes.
 pub const PAGE_BYTES: u32 = 128 * 1024;
 /// Most clusters one simplification group may have (limited in practice by

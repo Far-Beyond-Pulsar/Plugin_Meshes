@@ -667,11 +667,17 @@ impl ApplicationHandler for App {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or_else(|| runtime.settings().page_budget_mb);
+        let tile_density_limit = std::env::var("VG_STRESS_TILE_DENSITY")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or_else(|| runtime.settings().tile_density_limit);
         runtime.set_settings(VgRuntimeSettings {
             tau_px: tau,
             mode,
             tier3,
             page_budget_mb,
+            tile_density_limit,
             ..runtime.settings()
         });
         println!("[Museum] VG mode {mode:?} (VG_STRESS_MODE=auto|hw|nonrt|off)");

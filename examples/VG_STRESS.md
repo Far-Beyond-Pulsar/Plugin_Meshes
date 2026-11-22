@@ -528,7 +528,8 @@ created): `HELIO_VG_DENSE_TRI` (base triangles per tile, default 64),
 `HELIO_VG_DENSE_LATCH` (frames a tile stays dense, default 8) and
 `HELIO_VG_DENSE_MAX_TILES` (qualifying tiles per frame, default 512; the
 thresholds are scaled by sensitivity too).
-`VG_STRESS_PAGE_MB` sets the page-pool budget.
+`VG_STRESS_PAGE_MB` sets the page-pool budget. `VG_STRESS_TILE_DENSITY=<n>` sets the
+overdraw valve's limit (triangles per covered pixel per 16x16 tile, 0 = off).
 
 ```powershell
 $env:VG_STRESS_TIER3 = '1'

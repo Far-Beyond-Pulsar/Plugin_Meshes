@@ -83,7 +83,7 @@ impl Default for VgCullConfig {
         Self {
             tau_px: 1.0,
             sw_edge_px: 2.0,
-            tile_density_limit: 8.0,
+            tile_density_limit: helio_vg_format::DEFAULT_TILE_DENSITY_LIMIT,
             prefetch_factor: 2.0,
             mode: VgMode::Auto,
             two_phase_occlusion: true,

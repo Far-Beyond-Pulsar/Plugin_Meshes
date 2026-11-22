@@ -147,7 +147,7 @@ impl Default for VirtualGeometrySettings {
             mode: VirtualGeometryMode::Auto,
             tau_pixels: 1.0,
             prefetch_factor: 2.0,
-            tile_density_limit: 16.0,
+            tile_density_limit: helio_vg_format::DEFAULT_TILE_DENSITY_LIMIT,
             dense_sensitivity: 1.0,
             page_budget_mb: 512,
             max_visible_clusters: 4_194_304,
