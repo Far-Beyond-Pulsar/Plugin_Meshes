@@ -95,8 +95,6 @@ pub struct GltfMaterial {
     pub base: Option<String>,
     pub normal: Option<String>,
     pub arm: Option<String>,
-    /// `KHR_texture_transform` of the base colour texture: `(scale, offset)`.
-    pub uv: Option<([f32; 2], [f32; 2])>,
 }
 
 pub fn gltf_materials(doc: &serde_json::Value) -> HashMap<String, GltfMaterial> {
@@ -113,14 +111,6 @@ pub fn gltf_materials(doc: &serde_json::Value) -> HashMap<String, GltfMaterial> 
         };
         let pbr = &m["pbrMetallicRoughness"];
         let base = &pbr["baseColorTexture"];
-        let pair = |v: &serde_json::Value| -> Option<[f32; 2]> {
-            Some([v.get(0)?.as_f64()? as f32, v.get(1)?.as_f64()? as f32])
-        };
-        let tt = &base["extensions"]["KHR_texture_transform"];
-        let rotation = tt["rotation"].as_f64().unwrap_or(0.0);
-        let uv = (rotation == 0.0)
-            .then(|| Some((pair(&tt["scale"])?, pair(&tt["offset"]).unwrap_or([0.0; 2]))))
-            .flatten();
         out.insert(
             name.to_string(),
             GltfMaterial {
@@ -128,7 +118,6 @@ pub fn gltf_materials(doc: &serde_json::Value) -> HashMap<String, GltfMaterial> 
                 base: image_of(base),
                 normal: image_of(&m["normalTexture"]),
                 arm: image_of(&pbr["metallicRoughnessTexture"]),
-                uv,
             },
         );
     }
@@ -475,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn real_gltf_alpha_modes_and_uv_transforms_are_read() {
+    fn real_gltf_alpha_modes_and_images_are_read() {
         let leaves = gltf_materials(&fixture("island_tree_01.gltf"));
         assert!(leaves["island_tree_01_leaves"].masked);
         assert!(!leaves["island_tree_01"].masked && !leaves["island_tree_01_branches"].masked);
@@ -491,10 +480,6 @@ mod tests {
             leaves["island_tree_01_leaves"].arm.as_deref(),
             Some("textures/island_tree_01_leaves_arm_2k.jpg")
         );
-        let (scale, offset) = leaves["island_tree_01_branches"].uv.unwrap();
-        assert!((scale[0] - 15.0).abs() < 1e-4 && (scale[1] - 3.4).abs() < 1e-4);
-        assert!((offset[1] + 2.4).abs() < 1e-4);
-        assert!(leaves["island_tree_01"].uv.is_none());
         let small = gltf_materials(&fixture("tree_small_02.gltf"));
         assert!(small["tree_small_02_leaves"].masked && !small["tree_small_02_trunk"].masked);
         assert_eq!(

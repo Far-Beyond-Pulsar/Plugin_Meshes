@@ -475,10 +475,11 @@ settle frames, not a streaming-ready signal, so a shot that needs many pages
 `vg.pool.resident_pages` between runs.
 
 The forest shots need the Poly Haven trees. Their glTFs require
-`KHR_texture_transform`, which the importer refuses, so the loader hands it a
-sibling `<name>.vgimport.gltf` copy with that extension no longer required
-(`importable_path` in `vg_stress_loading.rs`) and bakes the UV transform into
-the vertices itself.
+`KHR_texture_transform`; the importer carries it on each material's texture
+slots, and the loader bakes the base colour slot's transform into the
+vertices (`load_scene` in `vg_stress_loading.rs`), since the museum's
+materials sample the vertex UVs as they are. A `<name>.vgimport.gltf` left
+beside a tree by an older loader is no longer read and can be deleted.
 
 ## Tier 3 measurements (dense tiles)
 
