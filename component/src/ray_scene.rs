@@ -14,10 +14,13 @@
 //!   traced sections are the segments of its BLAS (each with its own
 //!   opacity), shared by every instance of the mesh; a hit's surface row is
 //!   its instance's custom data (the mesh's first row) plus the hit's
-//!   `geometry_index`. Virtual-geometry meshes are traced through their
-//!   assets' coarse proxies ([`helio_mesh_host::ray_proxies`]), a segment for
-//!   each of the proxy's material sections, drawn with the mesh's section
-//!   of that slot.
+//!   `geometry_index`. A mesh with `virtual_geometry` on is traced like any
+//!   other: its component holds the full source geometry (the `.vgeo` is
+//!   built from it, and it stays mirrored as the classic fallback), so its
+//!   BLAS is exact and needs no copy of the vertices. A coarse cut of the
+//!   cluster DAG would only add memory and error here (rays would hit a
+//!   surface up to the cut's error away from the one the raster draws, which
+//!   shows as wrong shadows and GI).
 //! - **Incremental.** The world's change journals say what changed: a mesh,
 //!   its materials or its enabled state re-evaluates that mesh; a transform
 //!   or parent change re-places the meshes below that entity (an index of
@@ -83,10 +86,9 @@ use glam::{DMat4, DVec3};
 use helio_core::{BlasGeometry, BlasManager, BlasSegment, TlasInstanceInput, TlasManager};
 use helio_mats::instance::{MaterialInstanceComponent, row_of};
 use helio_mesh_api::{
-    RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_SKINNED, RAY_INSTANCE_TWO_SIDED,
-    RAY_SPACE_GROUP, RAY_SPACE_SLOTS, RayInstance, RayProgram, RayPrograms, RayTransform,
+    RAY_INSTANCE_MASKED, RAY_INSTANCE_SKINNED, RAY_INSTANCE_TWO_SIDED, RAY_SPACE_GROUP,
+    RAY_SPACE_SLOTS, RayInstance, RayProgram, RayPrograms, RayTransform,
 };
-use helio_mesh_host::ray_proxies::{Lookup, ProxyRange, VgRayProxies};
 use helio_pass_mesh_rays::RayTracingSettings;
 use pulsar_scene_model::attachments::ComponentOwner;
 use pulsar_scene_model::{Parent, SpaceSlot, Transform, Visibility};
@@ -120,12 +122,6 @@ enum BlasKey {
         geometry: u128,
         sections: Vec<(u32, u32, bool)>,
     },
-    /// A virtual-geometry asset's proxy: its traced material sections, first
-    /// index (relative to the proxy's), index count and opacity each.
-    Proxy {
-        key: u64,
-        sections: Vec<(u32, u32, bool)>,
-    },
     /// A skinned instance's own deforming BLAS (its entity's bits), its
     /// mesh and traced sections as a mesh's.
     Skinned {
@@ -143,7 +139,6 @@ enum Source {
         vertices: VarLenHandle,
         first_index: u32,
     },
-    Proxy(ProxyRange),
     /// A skinned instance's vertices in the skin cache (by its entity), its
     /// indices in the mesh pool from `first_index`.
     Skinned {
@@ -190,7 +185,6 @@ enum Skip {
     Unloaded,
     Unmirrored,
     NoMaterials,
-    ProxyPending,
     Disabled,
     Hidden,
     Glass,
@@ -200,7 +194,7 @@ impl Skip {
     fn retried(self) -> bool {
         matches!(
             self,
-            Self::Unloaded | Self::Unmirrored | Self::NoMaterials | Self::ProxyPending
+            Self::Unloaded | Self::Unmirrored | Self::NoMaterials
         )
     }
 
@@ -209,7 +203,6 @@ impl Skip {
             Self::Unloaded => "not loaded",
             Self::Unmirrored => "not on the GPU yet",
             Self::NoMaterials => "without materials",
-            Self::ProxyPending => "proxy building",
             Self::Disabled => "disabled",
             Self::Hidden => "hidden",
             Self::Glass => "only glass",
@@ -227,7 +220,6 @@ struct Traced {
     movable: bool,
     /// The coordinate space slot its owner is authored in.
     space: u32,
-    proxy: Option<u64>,
     /// Its TLAS instance, once its BLAS is built.
     slot: Option<usize>,
     /// Its BLAS's triangles and their count, for the build.
@@ -336,7 +328,6 @@ pub struct WorldRayScene {
     /// The material rows' and keys' flush sequences the surfaces were last
     /// read at ([`Self::refresh_surfaces`]).
     materials_seen: (u64, u64),
-    vg: Option<VgRayProxies>,
     tlas_ok: bool,
     logged: Option<Stats>,
     warned: bool,
@@ -352,13 +343,8 @@ pub struct WorldRayScene {
 }
 
 impl WorldRayScene {
-    /// `None` without hardware ray queries on `device`. `virtual_geometry`:
-    /// the runtime whose assets are traced through proxies.
-    pub fn new(
-        device: Arc<wgpu::Device>,
-        queue: Arc<wgpu::Queue>,
-        virtual_geometry: Option<helio_vg_stream::VgRuntime>,
-    ) -> Option<Self> {
+    /// `None` without hardware ray queries on `device`.
+    pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Option<Self> {
         let tlas = TlasManager::new(device.clone(), 1);
         if !tlas.is_rt_available() {
             return None;
@@ -393,7 +379,6 @@ impl WorldRayScene {
             programs: Arc::new(RayPrograms::default()),
             pending: HashSet::new(),
             materials_seen: (0, 0),
-            vg: virtual_geometry.map(VgRayProxies::new),
             tlas_ok: false,
             logged: None,
             warned: false,
@@ -431,14 +416,6 @@ impl WorldRayScene {
         let store = mirror.store();
         // Compact the BLASes built in earlier frames (a few a frame).
         self.blas.maintain(&self.queue);
-        // Proxies that came or went: re-evaluate everything.
-        if self
-            .vg
-            .as_mut()
-            .is_some_and(|vg| vg.poll(&self.device, &self.queue))
-        {
-            self.cursors = None;
-        }
         // A new criterion re-tests every traced instance.
         if settings != self.settings {
             self.settings = settings;
@@ -572,11 +549,6 @@ impl WorldRayScene {
         }
         if let Some(groups) = &self.space_groups_buffer {
             rays = rays.with(helio_mesh_api::RAY_SPACE_GROUPS, groups.clone());
-        }
-        if let Some((vertices, indices)) = self.vg.as_ref().and_then(VgRayProxies::buffers) {
-            rays = rays
-                .with(helio_mesh_api::RAY_PROXY_VERTICES, vertices.clone())
-                .with(helio_mesh_api::RAY_PROXY_INDICES, indices.clone());
         }
         if let Some(skinned) = self
             .skinned_vertices
@@ -956,7 +928,6 @@ impl WorldRayScene {
             world: world_matrix,
             movable: true,
             space: 0,
-            proxy: None,
             slot: None,
             source_hint: (
                 Source::Skinned {
@@ -1001,10 +972,9 @@ impl WorldRayScene {
         let Some(instances) = world.get::<MeshMaterials>(entity) else {
             return Err(Skip::NoMaterials);
         };
-        // The traced sections: each with its ordinal (a virtual-geometry
-        // asset's material slot), material instance and surface.
+        // The traced sections: each with its material instance and surface.
         let mut sections = Vec::new();
-        for (ordinal, section) in StaticMeshDraw::of(mesh).sections.into_iter().enumerate() {
+        for section in StaticMeshDraw::of(mesh).sections {
             if section.index_count == 0
                 || section.first_index as u64 + section.index_count as u64 > indices.count as u64
             {
@@ -1018,7 +988,7 @@ impl WorldRayScene {
                 .surface(world, mirror, material)
                 .ok_or(Skip::NoMaterials)?;
             if !surface.blended {
-                sections.push((ordinal as u32, section, material, surface));
+                sections.push((section, material, surface));
             }
         }
         if sections.is_empty() {
@@ -1036,112 +1006,43 @@ impl WorldRayScene {
                 program: surface.program,
                 _pad: [0; 2],
             };
-        let lookup = match self.vg.as_mut() {
-            Some(vg) => vg.lookup((vertices.offset, vertices.count)),
-            None => Lookup::Classic,
-        };
         let movable = helio::Movability::from(mesh.movability).can_move();
-        let (key, rows, materials, proxy, source_hint) = match lookup {
-            Lookup::Pending => return Err(Skip::ProxyPending),
-            Lookup::Proxy(key, range) => {
-                // A segment a material section of the proxy, drawn with the
-                // mesh's section of that ordinal (the asset's material slot).
-                let parts: Vec<_> = self
-                    .vg
-                    .as_ref()
-                    .map(|vg| vg.sections(key).to_vec())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|part| {
-                        sections
-                            .iter()
-                            .find(|(ordinal, ..)| *ordinal == part.material)
-                            .map(|(_, _, material, surface)| (part, *material, *surface))
-                    })
-                    .collect();
-                if parts.is_empty() {
-                    return Err(Skip::Glass);
-                }
-                (
-                    BlasKey::Proxy {
-                        key,
-                        sections: parts
-                            .iter()
-                            .map(|(part, _, surface)| {
-                                (
-                                    part.first_index,
-                                    part.index_count,
-                                    surface.flags & RAY_INSTANCE_MASKED == 0,
-                                )
-                            })
-                            .collect(),
-                    },
-                    parts
-                        .iter()
-                        .map(|(part, material, surface)| {
-                            row(
-                                range.first_index + part.first_index,
-                                range.first_vertex,
-                                RAY_INSTANCE_PROXY,
-                                *material,
-                                surface,
-                            )
-                        })
-                        .collect(),
-                    parts.iter().map(|(_, material, _)| *material).collect(),
-                    Some(key),
+        let key = BlasKey::Mesh {
+            geometry: mesh.geometry_key.0,
+            sections: sections
+                .iter()
+                .map(|(s, _, surface)| {
                     (
-                        Source::Proxy(range),
-                        parts
-                            .iter()
-                            .map(|(p, ..)| u64::from(p.index_count / 3))
-                            .sum(),
-                    ),
-                )
-            }
-            Lookup::Classic => (
-                BlasKey::Mesh {
-                    geometry: mesh.geometry_key.0,
-                    sections: sections
-                        .iter()
-                        .map(|(_, s, _, surface)| {
-                            (
-                                s.first_index,
-                                s.index_count,
-                                surface.flags & RAY_INSTANCE_MASKED == 0,
-                            )
-                        })
-                        .collect(),
-                },
-                sections
-                    .iter()
-                    .map(|(_, s, material, surface)| {
-                        row(
-                            indices.offset + s.first_index,
-                            vertices.offset,
-                            0,
-                            *material,
-                            surface,
-                        )
-                    })
-                    .collect(),
-                sections
-                    .iter()
-                    .map(|(_, _, material, _)| *material)
-                    .collect(),
-                None,
-                (
-                    Source::Mesh {
-                        vertices,
-                        first_index: indices.offset,
-                    },
-                    sections
-                        .iter()
-                        .map(|(_, s, _, _)| u64::from(s.index_count / 3))
-                        .sum(),
-                ),
-            ),
+                        s.first_index,
+                        s.index_count,
+                        surface.flags & RAY_INSTANCE_MASKED == 0,
+                    )
+                })
+                .collect(),
         };
+        let rows = sections
+            .iter()
+            .map(|(s, material, surface)| {
+                row(
+                    indices.offset + s.first_index,
+                    vertices.offset,
+                    0,
+                    *material,
+                    surface,
+                )
+            })
+            .collect();
+        let materials = sections.iter().map(|(_, material, _)| *material).collect();
+        let source_hint = (
+            Source::Mesh {
+                vertices,
+                first_index: indices.offset,
+            },
+            sections
+                .iter()
+                .map(|(s, _, _)| u64::from(s.index_count / 3))
+                .sum(),
+        );
         let (center, radius) = world_sphere(world_matrix, mesh.bounds_local);
         Ok(Traced {
             key,
@@ -1150,7 +1051,6 @@ impl WorldRayScene {
             world: world_matrix,
             movable,
             space: 0,
-            proxy,
             slot: None,
             source_hint,
             center,
@@ -1188,7 +1088,6 @@ impl WorldRayScene {
     fn build_blases(&mut self, store: &SceneGpuStore, encoder: &mut wgpu::CommandEncoder) {
         let vertex_pool = store.resolve_buffer_handle(helio_mesh_api::MESH_VERTICES.key());
         let index_pool = store.resolve_buffer_handle(helio_mesh_api::MESH_INDICES.key());
-        let proxies = self.vg.as_ref().and_then(VgRayProxies::buffers);
         let mut budget = BUILD_TRIANGLES_PER_FRAME;
         let mut built_any = false;
         while let Some(key) = self.build_queue.front() {
@@ -1240,34 +1139,6 @@ impl WorldRayScene {
                             .map_err(|e| e.to_string())
                     }
                     _ => Err("the mesh pools are not registered".into()),
-                },
-                (BlasKey::Proxy { sections, .. }, Source::Proxy(range)) => match proxies {
-                    Some((vertices, indices)) => self
-                        .blas
-                        .build(
-                            blas.id,
-                            encoder,
-                            sections
-                                .iter()
-                                .map(|&(first, count, opaque)| BlasSegment {
-                                    geometry: BlasGeometry {
-                                        positions_revision: 0,
-                                        topology_revision: 0,
-                                        vertices,
-                                        first_vertex: range.first_vertex,
-                                        vertex_count: range.vertex_count,
-                                        vertex_stride: helio_mesh_api::RAY_PROXY_VERTEX_BYTES,
-                                        indices: Some(indices),
-                                        first_index: range.first_index + first,
-                                        index_count: count,
-                                    },
-                                    opaque,
-                                })
-                                .collect(),
-                            helio_core::Movability::Static,
-                        )
-                        .map_err(|e| e.to_string()),
-                    None => Err("the proxy pool is missing".into()),
                 },
                 _ => Err("source does not match its key".into()),
             };
@@ -1412,8 +1283,7 @@ impl WorldRayScene {
 
     /// Lay the traced meshes' rows out in TLAS order (each instance's custom
     /// data its first row, each row its instance), give the spaces their
-    /// mask groups and each instance its mask, and upload them; keep the
-    /// proxies they use.
+    /// mask groups and each instance its mask, and upload them.
     fn write_rows(&mut self) {
         self.rows_dirty = false;
         self.all_moved = true;
@@ -1427,7 +1297,6 @@ impl WorldRayScene {
             })
             .collect();
         let groups = helio_mesh_api::ray_space_groups(traced_spaces);
-        let mut proxies = HashSet::new();
         for (slot, entity) in self.slots.iter().enumerate() {
             let Some(Ok(traced)) = self.entries.get(entity).map(|e| &e.state) else {
                 continue;
@@ -1441,7 +1310,6 @@ impl WorldRayScene {
                 instance: slot as u32,
                 ..*row
             }));
-            proxies.extend(traced.proxy);
         }
         if groups != self.space_groups || self.space_groups_buffer.is_none() {
             self.space_groups = groups;
@@ -1455,14 +1323,6 @@ impl WorldRayScene {
             });
             self.queue
                 .write_buffer(buffer, 0, bytemuck::cast_slice(&self.space_groups));
-        }
-        for entity in &self.awaiting_blas {
-            if let Some(Ok(traced)) = self.entries.get(entity).map(|e| &e.state) {
-                proxies.extend(traced.proxy);
-            }
-        }
-        if let Some(vg) = self.vg.as_mut() {
-            vg.retain(&proxies);
         }
         let size = (self.rows.len().max(1) * std::mem::size_of::<RayInstance>()) as u64;
         if self

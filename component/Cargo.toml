@@ -31,8 +31,6 @@ helio-feature-api = { workspace = true }
 helio-scene-join = { workspace = true }
 helio-settings = { workspace = true }
 helio-mesh-api = { workspace = true }
-# The ray-traced scene's texture means and payload contract (`ray_scene`).
-helio-mesh-host = { workspace = true }
 helio-frame-api = { workspace = true }
 helio-mats = { workspace = true, features = ["instances"] }
 helio-asset-compat = { workspace = true }
@@ -47,6 +45,8 @@ helio-pass-vg = { workspace = true }
 helio-vg-format = { workspace = true }
 helio-vg-stream = { workspace = true }
 helio-vg-build = { workspace = true }
+# The `.vgeo` builds run as host tasks (`virtual_geometry_host`).
+helio-tasks = { workspace = true }
 # The animation runtime and skeletal formats the skeletal mesh decodes and
 # drives (the animation plugin's crate; see the plan doc's step 1 audit).
 skeletal_assets = { workspace = true }
