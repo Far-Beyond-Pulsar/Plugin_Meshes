@@ -109,7 +109,10 @@ fn uses_explicit_specular_ior_workflow(material: &SolidMaterial) -> bool {
         || !ior_is_default
 }
 
-fn convert_texture_ref(
+/// A source texture slot as the materials read it: its texture, UV set and
+/// UV transform. The one conversion of a slot, for the material rows and the
+/// material sources ([`crate::MaterialImage`]) alike.
+pub(crate) fn convert_texture_ref(
     texture: &SolidTextureRef,
     semantic: TextureSemantic,
 ) -> ConvertedTextureRef {

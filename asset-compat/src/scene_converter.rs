@@ -146,11 +146,15 @@ fn fallback_texture(semantic: TextureSemantic) -> helio_mats::TextureUpload {
 }
 
 /// An image file one of a source material's texture slots names, located on
-/// disk.
+/// disk, with how the slot reads it: its UV set and its UV transform (glTF
+/// `KHR_texture_transform`, `helio_mats::TextureTransform`), as the
+/// material rows take them ([`crate::ConvertedMaterial::texture_data`]).
 #[derive(Debug, Clone)]
 pub struct MaterialImage {
     pub semantic: TextureSemantic,
     pub path: std::path::PathBuf,
+    pub uv_channel: u32,
+    pub transform: helio_mats::TextureTransform,
 }
 
 /// A source material: its name and the image files its texture slots name.
@@ -187,7 +191,13 @@ fn collect_material_sources(scene: &Scene, base_dir: &std::path::Path) -> Vec<Ma
                     texture.texture_index,
                     base_dir,
                 )?;
-                Some(MaterialImage { semantic, path })
+                let read = crate::material_converter::convert_texture_ref(texture, semantic);
+                Some(MaterialImage {
+                    semantic,
+                    path,
+                    uv_channel: read.uv_channel,
+                    transform: read.transform,
+                })
             })
             .collect(),
         })
@@ -614,4 +624,57 @@ fn unpack_snorm4x8(packed: u32) -> [f32; 4] {
         bytes[2] as i8 as f32 / 127.0,
         bytes[3] as i8 as f32 / 127.0,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solid_rs::scene::{Image, Material, Texture, TextureRef, TextureTransform};
+
+    /// A material source's images keep how their slots read them: the UV
+    /// set and `KHR_texture_transform` (the Poly Haven tree's branches),
+    /// what the editor's import companion builds its graph from.
+    #[test]
+    // The converter locates images on the real file system (`texture_loader`
+    // has no engine_fs), so the fixture image is a real file.
+    #[allow(clippy::disallowed_methods)]
+    fn material_images_keep_their_slots_uv_set_and_transform() {
+        let dir = std::env::temp_dir().join(format!("asset-compat-sources-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bark.png"), b"png").unwrap();
+
+        let mut scene = Scene::new();
+        scene.images.push(Image::from_uri("bark", "bark.png"));
+        scene.textures.push(Texture::new("bark", 0));
+        let mut material = Material::new("branches");
+        material.base_color_texture = Some(TextureRef {
+            texture_index: 0,
+            uv_channel: 1,
+            transform: Some(TextureTransform {
+                offset: solid_rs::glam::Vec2::new(0.0, -2.4),
+                rotation: 0.25,
+                scale: solid_rs::glam::Vec2::new(15.0, 3.4),
+            }),
+        });
+        material.occlusion_texture = Some(TextureRef::new(0));
+        scene.materials.push(material);
+
+        let sources = collect_material_sources(&scene, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let images = &sources[0].images;
+        assert_eq!(images.len(), 2);
+        let base = &images[0];
+        assert_eq!(base.semantic, TextureSemantic::BaseColor);
+        assert_eq!(base.uv_channel, 1);
+        assert_eq!(
+            base.transform,
+            helio_mats::TextureTransform {
+                offset: [0.0, -2.4],
+                scale: [15.0, 3.4],
+                rotation_radians: 0.25,
+            }
+        );
+        assert_eq!(images[1].transform, helio_mats::TextureTransform::IDENTITY);
+        assert_eq!(images[1].uv_channel, 0);
+    }
 }
