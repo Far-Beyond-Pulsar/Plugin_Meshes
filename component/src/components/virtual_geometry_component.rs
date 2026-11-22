@@ -11,7 +11,10 @@
 //! object through `ComponentOwner`, like `LODComponent`. Its authored values
 //! reach the GPU as one [`VgOverrideGpu`] row in the variable-length buffer
 //! `vg_instance_overrides` (handles in `vg_instance_overrides::handles`,
-//! keyed by the component's entity row). The virtual-geometry scene
+//! keyed by the component's entity row), derived from the value on every
+//! insert, write, removal and replay ([`VirtualGeometryOverrideRow`]), so
+//! however a value is written (a literal, a decode, a property edit) its row
+//! is its authored values. The virtual-geometry scene
 //! derivation ([`crate::virtual_geometry_instances`]) joins it to the
 //! owner's static-mesh instances on the GPU.
 //!
@@ -23,6 +26,8 @@
 use engine_class_derive::{engine_class, world_component};
 use helio_vg_format::{INST_FORCE_ROOT_ONLY, INST_SHADOW_CASTER, INST_TIER_SHIFT, TierLock};
 use pulsar_reflection::Reflectable;
+use pulsar_scenedb::gpu::GpuMirrorHandle;
+use pulsar_scenedb_derive::SceneStore;
 use serde::{Deserialize, Serialize};
 
 /// Which raster tier an instance is locked to.
@@ -62,8 +67,7 @@ pub const LOD_ERROR_SCALE_RANGE: (f32, f32) = (1.0 / 64.0, 64.0);
     clone,
     debug,
     serialize,
-    deserialize,
-    scene_store
+    deserialize
 )]
 pub struct VirtualGeometryComponent {
     /// Pin the instance to one raster tier instead of choosing per cluster.
@@ -87,13 +91,6 @@ pub struct VirtualGeometryComponent {
     #[property]
     #[serde(default = "default_true")]
     pub shadow_caster: bool,
-
-    /// The GPU source row derived from the properties above (one element).
-    /// Held as a variable-length range so the component follows the same
-    /// handle/pool scheme as `LODComponent`.
-    #[gpu(buffer = "vg_instance_overrides")]
-    #[serde(skip)]
-    pub gpu_override: Vec<VgOverrideGpu>,
 }
 
 fn default_true() -> bool {
@@ -106,15 +103,12 @@ fn default_one() -> f32 {
 
 impl Default for VirtualGeometryComponent {
     fn default() -> Self {
-        let mut component = Self {
+        Self {
             tier_lock: VgTierLock::Auto,
             lod_error_scale: 1.0,
             force_root_only: false,
             shadow_caster: true,
-            gpu_override: Vec::new(),
-        };
-        refresh_gpu_override(&mut component);
-        component
+        }
     }
 }
 
@@ -166,35 +160,61 @@ impl VirtualGeometryComponent {
     }
 }
 
-fn refresh_gpu_override(component: &mut VirtualGeometryComponent) {
-    component.gpu_override = vec![component.gpu_row()];
+/// What a [`VirtualGeometryComponent`] uploads: its one [`VgOverrideGpu`]
+/// row, held as a variable-length range (the handle/pool scheme
+/// `LODComponent` follows: a zero count means no component). Derived from
+/// the authored value by SceneDB on every insert, guarded write, removal and
+/// replay of the component (a second GPU registration on it, as
+/// `StaticMeshDraw` is the static mesh's), never cached on the value, so no
+/// write path can leave the row behind its properties.
+#[derive(SceneStore, Clone, Debug)]
+pub struct VirtualGeometryOverrideRow {
+    #[gpu(buffer = "vg_instance_overrides")]
+    pub rows: Vec<VgOverrideGpu>,
 }
 
-fn decode_virtual_geometry_component(
-    data: &serde_json::Value,
-) -> Result<VirtualGeometryComponent, String> {
-    let mut component: VirtualGeometryComponent = pulsar_world_registry::decode_json(data)?;
-    refresh_gpu_override(&mut component);
-    Ok(component)
-}
-
-fn virtual_geometry_property_written(
-    component: &mut VirtualGeometryComponent,
-    property: Option<&str>,
-) {
-    if matches!(
-        property,
-        None | Some("tier_lock" | "lod_error_scale" | "force_root_only" | "shadow_caster")
-    ) {
-        refresh_gpu_override(component);
+impl VirtualGeometryOverrideRow {
+    pub fn of(component: &VirtualGeometryComponent) -> Self {
+        Self {
+            rows: vec![component.gpu_row()],
+        }
     }
 }
 
-#[world_component(
-    decode = decode_virtual_geometry_component,
-    property_written = virtual_geometry_property_written
-)]
+fn virtual_geometry_override_dispatch(
+    mirror: &GpuMirrorHandle,
+    row: u32,
+    data: *const (),
+    is_new_insert: bool,
+) {
+    // SAFETY: SceneDB reaches this only through `VirtualGeometryComponent`'s
+    // own `ComponentId`, with a pointer to a live `VirtualGeometryComponent`.
+    let component = unsafe { &*(data as *const VirtualGeometryComponent) };
+    let derived = VirtualGeometryOverrideRow::of(component);
+    pulsar_scenedb::gpu::write_derived_row(mirror, row, &derived, is_new_insert);
+}
+
+fn virtual_geometry_override_clear(mirror: &GpuMirrorHandle, row: u32) {
+    pulsar_scenedb::gpu::clear_derived_row::<VirtualGeometryOverrideRow>(mirror, row);
+}
+
+pulsar_scenedb::pulsar_reflection::inventory::submit! {
+    pulsar_scenedb::gpu::GpuMirrorRegistration {
+        component_id: pulsar_scenedb::component_id::<VirtualGeometryComponent>,
+        dispatch: virtual_geometry_override_dispatch,
+    }
+}
+
+pulsar_scenedb::pulsar_reflection::inventory::submit! {
+    pulsar_scenedb::gpu::GpuClearRegistration {
+        component_id: pulsar_scenedb::component_id::<VirtualGeometryComponent>,
+        clear: virtual_geometry_override_clear,
+    }
+}
+
+#[world_component]
 impl VirtualGeometryComponent {}
+
 
 #[cfg(test)]
 mod tests {
@@ -213,7 +233,7 @@ mod tests {
         assert!(component.shadow_caster && !component.force_root_only);
         assert_eq!(component.tier_lock, VgTierLock::Auto);
         assert_eq!(component.lod_error_scale, 1.0);
-        let row = component.gpu_override[0];
+        let row = component.gpu_row();
         assert_eq!(row.flags, INST_SHADOW_CASTER);
         assert_eq!(row.lod_error_scale, 1.0);
     }
@@ -253,19 +273,21 @@ mod tests {
         assert_eq!(sanitize_lod_error_scale(2.5), 2.5);
     }
 
+    /// The uploaded row is derived from the value as written, however it was
+    /// made: a literal built with struct update syntax from the defaults
+    /// (what scripts and tests write) uploads its own authored values.
     #[test]
-    fn property_writes_refresh_the_gpu_row() {
-        let mut component = VirtualGeometryComponent::default();
-        component.shadow_caster = false;
-        component.lod_error_scale = 4.0;
-        virtual_geometry_property_written(&mut component, Some("shadow_caster"));
-        assert_eq!(component.gpu_override.len(), 1);
-        assert_eq!(component.gpu_override[0].flags & INST_SHADOW_CASTER, 0);
-        assert_eq!(component.gpu_override[0].lod_error_scale, 4.0);
-        // An unrelated property does not touch it.
-        component.tier_lock = VgTierLock::Dense;
-        virtual_geometry_property_written(&mut component, Some("something_else"));
-        assert_eq!(component.gpu_override[0].flags >> INST_TIER_SHIFT, 0);
+    fn the_uploaded_row_is_the_values_authored_values() {
+        let component = VirtualGeometryComponent {
+            force_root_only: true,
+            shadow_caster: false,
+            lod_error_scale: 16.0,
+            ..VirtualGeometryComponent::default()
+        };
+        let derived = VirtualGeometryOverrideRow::of(&component);
+        assert_eq!(derived.rows.len(), 1);
+        assert_eq!(derived.rows[0].flags, INST_FORCE_ROOT_ONLY);
+        assert_eq!(derived.rows[0].lod_error_scale, 16.0);
     }
 
     /// A component saved with fewer (or no) fields, or by a build that knew

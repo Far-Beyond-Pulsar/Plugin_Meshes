@@ -4,9 +4,11 @@
 //!
 //! Turns every live `StaticObjectComponent` SceneDB row into the exact same
 //! shape `Scene::rebuild_instance_buffers`'s CPU implementation used to
-//! produce: a sorted-by-`(material_class, graph_hash, mesh_id, material_id)`
-//! `instances`/`aabbs` array, one `draw_calls` entry per contiguous
-//! same-`(mesh_id, material_id)` run, and `(class, graph_hash, start, count)`
+//! produce: a sorted-by-`(material_class, graph_hash, mirrors, mesh_id,
+//! material_id)` `instances`/`aabbs` array, one `draw_calls` entry per
+//! contiguous same-`(mesh_id, material_id, mirrors)` run (a mirroring
+//! transform's run draws with the opposite front face, its range's class
+//! carrying `SEGMENT_RASTER_REVERSED_WINDING`), and `(class, graph_hash, start, count)`
 //! ranges over those draw-call groups (split into opaque/transparent/
 //! forward), plus the static/movable shadow-partitioned indirect lists —
 //! with no per-frame CPU iteration over scene objects at all.
@@ -133,12 +135,15 @@ struct PrevRow {
 @group(0) @binding(5) var<storage, read_write> prev_rows: array<PrevRow>;
 
 /// A hierarchical per-row sort key matching the CPU reference's tuple sort
-/// PRIORITY ORDER `(material_class, graph_hash, mesh_id, material_id)`, not
-/// just its highest field: `material_class` occupies the top 8 bits
+/// PRIORITY ORDER `(material_class, graph_hash, mirrors, mesh_id, material_id)`,
+/// not just its highest field: `material_class` occupies the top 8 bits
 /// (exact, no hashing -- assumes <=256 material classes, matching every
-/// other `& 0xFFu`-masked use of `material_class` in this codebase), a
-/// 12-bit hash of `graph_hash` occupies the next 12 bits, and a 12-bit hash
-/// of `(mesh_slot, material_slot)` occupies the low 12 bits.
+/// other `& 0xFFu`-masked use of `material_class` in this codebase), an
+/// 11-bit hash of `graph_hash` occupies the next 11 bits, whether the
+/// transform mirrors (`object_row_mirrors`) the next bit, so a `(class,
+/// graph)`'s mirrored rows sort into a run of their own (their own range and
+/// segment, drawn with the opposite front face), and a 12-bit hash of
+/// `(mesh_slot, material_slot)` occupies the low 12 bits.
 ///
 /// The field SEPARATION (not just concatenation into one combined hash) is
 /// the whole point: two rows sharing the same `(class, graph_hash)` but
@@ -171,7 +176,9 @@ fn hash12(x: u32) -> u32 {
 fn compute_sort_key(row: StaticObjectRow) -> u32 {
     let graph_hash_bucket = hash12(row.graph_hash_lo ^ (row.graph_hash_hi * 0x9E3779B1u));
     let mesh_material_bucket = hash12(row.mesh_slot ^ (row.material_slot * 0x85EBCA6Bu));
-    return ((row.material_class & 0xFFu) << 24u) | (graph_hash_bucket << 12u) | mesh_material_bucket;
+    let mirrors = select(0u, 1u, object_row_mirrors(row));
+    return ((row.material_class & 0xFFu) << 24u) | ((graph_hash_bucket & 0x7FFu) << 13u)
+        | (mirrors << 12u) | mesh_material_bucket;
 }
 
 @compute @workgroup_size(WG)
@@ -360,8 +367,11 @@ fn cs_final_gather_moved(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 var<workgroup> group_scan_buf: array<u32, 256>;
 
+// Mirrored instances draw with the opposite front face, so never with
+// unmirrored ones in one draw.
 fn same_draw_group(a: StaticObjectRow, b: StaticObjectRow) -> bool {
-    return a.mesh_slot == b.mesh_slot && a.material_slot == b.material_slot;
+    return a.mesh_slot == b.mesh_slot && a.material_slot == b.material_slot
+        && object_row_mirrors(a) == object_row_mirrors(b);
 }
 
 // Downstream frustum/occlusion kernels assign one workgroup to each draw.
@@ -562,8 +572,13 @@ fn cs_build_draw_calls(@builtin(global_invocation_id) gid: vec3<u32>) {
         start,
     );
     // Range/segment key: low 16 bits are the template class; upper bits
-    // carry raster state. Double-sided cards must not share an opaque PSO.
-    group_material_class[g] = row.material_class | ((materials_bdc[row.material_slot].flags & (MATERIAL_FLAG_DOUBLE_SIDED | MATERIAL_FLAG_ALPHA_TEST)) << 16u);
+    // carry raster state. Double-sided cards must not share an opaque PSO, and
+    // mirrored instances draw with the opposite front face.
+    var raster = (materials_bdc[row.material_slot].flags & (MATERIAL_FLAG_DOUBLE_SIDED | MATERIAL_FLAG_ALPHA_TEST)) << 16u;
+    if object_row_mirrors(row) {
+        raster |= SEGMENT_RASTER_REVERSED_WINDING;
+    }
+    group_material_class[g] = row.material_class | raster;
     group_graph_hash_lo[g] = row.graph_hash_lo;
     group_graph_hash_hi[g] = row.graph_hash_hi;
 
@@ -808,6 +823,17 @@ fn shadow_membership_hash(value: u32, salt: u32) -> u32 {
     return x ^ (x >> 16u);
 }
 
+/// A static caster's identity in the cached atlas's membership fingerprint:
+/// its row and the geometry it draws, so a caster whose geometry changed in
+/// place (a reimport, a mesh swapping between its full geometry and its
+/// virtual-geometry fallback) redraws the static layer as one that came or
+/// went does.
+fn shadow_caster_identity(sorted: u32, row: StaticObjectRow) -> u32 {
+    return shadow_membership_hash(sorted, 0x27d4eb2fu)
+        ^ shadow_membership_hash(row.first_index, 0x165667b1u)
+        ^ shadow_membership_hash(row.index_count ^ bitcast<u32>(row.vertex_offset), 0xd3a2646cu);
+}
+
 @compute @workgroup_size(WG)
 fn cs_shadow_partition(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -827,7 +853,7 @@ fn cs_shadow_partition(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Moving glass casts no coloured shadow (the transmittance layer is
         // cached with the static atlas); it never casts an opaque one.
         if (row.flags & INSTANCE_FLAG_MOVABLE) == 0u {
-            let identity = sorted_indices_sp[i];
+            let identity = shadow_caster_identity(sorted_indices_sp[i], row);
             atomicXor(&shadow_counts[3], shadow_membership_hash(identity, 0x9e3779b9u));
             atomicXor(&shadow_counts[4], shadow_membership_hash(identity, 0x85ebca6bu));
             let slot = atomicAdd(&shadow_counts[2], 1u);
@@ -837,7 +863,7 @@ fn cs_shadow_partition(@builtin(global_invocation_id) gid: vec3<u32>) {
         let slot = atomicAdd(&shadow_counts[1], 1u);
         shadow_movable_indirect[slot] = entry;
     } else {
-        let identity = sorted_indices_sp[i];
+        let identity = shadow_caster_identity(sorted_indices_sp[i], row);
         atomicXor(&shadow_counts[3], shadow_membership_hash(identity, 0x9e3779b9u));
         atomicXor(&shadow_counts[4], shadow_membership_hash(identity, 0x85ebca6bu));
         let slot = atomicAdd(&shadow_counts[0], 1u);

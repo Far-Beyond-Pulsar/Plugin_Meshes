@@ -87,6 +87,50 @@
       "debug_view": "triangle"
     },
     {
+      "name": "hero-green-dragon-closeup",
+      "camera": {
+        "fov_deg": 45,
+        "look_at": [
+          13.399999618530273,
+          1.100000023841858,
+          37
+        ],
+        "position": [
+          17.799999237060547,
+          1.399999976158142,
+          47
+        ]
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "debug_view": "normal",
+      "tau_px": 1.0
+    },
+    {
+      "name": "hero-green-dragon-closeup-triangles",
+      "camera": {
+        "fov_deg": 45,
+        "look_at": [
+          13.399999618530273,
+          1.100000023841858,
+          37
+        ],
+        "position": [
+          17.799999237060547,
+          1.399999976158142,
+          47
+        ]
+      },
+      "resolution": [
+        1280,
+        720
+      ],
+      "debug_view": "triangle",
+      "tau_px": 1.0
+    },
+    {
       "name": "hero-canopy",
       "camera": {
         "position": [

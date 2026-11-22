@@ -28,8 +28,9 @@ pub struct VgCullFrameData<'a> {
 /// The cull's per-tile estimate of the triangles its emitted clusters put in each
 /// 16x16 screen tile, hardware-class clusters included (a cheap projection of
 /// their bounding spheres; the software raster's counters are exact but only see
-/// the software class). `buffer[base_words + tile * TILE_WORDS]` is the tile's
-/// estimated triangles times [`crate::TILE_FIXED`]; tiles are row-major over
+/// the software class). `buffer[base_words + tile * TILE_WORDS + tile_word::TRIANGLES]`
+/// is the tile's estimated triangles times [`crate::TILE_FIXED`]
+/// ([`crate::TileValve`] decodes every word of a tile); tiles are row-major over
 /// `tiles` = `[tiles_x, tiles_y]`.
 #[derive(Clone, Copy)]
 pub struct VgTileEstimate<'a> {
@@ -90,6 +91,35 @@ impl VgCullEarlyPass {
     /// Latest asynchronously completed stats sample (never waits for the GPU).
     pub fn stats_snapshot(&self) -> Option<crate::VgCullStats> {
         crate::VgCullStats::from_state_words(self.core.lock().ok()?.last_state_words()?)
+    }
+
+    /// Read back the overdraw valve's tile block at the end of each of the next
+    /// `frames` frames, without waiting ([`VgCullCore::watch_tile_valve`]).
+    pub fn watch_tile_valve(&self, frames: u32) {
+        if let Ok(mut core) = self.core.lock() {
+            core.watch_tile_valve(frames);
+        }
+    }
+
+    /// Completed tile-valve samples, oldest first; never waits for the GPU.
+    pub fn take_tile_valve_samples(&self) -> Vec<crate::TileValveSample> {
+        self.core
+            .lock()
+            .map(|mut core| core.take_tile_valve_samples())
+            .unwrap_or_default()
+    }
+
+    /// Diagnostics (capture and tests only: it BLOCKS on the GPU). Every watched
+    /// frame's sample, after the frames are submitted
+    /// ([`VgCullCore::tile_valve_samples_blocking`]).
+    pub fn tile_valve_samples_blocking(
+        &self,
+        device: &wgpu::Device,
+    ) -> Vec<crate::TileValveSample> {
+        self.core
+            .lock()
+            .map(|mut core| core.tile_valve_samples_blocking(device))
+            .unwrap_or_default()
     }
 
     /// Both halves of the cull sharing one core, for the frame's own instances

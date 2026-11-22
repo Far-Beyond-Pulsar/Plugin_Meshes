@@ -55,9 +55,12 @@ pub use crate::core::{PageBytes, StoreCore, VgStreamConfig, VgStreamError, PAGE_
 pub use feedback::{Feedback, FeedbackLayout};
 pub use proxy::{
     build_proxy, error_ladder, proxy_key, ProxyBuild, ProxyCache, ProxyCacheStats, ProxyLodCpu,
-    ProxyOptions, ProxySection, ProxyState,
+    ProxyOptions, ProxySection, ProxyState, ProxyVertexData,
 };
-pub use runtime::{content_words, VgAssetInfo, VgRuntime, VgRuntimeSettings, VgTier3Stats};
+pub use runtime::{
+    content_words, VgAssetInfo, VgAssetMemory, VgAssetReport, VgRuntime, VgRuntimeSettings,
+    VgTier3Stats,
+};
 pub use scheduler::{Fetch, PageScheduler, SchedulerConfig, SchedulerStats};
 pub use source::{testing, VgeoBytes, VgeoSource};
 pub use store::{

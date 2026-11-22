@@ -23,3 +23,18 @@ struct StaticObjectRow {
     // Which section of its mesh the row draws.
     section_index: u32,
 }
+
+// `helio_mesh_api::RASTER_FLAG_REVERSED_WINDING` in a draw segment's
+// material class (raster flags are its upper 16 bits): the segment's
+// instances mirror, and a pass draws them with the opposite front face.
+const SEGMENT_RASTER_REVERSED_WINDING: u32 = 1u << 31u;
+
+// Whether the row's transform mirrors (a negative determinant): its
+// triangles wind the other way in the world.
+fn object_row_mirrors(row: StaticObjectRow) -> bool {
+    let t = row.transform;
+    let x = vec3<f32>(t[0][0], t[0][1], t[0][2]);
+    let y = vec3<f32>(t[1][0], t[1][1], t[1][2]);
+    let z = vec3<f32>(t[2][0], t[2][1], t[2][2]);
+    return dot(cross(x, y), z) < 0.0;
+}

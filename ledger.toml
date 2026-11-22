@@ -57,7 +57,7 @@ notes = "Phase 0's failures (no draw row when added after the first frame, panel
 [[schema]]
 type = "StaticMeshDraw"
 path = "meshes_component::components::static_mesh_draw::StaticMeshDraw"
-buffers = ["static_mesh_draw_bounds", "static_mesh_draw_flags", "static_mesh_draw_sections"]
+buffers = ["static_mesh_draw_bounds", "static_mesh_draw_flags", "static_mesh_draw_vg_asset", "static_mesh_draw_sections"]
 clears_on_remove = false
 releases_var_len = true
 registered = true
@@ -111,13 +111,27 @@ test = "plugins/installed/tests/render_acceptance.rs"
 status = "verified"
 
 [[schema]]
-type = "VirtualGeometryComponent"
-path = "meshes_component::components::virtual_geometry_component::VirtualGeometryComponent"
+type = "VirtualGeometryOverrideRow"
+path = "meshes_component::components::virtual_geometry_component::VirtualGeometryOverrideRow"
 buffers = ["vg_instance_overrides"]
 clears_on_remove = false
 releases_var_len = true
 registered = true
-writer = "its own SceneDB var-len dispatch: one VgOverrideGpu row (authored flags, tier lock, sanitised error scale) refreshed on decode and on every write of an authored property, freed on removal"
+writer = "VirtualGeometryComponent's GPU registration: one VgOverrideGpu row (authored flags, tier lock, sanitised error scale) derived from the value on every insert, guarded write and replay (never cached on the value, so every write path uploads its authored values), freed on removal"
+owner = "meshes_component::components::virtual_geometry_component"
+disposition = "keep: the per-instance virtual-geometry overrides; the VirtualGeometryInstances derivation reads them (vg_instance_overrides, vg_instance_overrides::handles)"
+target_contract = "Phase 4; 03-gpu-reflection-and-rendering.md"
+test = "plugins/vendor/meshes/tests/virtual_geometry_instances_gpu.rs; plugins/installed/tests/virtual_geometry_acceptance.rs (virtual_geometry_matches_the_classic_render_and_off_restores_it: force_root_only reaches the cull)"
+status = "verified"
+
+[[schema]]
+type = "VirtualGeometryComponent"
+path = "meshes_component::components::virtual_geometry_component::VirtualGeometryComponent"
+buffers = []
+clears_on_remove = true
+releases_var_len = false
+registered = false
+writer = "no columns of its own: the derived VirtualGeometryOverrideRow registration uploads its override row (see that schema)"
 owner = "meshes_component::components::virtual_geometry_component"
 disposition = "keep: the per-instance virtual-geometry overrides; the VirtualGeometryInstances derivation reads them (vg_instance_overrides, vg_instance_overrides::handles)"
 target_contract = "Phase 4; 03-gpu-reflection-and-rendering.md"
@@ -162,7 +176,7 @@ status = "verified"
 
 [[buffer]]
 key = "vg_instance_overrides"
-producers = ["VirtualGeometryComponent"]
+producers = ["VirtualGeometryOverrideRow"]
 consumers = ["meshes_component"]
 owner = "meshes_component::components::virtual_geometry_component (VgOverrideGpu pool)"
 disposition = "keep: a VirtualGeometryComponent's one override row; the VirtualGeometryInstances derivation scatters it to its owner object"
@@ -205,7 +219,7 @@ key = "classic_suppressed"
 producers = []
 consumers = ["helio-pass-object-batch", "meshes_component"]
 owner = "helio_component::virtual_geometry_instances (output); helio-pass-object-batch (reader)"
-disposition = "keep: execution data. One u32 per static_objects row, non-zero for every section row of a VG-active instance; the object batch tags the instance INSTANCE_FLAG_CLASSIC_SUPPRESSED and the main-view frustum cull skips it so virtual geometry does not double-draw. Shadow passes still draw the row: the classic geometry is the shadow proxy (plan D5). Neither side knows the other's types"
+disposition = "keep: execution data. One u32 per static_objects row, non-zero for every section row of a VG-active instance; the object batch tags the instance INSTANCE_FLAG_CLASSIC_SUPPRESSED and the main-view frustum cull skips it so virtual geometry does not double-draw. Shadow passes still draw the row: the classic geometry (the mesh's error-bounded fallback once its clusters are drawn) is the shadow proxy (plan D5). Neither side knows the other's types"
 target_contract = "Phase 4; 03-gpu-reflection-and-rendering.md"
 test = "plugins/installed/tests/virtual_geometry_acceptance.rs (virtual_geometry_matches_the_classic_render_and_off_restores_it)"
 status = "verified"
@@ -215,7 +229,7 @@ key = "vg_asset_ready"
 producers = []
 consumers = ["meshes_component"]
 owner = "helio_component::virtual_geometry_host (VgAssetReadyPublisher scene derivation output, rows from helio_vg_stream::VgRuntime); helio_component::virtual_geometry_instances (reader)"
-disposition = "keep: per-asset readiness rows (VgAssetReadyRow: interned vertex offset, asset slot, ready flag) sorted by vertex offset; an instance is VG-active only once its asset's root pages are resident"
+disposition = "keep: per-asset readiness rows (VgAssetReadyRow: content id, asset slot, ready flag) sorted by content id; an instance names its asset by its full geometry's content id (static_mesh_draw_vg_asset) and is VG-active only once the asset's root pages are resident"
 target_contract = "Phase 4; 03-gpu-reflection-and-rendering.md"
 test = "plugins/vendor/meshes/tests/virtual_geometry_instances_gpu.rs (test-built rows); plugins/installed/tests/virtual_geometry_acceptance.rs (published from the runtime)"
 status = "verified"
@@ -238,6 +252,16 @@ owner = "meshes_component::components::static_mesh_draw"
 disposition = "keep: a mesh instance's object-row flags (movable); static/movable edits reach the draw rows through it"
 target_contract = "Phase 2; 03-gpu-reflection-and-rendering.md"
 test = "plugins/vendor/meshes/tests/scene_join_rows.rs"
+status = "verified"
+
+[[buffer]]
+key = "static_mesh_draw_vg_asset"
+producers = ["StaticMeshDraw"]
+consumers = ["meshes_component"]
+owner = "meshes_component::components::static_mesh_draw"
+disposition = "keep: a mesh instance's virtual-geometry asset identity, the content id of its full geometry as four u32 words, the same whether it shows that geometry or its fallback; the VG instance derivation finds the asset's vg_asset_ready row by it"
+target_contract = "Phase 4; 03-gpu-reflection-and-rendering.md"
+test = "plugins/vendor/meshes/tests/virtual_geometry_instances_gpu.rs; plugins/installed/tests/virtual_geometry_acceptance.rs (the_full_classic_geometry_leaves_the_gpu_and_comes_back)"
 status = "verified"
 
 [[buffer]]

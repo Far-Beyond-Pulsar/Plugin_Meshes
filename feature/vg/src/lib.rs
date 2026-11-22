@@ -390,7 +390,11 @@ pub fn add_virtual_geometry_passes(
         log::warn!("virtual geometry: runtime {id} is gone; building the classic graph");
         return false;
     };
-    if !virtual_geometry_supported(device) {
+    // The host keeps instances' full classic geometry where the renderer
+    // cannot draw their clusters, and releases it where it can.
+    let supported = virtual_geometry_supported(device);
+    runtime.set_renderer_support(supported);
+    if !supported {
         log::info!(
             "virtual geometry: device lacks {} storage buffers per stage or INDIRECT_FIRST_INSTANCE; \
              classic rendering only",

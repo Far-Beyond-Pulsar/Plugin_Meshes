@@ -114,8 +114,84 @@ fn uv_slides_the_simplified_surface_cannot_reproduce_raise_the_error() {
     // off by the curvature of the warp, in object-space length.
     let warped = |x: f32, y: f32| ([0.0, 0.0, 1.0], [x * x, y]);
     let (shaded, opaque) = (max_error(16, warped), max_error(12, warped));
+    // The simplifier weighs uv too, so it keeps the warp to about 1e-3 at the
+    // coarsest finite level. The position-only error is a two-sided bound,
+    // not a sampled zero: about 1e-4 here, where an original triangle owned by
+    // one group lies a fraction of an edge beyond its border. The uv slide
+    // must still raise the stored error by an order of magnitude.
     assert!(
-        shaded > 20.0 * opaque.max(1e-5),
+        shaded > 10.0 * opaque.max(1e-5),
         "uv deviation must reach the stored error: {shaded} vs position-only {opaque}"
+    );
+}
+
+/// A UV sphere (`rings x segments`, uv seam and poles), records in the
+/// format's layout, as an imported mesh reaches the builder.
+fn uv_sphere(rings: u32, segments: u32) -> (Vec<[f32; 3]>, Vec<u8>, Vec<u32>) {
+    let (mut pos, mut bytes) = (Vec::new(), Vec::new());
+    for ring in 0..=rings {
+        let theta = std::f32::consts::PI * ring as f32 / rings as f32;
+        for segment in 0..=segments {
+            // The seam column repeats the first one bit for bit, as an exporter
+            // writes it (sin(TAU) is not 0 in f32).
+            let phi = std::f32::consts::TAU * (segment % segments) as f32 / segments as f32;
+            // Poles are one point (sin(PI) is not 0 in f32 either).
+            let s = if ring == 0 || ring == rings {
+                0.0
+            } else {
+                theta.sin()
+            };
+            let n = [s * phi.cos(), theta.cos(), s * phi.sin()];
+            pos.push(n);
+            bytes.extend(
+                helio_vg_format::VertexAttr {
+                    normal: n,
+                    tangent: [-phi.sin(), 0.0, phi.cos()],
+                    bitangent_sign: 1.0,
+                    uv0: [segment as f32 / segments as f32, ring as f32 / rings as f32],
+                    uv1: [segment as f32 / segments as f32, ring as f32 / rings as f32],
+                }
+                .encode(),
+            );
+        }
+    }
+    let mut idx = Vec::new();
+    let stride = segments + 1;
+    for ring in 0..rings {
+        for segment in 0..segments {
+            let a = ring * stride + segment;
+            let b = a + stride;
+            idx.extend([a, b, a + 1, a + 1, b, b + 1]);
+        }
+    }
+    (pos, bytes, idx)
+}
+
+#[test]
+fn a_uv_sphere_reduces_to_a_coarse_root() {
+    let (pos, bytes, idx) = uv_sphere(120, 160);
+    let dag = build_dag(&MeshInput {
+        positions: &pos,
+        attributes: &bytes,
+        attribute_stride: ATTR_STRIDE as usize,
+        indices: &idx,
+        tri_material: &[],
+    })
+    .unwrap();
+    let root: usize = dag
+        .groups
+        .iter()
+        .filter(|g| g.is_root)
+        .flat_map(|g| &g.clusters)
+        .map(|&c| dag.clusters[c as usize].tris.len())
+        .sum();
+    println!(
+        "uv sphere: {} source triangles, root {root}",
+        dag.source_tris
+    );
+    assert!(
+        root * 50 < dag.source_tris,
+        "root {root} of {}",
+        dag.source_tris
     );
 }

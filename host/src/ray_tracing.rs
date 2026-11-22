@@ -35,7 +35,9 @@
 //! reads mesh components placed by their owners' transform hierarchy, with
 //! material instances. The rows are different data, not one job done twice.
 //! The standalone model has no skinned meshes, so it traces none.
-use crate::ray_proxies::{Lookup, VgRayProxies, VgRayStats};
+use crate::ray_proxies::{
+    Lookup, VgRayProxies, VgRayProxySettings, VgRayStats, VirtualGeometryMesh,
+};
 use crate::{MeshComponent, RenderGroupComponent, StaticObjectComponent};
 use helio_core::{
     BlasGeometry, BlasManager, BlasSegment, Movability, TlasInstanceInput, TlasManager,
@@ -65,7 +67,7 @@ pub struct RayTransmission(pub [f32; 3]);
 /// applied incrementally; a change to any of the others forces a rebuild.
 struct Cursors {
     objects: ChangeCursor,
-    others: [ChangeCursor; 5],
+    others: [ChangeCursor; 6],
 }
 
 impl Cursors {
@@ -78,6 +80,7 @@ impl Cursors {
                 world.open_change_cursor::<RayTransmission>(),
                 world.open_change_cursor::<RenderGroupComponent>(),
                 world.open_change_cursor::<Movability>(),
+                world.open_change_cursor::<VirtualGeometryMesh>(),
             ],
         }
     }
@@ -292,8 +295,25 @@ impl SceneDbRayTracing {
     /// Traces virtual-geometry instances (static objects whose mesh is an
     /// asset of `runtime`) through their assets' proxies instead of their
     /// classic meshes ([`crate::ray_proxies`]). An instance whose proxy is
-    /// still building is left out (rays pass it); in a full projection
-    /// ([`Self::new`]) that fails the build until it is ready.
+    /// still building, or over the scene's proxy budget, is left out (rays
+    /// pass it); in a full projection ([`Self::new`]) that fails the build
+    /// until it is ready. The proxies are cut and budgeted by
+    /// [`VgRayProxySettings::default`] until
+    /// [`Self::set_vg_proxy_settings`].
+    pub fn with_virtual_geometry(mut self, runtime: helio_vg_stream::VgRuntime) -> Self {
+        self.vg = Some(VgRayProxies::new(runtime, VgRayProxySettings::default()));
+        self.cursors = None;
+        self
+    }
+
+    /// The proxies' error bound and scene budget (takes effect at the next
+    /// preparation; without virtual geometry, nothing).
+    pub fn set_vg_proxy_settings(&mut self, settings: VgRayProxySettings) {
+        if let Some(vg) = self.vg.as_mut() {
+            vg.set_settings(settings);
+        }
+    }
+
     /// The geometry the renderer draws that this projection does not trace:
     /// a host passes its renderer's `Renderer::untraced_geometry` (what the
     /// features declared), and a full projection refuses a scene holding
@@ -304,12 +324,6 @@ impl SceneDbRayTracing {
             // Re-check the scene against the new list.
             self.cursors = None;
         }
-    }
-
-    pub fn with_virtual_geometry(mut self, runtime: helio_vg_stream::VgRuntime) -> Self {
-        self.vg = Some(VgRayProxies::new(runtime));
-        self.cursors = None;
-        self
     }
 
     /// The virtual-geometry proxies' counters (zero without them).
@@ -373,6 +387,18 @@ impl SceneDbRayTracing {
                 helio_mesh_api::stats::RAY_PROGRAMS,
                 self.programs.programs().len() as u64,
             );
+            if let Some(vg) = &self.vg {
+                let vg = vg.stats();
+                stats.add_named(helio_mesh_api::stats::VG_RAY_PROXY_BYTES, vg.live_bytes);
+                stats.add_named(
+                    helio_mesh_api::stats::VG_RAY_PROXY_BUDGET_BYTES,
+                    vg.budget_bytes,
+                );
+                stats.add_named(
+                    helio_mesh_api::stats::VG_RAY_PROXIES_OVER_BUDGET,
+                    u64::from(vg.over_budget),
+                );
+            }
         }
         Ok(self.tlas.tlas().expect("successful TLAS build"))
     }
@@ -699,11 +725,14 @@ impl SceneDbRayTracing {
             // A virtual-geometry asset: traced through its proxy, whatever
             // its classic mesh is (a fallback or a placeholder).
             let lookup = match self.vg.as_mut() {
-                Some(vg) => vg.lookup((vertex_range.offset, vertex_range.count)),
+                Some(vg) => vg.lookup(world.get::<VirtualGeometryMesh>(*entity).copied()),
                 None => Lookup::Classic,
             };
             let (id, first_index, base_vertex, flags) = match lookup {
                 Lookup::Pending => unsupported!("virtual geometry whose proxy is not built yet"),
+                Lookup::OverBudget => {
+                    unsupported!("virtual geometry whose proxy does not fit the scene's proxy budget")
+                }
                 Lookup::Proxy(..) if transmits => unsupported!("transmitting virtual geometry"),
                 Lookup::Proxy(key, range) => {
                     // The object draws one section of its asset (its row's

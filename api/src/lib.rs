@@ -36,7 +36,9 @@ pub mod stats;
 pub use asset_types::{MeshUpload, PackedVertex, SectionedMeshUpload};
 pub use culled_batch_frame_data::CulledBatchFrameData;
 pub use draw::*;
-pub use draw_segments::{DrawSegment, DrawSegments, ShadingBucket};
+pub use draw_segments::{
+    front_face, DrawSegment, DrawSegments, ShadingBucket, RASTER_FLAG_REVERSED_WINDING,
+};
 pub use draw_slots::{DrawSlots, DRAW_SLOT_LAYOUT, DRAW_SLOT_LOCATION};
 pub use indirect_draw::{multi_draw_indexed_indirect, GpuDrawCount, DRAW_INDEXED_INDIRECT_STRIDE};
 pub use object_batch_frame_data::{IndirectDispatchArgs, ObjectBatchFrameData};

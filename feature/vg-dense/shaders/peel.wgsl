@@ -364,8 +364,8 @@ fn peel(
 //@O         dense_key[pix.y * params.viewport.x + pix.x] = vg_raster_key(best_z, best_id);
 //@M         let at = pix.y * params.viewport.x + pix.x;
 //@M         let cur = dense_key[at];
-//@M         let cur_z = bitcast<f32>(cur.x);
-//@M         if best_z > 0.0 && (best_z > cur_z || (best_z == cur_z && best_id > cur.y)) {
+//@M         let cur_z = vg_raster_key_depth(cur);
+//@M         if best_z > 0.0 && (best_z > cur_z || (best_z == cur_z && best_id > vg_raster_key_id(cur))) {
 //@M             dense_key[at] = vg_raster_key(best_z, best_id);
 //@M         }
     }

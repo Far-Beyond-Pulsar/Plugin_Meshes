@@ -206,51 +206,13 @@ struct LoadedScene {
     info: std::collections::HashMap<String, GltfMaterial>,
 }
 
-/// The importer (`solid-gltf`) refuses a glTF that *requires*
-/// `KHR_texture_transform`, which every Poly Haven tree does. The loader
-/// bakes the transform into the vertices itself (below), so the importer is
-/// handed a sibling copy of the glTF JSON with that one extension no longer
-/// required (the `.bin` and textures are referenced by their relative URIs,
-/// not copied). Any other glTF is imported as it is.
-fn importable_path(path: &Path) -> Result<std::path::PathBuf, String> {
-    const EXT: &str = "KHR_texture_transform";
-    if !path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("gltf"))
-    {
-        return Ok(path.to_path_buf());
-    }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut doc: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    let Some(required) = doc
-        .get_mut("extensionsRequired")
-        .and_then(|v| v.as_array_mut())
-    else {
-        return Ok(path.to_path_buf());
-    };
-    if !required.iter().any(|v| v.as_str() == Some(EXT)) {
-        return Ok(path.to_path_buf());
-    }
-    required.retain(|v| v.as_str() != Some(EXT));
-    if required.is_empty() {
-        doc.as_object_mut().map(|o| o.remove("extensionsRequired"));
-    }
-    let out = path.with_extension("vgimport.gltf");
-    let json = serde_json::to_vec(&doc).map_err(|e| e.to_string())?;
-    if std::fs::read(&out).ok().as_deref() != Some(json.as_slice()) {
-        let tmp = out.with_extension(format!("tmp{}", std::process::id()));
-        std::fs::write(&tmp, &json).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &out).map_err(|e| format!("{}: {e}", out.display()))?;
-    }
-    Ok(out)
-}
-
-/// glTF `KHR_texture_transform` UV scale/offset is baked into the vertices.
+/// The importer carries a glTF's `KHR_texture_transform` on each material's
+/// texture slots. The museum's materials sample the vertex UVs as they are,
+/// so the base colour slot's transform (when it samples UV0) is baked into
+/// `tex_coords0` here, with the formula the material shader applies.
 fn load_scene(path: &Path) -> Result<LoadedScene, String> {
-    let import_path = importable_path(path)?;
-    let mut scene = load_scene_file_with_config(&import_path, LoadConfig::default())
-        .map_err(|e| e.to_string())?;
+    let mut scene =
+        load_scene_file_with_config(path, LoadConfig::default()).map_err(|e| e.to_string())?;
     let info = if path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("gltf"))
@@ -261,18 +223,26 @@ fn load_scene(path: &Path) -> Result<LoadedScene, String> {
     };
     let mut meshes = std::mem::take(&mut scene.meshes);
     for mesh in &mut meshes {
-        let uv = mesh
+        let Some(t) = mesh
             .material_index
-            .and_then(|i| scene.material_sources.get(i))
-            .and_then(|s| info.get(&s.name))
-            .and_then(|m| m.uv);
-        if let Some((scale, offset)) = uv {
-            for v in &mut mesh.vertices {
-                v.tex_coords0 = [
-                    v.tex_coords0[0] * scale[0] + offset[0],
-                    v.tex_coords0[1] * scale[1] + offset[1],
-                ];
-            }
+            .and_then(|i| scene.materials.get(i))
+            .and_then(|m| m.textures.base_color)
+            .filter(|t| t.uv_channel == 0)
+            .map(|t| t.transform)
+        else {
+            continue;
+        };
+        if t == Default::default() {
+            continue;
+        }
+        let (sin, cos) = t.rotation_radians.sin_cos();
+        for v in &mut mesh.vertices {
+            let x = v.tex_coords0[0] * t.scale[0];
+            let y = v.tex_coords0[1] * t.scale[1];
+            v.tex_coords0 = [
+                cos * x - sin * y + t.offset[0],
+                sin * x + cos * y + t.offset[1],
+            ];
         }
     }
     Ok(LoadedScene {
@@ -321,7 +291,7 @@ impl<'a> PartGeometry<'a> {
 }
 
 /// A tree variant's material parts as one VG asset with one section per part
-/// (Nanite's model: one mesh, materials per cluster). One instance, one
+/// (the cluster-LOD model: one mesh, materials per cluster). One instance, one
 /// hierarchy walk and one set of roots per placed tree instead of one per
 /// material. Only when every part has the same node transform (the glTF
 /// primitives of one mesh do); otherwise `None` and the parts stay separate.

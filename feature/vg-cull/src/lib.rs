@@ -54,8 +54,18 @@
 //!   (`tile estimate`, in `state`); next frame `cs_tiles` turns that into triangles per
 //!   covered pixel per tile. Only a tile over the limit coarsens, slowly and with
 //!   a dead band ([`TILE_BAND`]), by at most [`TILE_SCALE_MAX`]x, and only the
-//!   groups whose footprint covers it feel it. A tile in the dense-tile mask is
-//!   exempt (its scale relaxes): dense is an outcome of the cut, not a failure.
+//!   groups whose footprint covers it feel it. A tile in the dense-tile mask
+//!   gets the same law: the limit bounds what the cull emits (its bins, its
+//!   traversal, every raster tier), and no tier makes that free. (Exempting
+//!   dense tiles let 512 forest tiles relax to full detail, 145 M triangles and
+//!   590 k clusters dropped from full bins, #1642.) The cut is discrete, so one
+//!   group swapping can move a tile across the whole band (a cliff, where no
+//!   scale is in the band); a tile that falls under the band right after a
+//!   coarsening step has found one and parks: it holds its scale until its
+//!   density moves by more than the band ([`TILE_STEP_COARSEN`]). Without it
+//!   the forest's still shots cycled in hundreds of tiles. Diagnostics read the tile block back without stalling the frame
+//!   ([`VgCullCore::watch_tile_valve`], decoded as [`TileValveSample`]); the
+//!   capture's valve check (`vg_stress --capture-check-valve`) is built on it.
 //! * **Dense estimate.** The same per-tile triangle estimate (hardware-class
 //!   clusters included) is published to the dense-tile classifier
 //!   ([`VgCullFrameData::tile_estimate`]), so a tile can go dense without the
@@ -132,7 +142,7 @@
 //! # Traversal
 //!
 //! Each phase runs `cs_traverse` once, with [`VgCullConfig::max_groups`]
-//! persistent workgroups (Nanite's persistent culling, with work stealing):
+//! persistent workgroups (persistent-thread culling, with work stealing):
 //!
 //! * A workgroup works depth-first: waves of up to 64 jobs from its own deque in
 //!   workgroup memory; children go back on the deque.
@@ -274,22 +284,120 @@ pub const EDGE_HYST: f32 = 0.15;
 /// covered pixel, relaxes below `limit / (1 + TILE_BAND)`, holds in between.
 pub const TILE_BAND: f32 = 0.25;
 /// Per-frame multipliers of a tile's coarsening scale (up when over the limit,
-/// down when under it or dense) and its ceiling.
+/// down when under it) and its ceiling.
 pub const TILE_STEP_UP: f32 = 1.2;
 pub const TILE_STEP_DOWN: f32 = 0.95;
 pub const TILE_SCALE_MAX: f32 = 32.0;
-/// Words per tile in the cull's tile block: estimated triangles and estimated
-/// covered area (both times [`TILE_FIXED`]) and the valve scale (f32 bits).
-pub const TILE_WORDS: u32 = 3;
+/// Words per tile in the cull's tile block, at [`tile_word`] offsets: estimated
+/// triangles and estimated covered area (both times [`TILE_FIXED`]), the valve
+/// scale and the valve's own state (park density, last step).
+pub const TILE_WORDS: u32 = 5;
+/// The valve's last step of a tile ([`tile_word::STEP`]): held (or parked),
+/// coarsened, relaxed. A tile that falls under the band right after coarsening
+/// crossed it in one step, which a continuous density cannot do
+/// ([`TILE_STEP_UP`]): the cut has a cliff there, and the tile parks.
+pub const TILE_STEP_HOLD: u32 = 0;
+pub const TILE_STEP_COARSEN: u32 = 1;
+pub const TILE_STEP_RELAX: u32 = 2;
 /// Fixed-point scale of the tile estimate words.
 pub const TILE_FIXED: f32 = 16.0;
+/// Pixels in one tile, the ceiling of the covered-area divisor of the density.
+pub const TILE_PIXELS: f32 = (DENSE_TILE * DENSE_TILE) as f32;
+
+/// Word offsets within one tile of the tile block.
+pub mod tile_word {
+    /// Triangles the frame's emitted clusters put in the tile, times `TILE_FIXED`.
+    pub const TRIANGLES: u32 = 0;
+    /// Their projected disc area in the tile (pixels), times `TILE_FIXED`.
+    pub const AREA: u32 = 1;
+    /// The valve's coarsening scale (f32 bits, 0 reads as 1).
+    pub const SCALE: u32 = 2;
+    /// The density a parked tile holds at (f32 bits, 0 = not parked).
+    pub const PARK: u32 = 3;
+    /// The valve's last step (`TILE_STEP_*`).
+    pub const STEP: u32 = 4;
+}
 
 /// The WGSL constants of the tile block, for every shader that reads it (the
 /// cull itself and the dense-tile classifier).
 pub fn tile_block_wgsl() -> String {
     format!(
-        "const VGC_TILE_WORDS: u32 = {TILE_WORDS}u;\nconst VGC_TILE_FIXED: f32 = {TILE_FIXED:?};\n"
+        "const VGC_TILE_WORDS: u32 = {TILE_WORDS}u;\nconst VGC_TILE_FIXED: f32 = {TILE_FIXED:?};\n\
+         const VGC_TW_TRIANGLES: u32 = {}u;\nconst VGC_TW_AREA: u32 = {}u;\n\
+         const VGC_TW_SCALE: u32 = {}u;\nconst VGC_TW_PARK: u32 = {}u;\nconst VGC_TW_STEP: u32 = {}u;\n\
+         const VGC_TILE_STEP_HOLD: u32 = {TILE_STEP_HOLD}u;\n\
+         const VGC_TILE_STEP_COARSEN: u32 = {TILE_STEP_COARSEN}u;\n\
+         const VGC_TILE_STEP_RELAX: u32 = {TILE_STEP_RELAX}u;\n",
+        tile_word::TRIANGLES,
+        tile_word::AREA,
+        tile_word::SCALE,
+        tile_word::PARK,
+        tile_word::STEP,
     )
+}
+
+/// One tile of the tile block, decoded: what the valve saw and did in one frame.
+///
+/// Read at the end of a frame, `triangles`/`covered_px` are that frame's estimate
+/// (made with `scale`), and `scale` is the scale the frame's cut used; the next
+/// frame's `cs_tiles` steps the scale from [`Self::density`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TileValve {
+    pub triangles: f32,
+    pub covered_px: f32,
+    /// The valve's coarsening scale, `1..=TILE_SCALE_MAX`.
+    pub scale: f32,
+    /// The density the tile is parked at (0 = not parked): it found a cliff in
+    /// the cut and holds its scale until its content changes.
+    pub park: f32,
+    /// The valve's last step (`TILE_STEP_*`).
+    pub step: u32,
+}
+
+impl TileValve {
+    /// Decodes one tile's [`TILE_WORDS`] words.
+    pub fn from_words(w: &[u32]) -> Self {
+        Self {
+            triangles: w[tile_word::TRIANGLES as usize] as f32 / TILE_FIXED,
+            covered_px: w[tile_word::AREA as usize] as f32 / TILE_FIXED,
+            scale: f32::from_bits(w[tile_word::SCALE as usize]).max(1.0),
+            park: f32::from_bits(w[tile_word::PARK as usize]),
+            step: w[tile_word::STEP as usize],
+        }
+    }
+
+    /// Triangles per covered pixel, the quantity the valve holds under its limit
+    /// (`cs_tiles`: the covered area is clamped to `1..=TILE_PIXELS`).
+    pub fn density(&self) -> f32 {
+        self.triangles / self.covered_px.clamp(1.0, TILE_PIXELS)
+    }
+}
+
+/// The tile block of one frame: every tile's [`TileValve`], row-major over `tiles`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TileValveSample {
+    /// The cull frame it was read at ([`crate::VgCullCore::frame_index`]):
+    /// consecutive samples have consecutive frames.
+    pub frame: u64,
+    /// The tile grid `[tiles_x, tiles_y]`.
+    pub tiles: [u32; 2],
+    pub valve: Vec<TileValve>,
+}
+
+impl TileValveSample {
+    /// Decodes a tile block (`tiles[0] * tiles[1] * TILE_WORDS` words).
+    pub fn decode(frame: u64, tiles: [u32; 2], words: &[u32]) -> Self {
+        Self {
+            frame,
+            tiles,
+            valve: words
+                .as_chunks::<{ TILE_WORDS as usize }>()
+                .0
+                .iter()
+                .map(|w| TileValve::from_words(w))
+                .collect(),
+        }
+    }
 }
 /// Error value at or above which a cluster/node is treated as infinitely
 /// coarse (root parents).

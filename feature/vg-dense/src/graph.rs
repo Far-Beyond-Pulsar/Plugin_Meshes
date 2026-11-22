@@ -7,7 +7,7 @@
 //!   `Auto`, every dense instance has a resident proxy and the dense-tile
 //!   count justifies it ([`Tier3Selector`], with hysteresis).
 //!
-//! Both fill a `(depth bits, vis id)` key per pixel that `VgShade`'s
+//! Both fill a `raster_key(depth, vis id)` per pixel that `VgShade`'s
 //! `vis_resolve` consumes identically; RT ids (cluster index
 //! `>= DENSE_RT_VISIBLE_BASE`) resolve through [`VgDenseFrameData::rt_visible`].
 //!
@@ -42,7 +42,7 @@ pub const KEY_DENSE: &str = helio_vg_format::VgRun::DIRECT.dense;
 /// The Tier 3 result for `vis_resolve`.
 #[derive(Clone, Copy)]
 pub struct VgDenseFrameData<'a> {
-    /// `width * height` of `vec2<u32>{depth bits, vis id}` (see
+    /// `width * height` of `vg_raster_key(depth, vis id)` (words `[id, depth bits]`, see
     /// [`crate::DenseBuffers::dense_key`]); only dense-tile pixels are valid.
     pub dense_key: &'a wgpu::Buffer,
     /// The dense-tile mask `dense_key` is valid under.
@@ -63,6 +63,9 @@ struct Published {
     mask: wgpu::Buffer,
     bary: Option<wgpu::Buffer>,
     visible: Option<wgpu::Buffer>,
+    /// The backend that actually drew (a ray-traced frame whose recording
+    /// failed fell back to the peel, which merges).
+    merge: bool,
 }
 
 /// While no dense tile was seen for [`ACTIVE_FRAMES`] frames, Tier 3 probes (the
@@ -516,6 +519,7 @@ impl RenderPass for VgDensePass {
                         mask: union_mask.clone(),
                         bary: Some(bary),
                         visible: Some(visible),
+                        merge: false,
                     })
             }
             _ => self.nonrt.buffers().map(|b| Published {
@@ -523,6 +527,7 @@ impl RenderPass for VgDensePass {
                 mask: union_mask.clone(),
                 bary: None,
                 visible: None,
+                merge: true,
             }),
         };
         if self.learn_only {
@@ -564,7 +569,7 @@ impl RenderPass for VgDensePass {
                     tile_mask,
                     rt_bary,
                     rt_visible,
-                    merge: self.backend != Tier3Backend::Rt,
+                    merge: p.merge,
                 },
                 "VgDense",
             );

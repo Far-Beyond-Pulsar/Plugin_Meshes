@@ -346,7 +346,10 @@ impl ForwardLitPass {
                     }),
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleList,
-                        front_face: self.view.front_face(),
+                        front_face: helio_mesh_api::front_face(
+                            self.view.front_face(),
+                            key.feature_flags,
+                        ),
                         cull_mode: if key.feature_flags & helio_mats::FLAG_DOUBLE_SIDED != 0 {
                             None
                         } else {

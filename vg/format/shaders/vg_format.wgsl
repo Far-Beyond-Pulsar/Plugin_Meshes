@@ -81,4 +81,9 @@ fn vg_vis_pack(cluster: u32, tri: u32) -> u32 {
 }
 fn vg_vis_cluster(id: u32) -> u32 { return id >> VG_VIS_TRI_BITS; }
 fn vg_vis_tri(id: u32) -> u32 { return id & VG_VIS_TRI_MASK; }
-fn vg_raster_key(depth: f32, id: u32) -> vec2<u32> { return vec2<u32>(bitcast<u32>(depth), id); }
+// `raster_key` (Rust) as two words: the 64-bit key `depth_bits << 32 | id`
+// stored little-endian, so `.x` is the id and `.y` the depth bits (a zero
+// depth word is "empty"). Every per-pixel key buffer (software, dense) uses it.
+fn vg_raster_key(depth: f32, id: u32) -> vec2<u32> { return vec2<u32>(id, bitcast<u32>(depth)); }
+fn vg_raster_key_depth(key: vec2<u32>) -> f32 { return bitcast<f32>(key.y); }
+fn vg_raster_key_id(key: vec2<u32>) -> u32 { return key.x; }

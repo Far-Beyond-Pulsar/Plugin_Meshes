@@ -4,7 +4,8 @@
 //! Dense 16x16 tiles (tiles where Tier 1/2 overdraw is pathological, flagged by
 //! T7's `tile_classify`) are re-resolved here, replacing whatever Tier 1/2
 //! wrote for those pixels. Two interchangeable backends produce the same
-//! output, a per-pixel `(depth bits, vis id)` key in a storage buffer
+//! output, a per-pixel `raster_key(depth, vis id)` (words `[id, depth bits]`)
+//! in a storage buffer
 //! ([`DenseBuffers::dense_key`]), so T9's `vis_resolve` is backend-agnostic:
 //!
 //! * [`DenseNonRtPass`] (3-NonRT, runs everywhere, no int64): exact tiled
@@ -66,7 +67,8 @@
 //!
 //! # Contract for T9 / T10
 //!
-//! * Output: `DenseBuffers::dense_key[y * width + x] = (depth f32 bits, id)`,
+//! * Output: `DenseBuffers::dense_key[y * width + x] = vg_raster_key(depth, id)`
+//!   (`helio_vg_format::raster_key` as little-endian words `[id, depth bits]`),
 //!   `id = vis_pack(visible_cluster, tri)`, depth bits 0 = empty. Valid only
 //!   for pixels of dense tiles (every pixel of every processed dense tile is
 //!   written, including empty ones). Reversed-Z: larger depth is nearer, so
@@ -150,7 +152,9 @@ pub mod rt_tier;
 pub mod stats_readback;
 
 pub use collect::{Candidate, CollectResult, RtCollect, CAND_CAPACITY};
-pub use common::{read_buffer, DenseBuffers, DenseFrame, DenseParamsGpu, DenseStats};
+pub use common::{
+    dense_key_words, read_buffer, DenseBuffers, DenseFrame, DenseParamsGpu, DenseStats,
+};
 pub use config::DenseConfig;
 pub use graph::{VgDenseFrameData, VgDensePass, KEY_DENSE};
 pub use mode::{rt_available, AutoPolicy, Tier3Backend, Tier3Selector};

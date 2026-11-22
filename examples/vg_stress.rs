@@ -20,6 +20,7 @@ mod vg_stress_cook;
 mod vg_stress_loading;
 /// Self-provisioning of the scan meshes (shared with `build.rs`).
 mod vg_stress_prep;
+mod vg_stress_valve;
 mod vg_stress_data {
     pub mod dims;
     pub mod forest;
@@ -38,7 +39,7 @@ use helio_vg_format::{
     GpuVgInstance, VgAssetReadyRow, INST_CONE_CULL, INST_ENABLED, INST_LOD_SUPPRESS,
     INST_SHADOW_CASTER, VG_ASSET_READY_FLAG_READY,
 };
-use helio_vg_stream::{VgRuntime, VgRuntimeSettings};
+use helio_vg_stream::{content_words, VgRuntime, VgRuntimeSettings};
 use pulsar_scenedb::{Entity, SceneDb};
 use v3_demo_common::{
     directional_light, make_material, new_scene_db_with_gpu_mirror, point_light, scene_db_handle,
@@ -67,6 +68,8 @@ use vg_stress_data::{
 const VG_INSTANCES: BufferKey = BufferKey::of("vg_instances");
 const VG_INSTANCE_COUNT: BufferKey = BufferKey::of("vg_instance_count");
 const VG_ASSET_READY: BufferKey = BufferKey::of("vg_asset_ready");
+/// Bytes of a `vg_asset_ready` row.
+const READY_ROW_BYTES: u64 = std::mem::size_of::<VgAssetReadyRow>() as u64;
 const CLASSIC_SUPPRESSED: BufferKey = BufferKey::of("classic_suppressed");
 const SCENE_OBJECTS_STRUCTURE: BufferKey = BufferKey::of("scene_objects_structure");
 const VG_FLAGS: u32 = INST_ENABLED | INST_SHADOW_CASTER | INST_LOD_SUPPRESS | INST_CONE_CULL;
@@ -88,8 +91,8 @@ fn is_scan_asset(path: &std::path::Path) -> bool {
 
 #[derive(Clone, Copy)]
 struct VgTarget {
-    vertex_offset: u32,
-    vertex_count: u32,
+    /// The asset's content id (`VgAssetReadyRow::content` words).
+    content: [u32; 4],
     /// First object row of the instance; its sections occupy
     /// `object_row .. object_row + sections`.
     object_row: u32,
@@ -148,14 +151,14 @@ fn select_visible(
     ready: &[VgAssetReadyRow],
     classic: &mut [u32],
 ) -> Vec<GpuVgInstance> {
-    let slots: HashMap<(u32, u32), u32> = ready
+    let slots: HashMap<[u32; 4], u32> = ready
         .iter()
         .filter(|row| row.flags & VG_ASSET_READY_FLAG_READY != 0)
-        .map(|row| ((row.vertex_offset, row.vertex_count), row.asset_slot))
+        .map(|row| (row.content, row.asset_slot))
         .collect();
     let mut instances = Vec::new();
     for target in targets {
-        let Some(&asset_slot) = slots.get(&(target.vertex_offset, target.vertex_count)) else {
+        let Some(&asset_slot) = slots.get(&target.content) else {
             continue;
         };
         instances.push(GpuVgInstance {
@@ -214,7 +217,7 @@ impl SceneVgDerivation {
             targets,
             instances: make("VG Stress Instances", instance_capacity as u64 * 16),
             count: make("VG Stress Instance Count", 16),
-            ready: make("VG Stress Asset Ready", 16),
+            ready: make("VG Stress Asset Ready", READY_ROW_BYTES),
             classic: make("VG Stress Classic Suppression", object_rows as u64 * 4),
             structure_marker: make("VG Stress Structure Marker", 16),
             instance_capacity,
@@ -268,7 +271,7 @@ impl SceneDerivation for SceneVgDerivation {
             self.ready_capacity = ready_rows.len().next_power_of_two() as u32;
             self.ready = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("VG Stress Asset Ready"),
-                size: self.ready_capacity as u64 * 16,
+                size: self.ready_capacity as u64 * READY_ROW_BYTES,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -294,7 +297,7 @@ impl SceneDerivation for SceneVgDerivation {
             targets.derive_rebuilds += 1;
             targets.gpu_bytes = u64::from(self.instance_capacity) * 16
                 + u64::from(self.object_rows) * 4
-                + u64::from(self.ready_capacity) * 16
+                + u64::from(self.ready_capacity) * READY_ROW_BYTES
                 + 32;
             let mut classic = vec![0u32; self.object_rows as usize];
             let visible: &[VgTarget] = if self.enabled { &targets.targets } else { &[] };
@@ -330,7 +333,7 @@ impl SceneDerivation for SceneVgDerivation {
                 ),
                 (
                     VG_ASSET_READY,
-                    Self::handle(&self.ready, 16, self.content_generation, self.buffer_epoch),
+                    Self::handle(&self.ready, READY_ROW_BYTES, self.content_generation, self.buffer_epoch),
                 ),
                 (
                     CLASSIC_SUPPRESSED,
@@ -498,6 +501,33 @@ fn prepare() {
 
 fn main() {
     env_logger::init();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some((before, after)) = vg_stress_capture::diff_requested(&args) {
+        match vg_stress_capture::diff(&before, &after) {
+            Ok(table) => print!("{table}"),
+            Err(e) => {
+                eprintln!("[Capture diff] {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if let Some(dir) = vg_stress_valve::check_requested(&args) {
+        match vg_stress_valve::check_dir(&dir) {
+            Ok((report, passed)) => {
+                print!("{report}");
+                if !passed {
+                    eprintln!("[Valve check] FAILED: {}", dir.display());
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("[Valve check] {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if prepare_requested() {
         return prepare();
     }
@@ -557,7 +587,7 @@ struct AppState {
     vg_loaded: usize,
     /// Instancing audit counters (printed when loading finishes).
     classic_meshes: usize,
-    vg_meshes: HashMap<u128, (Entity, u32, u32)>,
+    vg_meshes: HashMap<u128, Entity>,
     classic_objects: usize,
     vg_objects: usize,
     classic_batches: HashSet<(u32, u32)>,
@@ -654,11 +684,17 @@ impl ApplicationHandler for App {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or_else(|| runtime.settings().page_budget_mb);
+        let tile_density_limit = std::env::var("VG_STRESS_TILE_DENSITY")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or_else(|| runtime.settings().tile_density_limit);
         runtime.set_settings(VgRuntimeSettings {
             tau_px: tau,
             mode,
             tier3,
             page_budget_mb,
+            tile_density_limit,
             ..runtime.settings()
         });
         println!("[Museum] VG mode {mode:?} (VG_STRESS_MODE=auto|hw|nonrt|off)");
@@ -1329,8 +1365,7 @@ impl AppState {
         asset: &str,
         meta: &vg_stress_loading::PartMeta,
         mesh: Entity,
-        range: (u32, u32),
-        vg: bool,
+        vg: Option<u128>,
     ) {
         let node = glam::Mat4::from_cols_array(&meta.transform);
         let spawn_started = std::time::Instant::now();
@@ -1401,10 +1436,9 @@ impl AppState {
             if let Some(bench) = &mut self.bench {
                 bench.entities.push(object);
             }
-            if vg {
+            if let Some(content) = vg {
                 targets.targets.push(VgTarget {
-                    vertex_offset: range.0,
-                    vertex_count: range.1,
+                    content: VgAssetReadyRow::content_words(content_words(content)),
                     object_row: object.index(),
                     sections: section_slots.len() as u32,
                 });
@@ -1418,7 +1452,7 @@ impl AppState {
             self.loaded_objects += 1;
         }
         if let Some(bench) = &mut self.bench {
-            if vg {
+            if vg.is_some() {
                 bench.spawn_ms += spawn_started.elapsed().as_secs_f64() * 1000.0;
                 bench.spawned_objects += (self.loaded_objects - objects_before) as u64;
                 bench.private_before_spawn = private_before;
@@ -1475,9 +1509,9 @@ impl AppState {
                     let Some(upload) = part.lods.into_iter().next() else {
                         break;
                     };
-                    let (mesh, offset, count) = self.upload_mesh(upload);
+                    let (mesh, _, _) = self.upload_mesh(upload);
                     self.classic_meshes += 1;
-                    self.place_instances(&part.asset, &part.meta, mesh, (offset, count), false);
+                    self.place_instances(&part.asset, &part.meta, mesh, None);
                     break;
                 }
                 Event::VgAsset { asset, parts } => {
@@ -1487,27 +1521,27 @@ impl AppState {
                             continue;
                         };
                         let content = vg_stress_loading::content_id(words);
-                        let (mesh, offset, count) = match self.vg_meshes.get(&content) {
+                        let mesh = match self.vg_meshes.get(&content) {
                             Some(&found) => found,
                             None => {
                                 // VG parts own no classic geometry. The mesh row is
-                                // a zero-area placeholder whose interned vertex
-                                // range is the identity of the VG asset.
+                                // a zero-area placeholder, marked with the asset's
+                                // content id for the ray-traced scene; the instances
+                                // name the asset by that id.
                                 self.placeholder_ordinal += 1;
-                                let (mesh, offset, count) = self.upload_mesh(
+                                let (mesh, _, _) = self.upload_mesh(
                                     vg_stress_cook::placeholder_mesh(self.placeholder_ordinal),
                                 );
-                                self.runtime.request_asset(
-                                    content,
-                                    offset,
-                                    count,
-                                    part.vgeo.clone(),
+                                self.scene_db.world.insert(
+                                    mesh,
+                                    helio_mesh_host::ray_proxies::VirtualGeometryMesh { content },
                                 );
-                                self.vg_meshes.insert(content, (mesh, offset, count));
-                                (mesh, offset, count)
+                                self.runtime.request_asset(content, part.vgeo.clone());
+                                self.vg_meshes.insert(content, mesh);
+                                mesh
                             }
                         };
-                        self.place_instances(&asset, &part.meta, mesh, (offset, count), true);
+                        self.place_instances(&asset, &part.meta, mesh, Some(content));
                     }
                     self.vg_loaded += 1;
                     break;
@@ -1681,10 +1715,9 @@ impl AppState {
 mod gating_tests {
     use super::*;
 
-    fn target(offset: u32, row: u32) -> VgTarget {
+    fn target(asset: u32, row: u32) -> VgTarget {
         VgTarget {
-            vertex_offset: offset,
-            vertex_count: 3,
+            content: [asset, 0, 0, 0],
             object_row: row,
             sections: 1,
         }
@@ -1693,8 +1726,7 @@ mod gating_tests {
     #[test]
     fn every_section_row_of_a_visible_instance_leaves_the_classic_path() {
         let targets = [VgTarget {
-            vertex_offset: 100,
-            vertex_count: 3,
+            content: [100, 0, 0, 0],
             object_row: 2,
             sections: 3,
         }];
@@ -1706,12 +1738,12 @@ mod gating_tests {
         assert_eq!(classic, [0, 0, 1, 1, 1, 0]);
     }
 
-    fn ready(offset: u32, slot: u32, flags: u32) -> VgAssetReadyRow {
+    fn ready(asset: u32, slot: u32, flags: u32) -> VgAssetReadyRow {
         VgAssetReadyRow {
-            vertex_offset: offset,
-            vertex_count: 3,
+            content: [asset, 0, 0, 0],
             asset_slot: slot,
             flags,
+            _pad: [0; 2],
         }
     }
 

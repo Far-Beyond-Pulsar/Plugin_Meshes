@@ -1,7 +1,9 @@
 //! PBR material mapping from SolidRS to Helio material assets.
 
 use helio_mats::MaterialWorkflow;
-use helio_mats::{GpuMaterial, TextureTransform};
+use helio_mats::{
+    GpuMaterial, MaterialTextureData, MaterialTextureSlot, TextureTransform, FLAG_ALPHA_TEST,
+};
 use solid_rs::scene::{AlphaMode, Material as SolidMaterial, TextureRef as SolidTextureRef};
 
 use crate::texture_loader::TextureSemantic;
@@ -36,6 +38,61 @@ pub struct ConvertedMaterial {
     pub textures: ConvertedMaterialTextures,
 }
 
+impl ConvertedMaterial {
+    /// The material's texture data ([`MaterialTextureData`]): each slot's
+    /// texture as the table slot `slot_of` gives for its scene texture index
+    /// (`ConvertedScene::textures`; `None`: not resident, the slot samples
+    /// nothing), with its UV set and transform, and the material's normal
+    /// scale, occlusion strength and alpha cutoff (0 unless alpha-tested).
+    pub fn texture_data(
+        &self,
+        mut slot_of: impl FnMut(usize) -> Option<u32>,
+    ) -> MaterialTextureData {
+        let textures = &self.textures;
+        let mut slot = |texture: &Option<ConvertedTextureRef>| {
+            texture
+                .as_ref()
+                .and_then(|texture| {
+                    slot_of(texture.texture_index).map(|index| {
+                        MaterialTextureSlot::new(index, texture.uv_channel, &texture.transform)
+                    })
+                })
+                .unwrap_or(MaterialTextureSlot::NONE)
+        };
+        let cutoff = if self.gpu.flags & FLAG_ALPHA_TEST != 0 {
+            textures.alpha_cutoff
+        } else {
+            0.0
+        };
+        MaterialTextureData {
+            base_color: slot(&textures.base_color),
+            normal: slot(&textures.normal),
+            roughness_metallic: slot(&textures.roughness_metallic),
+            emissive: slot(&textures.emissive),
+            occlusion: slot(&textures.occlusion),
+            specular_color: slot(&textures.specular_color),
+            specular_weight: slot(&textures.specular_weight),
+            params: [
+                textures.normal_scale,
+                textures.occlusion_strength,
+                cutoff,
+                0.0,
+            ],
+        }
+    }
+
+    /// The material row and its texture data as a host uploads them (both
+    /// at the material's row: `helio_mats::host_rows::material_rows`), the
+    /// textures resolved by `slot_of` ([`Self::texture_data`]).
+    pub fn rows(
+        &self,
+        slot_of: impl FnMut(usize) -> Option<u32>,
+    ) -> (GpuMaterial, MaterialTextureData) {
+        let data = self.texture_data(slot_of);
+        (data.bind(self.gpu), data)
+    }
+}
+
 fn uses_explicit_specular_ior_workflow(material: &SolidMaterial) -> bool {
     let specular_color_is_default = (material.specular_color.x - 1.0).abs()
         <= MATERIAL_WORKFLOW_EPSILON
@@ -52,7 +109,10 @@ fn uses_explicit_specular_ior_workflow(material: &SolidMaterial) -> bool {
         || !ior_is_default
 }
 
-fn convert_texture_ref(
+/// A source texture slot as the materials read it: its texture, UV set and
+/// UV transform. The one conversion of a slot, for the material rows and the
+/// material sources ([`crate::MaterialImage`]) alike.
+pub(crate) fn convert_texture_ref(
     texture: &SolidTextureRef,
     semantic: TextureSemantic,
 ) -> ConvertedTextureRef {
@@ -64,6 +124,9 @@ fn convert_texture_ref(
         );
     }
 
+    // SolidRS keeps a slot's `KHR_texture_transform` in glTF's convention,
+    // which is the materials' own (`helio_mats::TextureTransform`): the
+    // values carry over unchanged.
     let transform =
         texture
             .transform
@@ -193,4 +256,84 @@ where
         },
         textures,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solid_rs::scene::TextureTransform as SolidTextureTransform;
+
+    /// The Poly Haven tree's branches: base colour, normal and ARM share
+    /// `KHR_texture_transform` offset (0, -2.4), scale (15, 3.4).
+    fn branches() -> SolidMaterial {
+        let transformed = |texture_index| SolidTextureRef {
+            texture_index,
+            uv_channel: 0,
+            transform: Some(SolidTextureTransform {
+                offset: solid_rs::glam::Vec2::new(0.0, -2.4),
+                rotation: 0.5,
+                scale: solid_rs::glam::Vec2::new(15.0, 3.4),
+            }),
+        };
+        let mut material = SolidMaterial::new("branches");
+        material.base_color_texture = Some(transformed(0));
+        material.normal_texture = Some(transformed(1));
+        material.metallic_roughness_texture = Some(transformed(2));
+        material.occlusion_texture = Some(SolidTextureRef::new(2));
+        material.alpha_mode = AlphaMode::Mask;
+        material.alpha_cutoff = 0.3;
+        material.normal_scale = 0.8;
+        material
+    }
+
+    /// A transformed slot reaches the row a host uploads: its table slot,
+    /// its transform as glTF gives it, and the row reading its texture data.
+    #[test]
+    fn a_transformed_slot_reaches_the_uploaded_rows() {
+        let converted = convert_material(&branches(), |texture, _| Ok(texture)).unwrap();
+        // Scene textures 0, 1, 2 resident at table slots 10, 11, 12.
+        let (row, data) = converted.rows(|index| Some(10 + index as u32));
+
+        assert_ne!(row.flags & helio_mats::FLAG_TEXTURE_DATA, 0);
+        assert_ne!(row.flags & helio_mats::FLAG_HAS_NORMAL_MAP, 0);
+        assert_eq!(
+            [
+                row.tex_base_color,
+                row.tex_normal,
+                row.tex_roughness,
+                row.tex_occlusion
+            ],
+            [10, 11, 12, 12]
+        );
+
+        let (sin, cos) = 0.5f32.sin_cos();
+        for slot in [data.base_color, data.normal, data.roughness_metallic] {
+            assert_eq!(slot.offset_scale, [0.0, -2.4, 15.0, 3.4]);
+            assert_eq!(slot.rotation, [sin, cos, 0.0, 0.0]);
+        }
+        assert_eq!(data.base_color.texture_index, 10);
+        // A slot without a transform samples with identity UVs.
+        assert_eq!(data.occlusion.texture_index, 12);
+        assert_eq!(data.occlusion.offset_scale, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(data.occlusion.rotation, [0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(data.emissive, MaterialTextureSlot::NONE);
+        assert_eq!(data.params, [0.8, 1.0, 0.3, 0.0]);
+
+        // Where the shaders sample: the transform as glTF defines it.
+        let t = data.base_color.transform();
+        let uv = t.apply([0.1, 0.2]);
+        let (u, v) = (0.1 * 15.0, 0.2 * 3.4);
+        assert!((uv[0] - (cos * u + sin * v)).abs() < 1e-5);
+        assert!((uv[1] - (-sin * u + cos * v - 2.4)).abs() < 1e-5);
+    }
+
+    /// A texture that is not resident samples nothing.
+    #[test]
+    fn a_texture_without_a_table_slot_samples_nothing() {
+        let converted = convert_material(&branches(), |texture, _| Ok(texture)).unwrap();
+        let (row, data) = converted.rows(|index| (index != 1).then_some(index as u32));
+        assert_eq!(data.normal, MaterialTextureSlot::NONE);
+        assert_eq!(row.tex_normal, GpuMaterial::NO_TEXTURE);
+        assert_eq!(row.flags & helio_mats::FLAG_HAS_NORMAL_MAP, 0);
+    }
 }

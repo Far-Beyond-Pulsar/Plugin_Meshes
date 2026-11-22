@@ -117,17 +117,25 @@ pub struct MeshAssetUpload {
 }
 
 /// Defaults authored on the mesh asset itself (in the mesh viewer, through
-/// [`set_asset_settings`]). A `StaticMeshComponent` takes them when it is
-/// spawned for the asset or pointed at it; after that they are the instance's
-/// own properties, edited per instance.
+/// [`set_asset_settings`]). `virtual_geometry` is a default: a
+/// `StaticMeshComponent` takes it when it is
+/// spawned for the asset or pointed at it; after that it is the instance's
+/// own property, edited per instance. `vg_fallback_error` stays the asset's:
+/// the virtual-geometry host cuts the mesh's fallback with it.
 ///
 /// Stored as the third element of the v3+ metadata. Files written before it
 /// existed have none, and read as [`MeshAssetSettings::default`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MeshAssetSettings {
     /// Whether instances of this mesh render through virtual geometry.
     #[serde(default)]
     pub virtual_geometry: bool,
+    /// Error bound of the mesh's virtual-geometry fallback (the classic
+    /// stand-in kept on the GPU while its full geometry is released), as a
+    /// fraction of its bounding radius; `None` takes the project's
+    /// (`project.virtual_geometry.fallback_relative_error`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vg_fallback_error: Option<f32>,
 }
 
 /// A validated local-space axis-aligned bound. Empty geometry is represented
@@ -1102,10 +1110,22 @@ pub fn set_default_materials(path: &Path, materials: &[String]) -> Result<(), St
 
 /// Rewrite the [`MeshAssetSettings`] of the native `.mesh` at `path`. Like
 /// [`set_default_materials`], geometry and content id are untouched and a
-/// mesh `AssetUpdated` is published. Placed meshes keep their own values: the
-/// settings seed an instance when it is placed, they do not drive it.
+/// mesh `AssetUpdated` is published. Placed meshes keep their own
+/// `virtual_geometry`: it seeds an instance when it is placed and does not
+/// drive it. The fallback error does: [`asset_settings_revision`] moves, and
+/// the virtual-geometry hosts read the settings of the meshes they use again.
 pub fn set_asset_settings(path: &Path, settings: MeshAssetSettings) -> Result<(), String> {
-    rewrite_metadata(path, |asset| asset.settings = settings)
+    rewrite_metadata(path, |asset| asset.settings = settings)?;
+    ASSET_SETTINGS_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+static ASSET_SETTINGS_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Moves whenever [`set_asset_settings`] rewrote a mesh's settings in this
+/// process: a reader of settings that drive rendering reads them again.
+pub fn asset_settings_revision() -> u64 {
+    ASSET_SETTINGS_REVISION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Decode the `.mesh` at `path`, apply `edit` to its metadata, and replace
@@ -1474,8 +1494,11 @@ mod tests {
 
         let on = MeshAssetSettings {
             virtual_geometry: true,
+            vg_fallback_error: Some(0.02),
         };
+        let revision = asset_settings_revision();
         set_asset_settings(&path, on).unwrap();
+        assert!(asset_settings_revision() > revision, "readers of the settings see the change");
         let bytes = std::fs::read(&path).unwrap();
         let (decoded, id) = decode_asset(&bytes).unwrap();
         assert_eq!((decoded.settings, id), (on, 9));

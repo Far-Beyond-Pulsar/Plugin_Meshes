@@ -13,7 +13,8 @@ use helio_core::{CommandRecorder, GpuCameraUniforms};
 use helio_pass_vg_bvh::gpu_types::{GpuBvhHeader, GpuBvhNode, NODE_LEAF_BIT};
 use helio_pass_vg_cull::reference::{choose_bin, select_clusters, RefInstance, RefView};
 use helio_pass_vg_cull::{
-    state, stats, VgCullConfig, VgCullCore, VgCullFrame, VgCullInputs, BIN_COUNT,
+    state, stats, TileValve, TileValveSample, VgCullConfig, VgCullCore, VgCullFrame,
+    VgCullInputs, BIN_COUNT, TILE_WORDS,
 };
 use helio_vg_format::*;
 use helio_vg_stream::feedback::{self, FeedbackLayout};
@@ -1564,19 +1565,17 @@ fn prefetch_requests_children_while_the_error_is_within_the_band() {
     assert!(!urgent.is_empty() && urgent.is_subset(&requests));
 }
 
-fn tile_block(g: &Gpu, core: &VgCullCore) -> Vec<[u32; 3]> {
+/// The tile block as it is now (a direct read of `state`).
+fn tile_block(g: &Gpu, core: &VgCullCore) -> Vec<TileValve> {
     let b = core.buffers();
-    let words = u64::from(b.tile_base()) + u64::from(b.tiles[0] * b.tiles[1]) * 3;
+    let words = u64::from(b.tile_base()) + u64::from(b.tiles[0] * b.tiles[1] * TILE_WORDS);
     let all = read_words(g, &b.state, words);
-    all[b.tile_base() as usize..]
-        .chunks_exact(3)
-        .map(|c| [c[0], c[1], c[2]])
-        .collect()
+    TileValveSample::decode(core.frame_index(), b.tiles, &all[b.tile_base() as usize..]).valve
 }
 
 #[test]
 fn overdraw_valve_coarsens_only_the_hot_tiles_stably() {
-    use helio_pass_vg_cull::{TILE_FIXED, TILE_SCALE_MAX};
+    use helio_pass_vg_cull::TILE_SCALE_MAX;
     let Some(g) = gpu() else {
         return;
     };
@@ -1601,7 +1600,7 @@ fn overdraw_valve_coarsens_only_the_hot_tiles_stably() {
     let r = upload(&g, &s);
     let eye = [-87.0, 0.0, 1500.0];
     let lone = STACK as u32;
-    let run = |limit: f32, frames: usize| -> (Vec<BTreeSet<Item>>, Vec<f32>, Vec<[u32; 3]>) {
+    let run = |limit: f32, frames: usize| -> (Vec<BTreeSet<Item>>, Vec<f32>, Vec<TileValve>) {
         let mut core = VgCullCore::new(
             &g.device,
             VgCullConfig {
@@ -1616,15 +1615,11 @@ fn overdraw_valve_coarsens_only_the_hot_tiles_stably() {
             sets.push(out.items);
         }
         let tiles = tile_block(&g, &core);
-        let scales = tiles
-            .iter()
-            .map(|t| f32::from_bits(t[2]).max(1.0))
-            .collect();
+        let scales = tiles.iter().map(|t| t.scale).collect();
         (sets, scales, tiles)
     };
     let (open, _, tiles) = run(0.0, 2);
-    let density = |t: &[u32; 3]| t[0] as f32 / (t[1] as f32).clamp(1.0, 256.0 * TILE_FIXED);
-    let hot = tiles.iter().map(density).fold(0.0f32, f32::max);
+    let hot = tiles.iter().map(TileValve::density).fold(0.0f32, f32::max);
     assert!(
         hot > 25.0,
         "the stacked patch is not hot enough for the test: {hot}"
@@ -1662,6 +1657,200 @@ fn overdraw_valve_coarsens_only_the_hot_tiles_stably() {
     );
     assert!(scales.iter().all(|&g| g <= TILE_SCALE_MAX + 1e-3));
     assert!(scales.iter().any(|&g| g > 1.5), "no tile coarsened");
+}
+
+/// The watched tile-valve readback (#1642): one sample per watched frame, in
+/// order, delivered without the caller waiting (the non-blocking take sees the
+/// earlier frames while later ones are in flight), decoded as the valve reads
+/// it: each sample's scale is `cs_tiles`' step from the previous sample's scale
+/// and density, and the last sample is the tile block as it is.
+#[test]
+fn the_tile_valve_readback_samples_every_watched_frame_as_the_valve_steps() {
+    use helio_pass_vg_cull::reference::tile_valve_step;
+    use helio_pass_vg_cull::TILE_SCALE_MAX;
+    let Some(g) = gpu() else {
+        return;
+    };
+    // A hot stack (48 copies at one place), so the valve climbs, then holds.
+    let mut s = scene(false);
+    s.instances = (0..48)
+        .map(|row| {
+            RefInstance::translated_scaled(
+                [-150.0, 0.0, 0.0],
+                1.0,
+                GpuVgInstance {
+                    asset_slot: 0,
+                    flags: INST_ENABLED,
+                    lod_error_scale: 1.0,
+                    object_row: row,
+                },
+            )
+        })
+        .collect();
+    let r = upload(&g, &s);
+    let eye = [-87.0, 0.0, 1500.0];
+    let limit = 16.0;
+    let mut core = VgCullCore::new(
+        &g.device,
+        VgCullConfig {
+            initial_bin_capacity: 1 << 16,
+            tile_density_limit: limit,
+            ..stability_config()
+        },
+    );
+    // Two unwatched frames, then 24 watched ones.
+    for _ in 0..2 {
+        frame_at(&g, &mut core, &r, eye);
+    }
+    const WATCHED: u64 = 24;
+    core.watch_tile_valve(WATCHED as u32);
+    let mut samples = Vec::new();
+    for _ in 0..WATCHED {
+        frame_at(&g, &mut core, &r, eye);
+        samples.extend(core.take_tile_valve_samples());
+    }
+    let early = samples.len();
+    assert!(early > 0, "nothing arrived before the blocking read");
+    samples.extend(core.tile_valve_samples_blocking(&g.device));
+    assert_eq!(
+        samples.last().map(|s| &s.valve),
+        Some(&tile_block(&g, &core)),
+        "the last sample is not the tile block"
+    );
+    // Past the watch, frames record nothing.
+    frame_at(&g, &mut core, &r, eye);
+    assert!(core.tile_valve_samples_blocking(&g.device).is_empty());
+    let frames: Vec<u64> = samples.iter().map(|s| s.frame).collect();
+    assert_eq!(frames, (3..3 + WATCHED).collect::<Vec<_>>(), "missing or out-of-order frames");
+
+    let tiles = core.buffers().tiles;
+    for pair in samples.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        assert_eq!(a.tiles, tiles);
+        for (t, (ta, tb)) in a.valve.iter().zip(&b.valve).enumerate() {
+            let want = tile_valve_step(ta, ta.density(), limit);
+            assert!(
+                (tb.scale - want.scale).abs() <= want.scale * 1e-5
+                    && (tb.park - want.park).abs() <= want.park * 1e-5
+                    && tb.step == want.step,
+                "frame {} tile {t}: {tb:?} after {ta:?} at density {}, the valve's step gives {want:?}",
+                b.frame,
+                ta.density()
+            );
+        }
+    }
+    let last = samples.last().unwrap();
+    let peak = last.valve.iter().map(|t| t.scale).fold(1.0f32, f32::max);
+    assert!(peak > 1.5 && peak <= TILE_SCALE_MAX, "the stack did not engage the valve: {peak}");
+}
+
+/// One valve step on the GPU with a test-written estimate: tile `tile` gets
+/// `density` triangles per covered pixel (a full tile), every other tile none,
+/// and nothing is drawn (no instances), so `cs_tiles` steps from exactly that.
+/// Returns the tile's valve after the frame.
+fn valve_frame(g: &Gpu, core: &mut VgCullCore, r: &Resources, tile: u32, density: f32) -> TileValve {
+    use helio_pass_vg_cull::{tile_word, TILE_FIXED, TILE_PIXELS};
+    let mut inputs = r.inputs();
+    inputs.instance_count = 0;
+    core.begin_frame(&g.device, &g.queue, &VgCullFrame { width: W, height: H }, &inputs);
+    let b = core.buffers().clone();
+    let word = |w: u32| u64::from(b.tile_base() + tile * TILE_WORDS + w) * 4;
+    let fixed = |v: f32| (v * TILE_FIXED).round() as u32;
+    g.queue.write_buffer(
+        &b.state,
+        word(tile_word::TRIANGLES),
+        bytemuck::cast_slice(&[fixed(density * TILE_PIXELS), fixed(TILE_PIXELS)]),
+    );
+    let mut enc = g.device.create_command_encoder(&Default::default());
+    {
+        let mut rec = CommandRecorder::from_encoder(&mut enc);
+        core.record_phase(&mut rec, &g.device, &g.queue, &r.camera, &inputs, None, 0);
+    }
+    g.queue.submit([enc.finish()]);
+    tile_block(g, core)[tile as usize]
+}
+
+/// The cut is discrete: one group swapping can move a tile's density across the
+/// whole dead band, and then no scale puts the tile in it. On the forest scene
+/// the valve cycled between the two sides of such a cliff on a still camera
+/// (32x: 3.4 triangles per pixel, 30.4x: 28) in hundreds of tiles (#1642). A tile
+/// that falls under the band right after coarsening parks: it holds while its
+/// density stays, and a content change releases it. Driven through `cs_tiles`
+/// on the GPU with a model density per scale, and checked step by step against
+/// the reference.
+#[test]
+fn the_valve_parks_at_a_cliff_in_the_cut_and_settles() {
+    use helio_pass_vg_cull::reference::tile_valve_step;
+    use helio_pass_vg_cull::{TILE_STEP_COARSEN, TILE_STEP_HOLD};
+    let Some(g) = gpu() else {
+        return;
+    };
+    let s = scene(false);
+    let r = upload(&g, &s);
+    let limit = 16.0;
+    let config = VgCullConfig {
+        tile_density_limit: limit,
+        initial_bin_capacity: 1 << 12,
+        ..stability_config()
+    };
+    const TILE: u32 = 5;
+    // Runs `frames` frames of `plant` (density from the scale the frame's cut
+    // used), checking each step against the reference; returns the scales.
+    let run = |core: &mut VgCullCore, prev: &mut TileValve, frames: usize, plant: &dyn Fn(f32) -> f32| {
+        let mut scales = Vec::new();
+        for _ in 0..frames {
+            let d = plant(prev.scale);
+            let got = valve_frame(&g, core, &r, TILE, d);
+            let want = tile_valve_step(prev, d, limit);
+            assert!(
+                (got.scale - want.scale).abs() <= want.scale * 1e-5
+                    && (got.park - want.park).abs() <= want.park * 1e-4
+                    && got.step == want.step,
+                "GPU {got:?} vs reference {want:?} after {prev:?} at density {d}"
+            );
+            *prev = got;
+            scales.push(got.scale);
+        }
+        scales
+    };
+    let reversals = |scales: &[f32]| {
+        let dirs: Vec<i32> = scales
+            .windows(2)
+            .filter(|w| w[0] != w[1])
+            .map(|w| if w[1] > w[0] { 1 } else { -1 })
+            .collect();
+        dirs.windows(2).filter(|w| w[0] != w[1]).count()
+    };
+
+    // A cliff: finer than 25.5x the tile reads 20.5 per pixel (over the band's
+    // upper edge, 20), coarser 8.6 (under its lower edge, 12.8).
+    let cliff = |g: f32| if g < 25.5 { 20.5 } else { 8.6 };
+    let mut core = VgCullCore::new(&g.device, config.clone());
+    let mut prev = TileValve { scale: 1.0, ..Default::default() };
+    let scales = run(&mut core, &mut prev, 120, &cliff);
+    let tail = &scales[60..];
+    assert_eq!(reversals(tail), 0, "the valve cycles at the cliff: {tail:?}");
+    assert!(prev.park > 0.0 && prev.scale >= 25.5, "not parked on the coarse side: {prev:?}");
+
+    // The content changes (the camera moved, the tile got cheap): the park is
+    // released and the tile relaxes.
+    let cheap = |_: f32| 2.0;
+    let scales = run(&mut core, &mut prev, 30, &cheap);
+    assert_eq!(prev.park, 0.0, "a content change did not release the park");
+    assert!(scales.windows(2).all(|w| w[1] <= w[0]) && scales[29] < scales[0] * 0.5);
+
+    // A continuous density (here ~ g^-1.5) never parks: it settles in the band.
+    let smooth = |g: f32| 400.0 * g.powf(-1.5);
+    let mut core = VgCullCore::new(&g.device, config);
+    let mut prev = TileValve { scale: 1.0, ..Default::default() };
+    let scales = run(&mut core, &mut prev, 120, &smooth);
+    assert_eq!(reversals(&scales), 0, "a smooth density oscillated: {scales:?}");
+    let d = smooth(prev.scale);
+    assert!(
+        (limit / 1.25..=limit * 1.25).contains(&d) && prev.park == 0.0,
+        "settled outside the band or parked: density {d} at {prev:?}"
+    );
+    assert!(prev.step == TILE_STEP_HOLD || prev.step == TILE_STEP_COARSEN);
 }
 
 // ── Viewport resizes and the tile estimate ─────────────────────────────────
@@ -1727,7 +1916,7 @@ fn sized_frame(
 /// handler.
 #[test]
 fn viewport_resizes_keep_the_tile_block_in_step_with_the_screen() {
-    use helio_pass_vg_cull::{TILE_FIXED, TILE_SCALE_MAX, TILE_WORDS};
+    use helio_pass_vg_cull::TILE_SCALE_MAX;
     let Some(g) = gpu() else {
         return;
     };
@@ -1776,13 +1965,13 @@ fn viewport_resizes_keep_the_tile_block_in_step_with_the_screen() {
         let tiles = tile_block(&g, &core);
         assert_eq!(tiles.len() as u32, grid[0] * grid[1]);
         for t in &tiles {
-            let scale = f32::from_bits(t[2]);
             assert!(
-                scale == 0.0 || (1.0 - 1e-3..=TILE_SCALE_MAX + 1e-3).contains(&scale),
-                "{w}x{h}: tile scale {scale}"
+                (1.0..=TILE_SCALE_MAX + 1e-3).contains(&t.scale),
+                "{w}x{h}: tile scale {}",
+                t.scale
             );
         }
-        let estimated: f32 = tiles.iter().map(|t| t[0] as f32 / TILE_FIXED).sum();
+        let estimated: f32 = tiles.iter().map(|t| t.triangles).sum();
         let emitted_tris: u32 = out
             .items
             .iter()
@@ -1801,14 +1990,14 @@ fn viewport_resizes_keep_the_tile_block_in_step_with_the_screen() {
     assert!(covered_frames >= 4, "the scene was never visible");
 }
 
-/// The dense mask has the raster grid (`dense_tiles`), which for the frame
-/// after a resize is not the cull grid. `cs_tiles` must read it by tile
-/// coordinate, not by the cull linear tile index: a tile the mask marks dense is
-/// exempt from the valve, and a different tile being exempt instead lets the hot
-/// stack be coarsened (#1645).
+/// A tile in the dense mask gets the valve's law like any other (#1642). Exempt,
+/// the 512 dense tiles of the forest relaxed to full detail: 145 M triangles and
+/// 590 k clusters dropped from full bins. The mask comes from a larger raster grid
+/// than the cull's (the frame after a resize, #1645), so it is laid out by tile
+/// coordinate, and it marks exactly the hot tiles: the stack must be coarsened to
+/// the same cut, with the same scales, as without a mask.
 #[test]
-fn the_dense_mask_is_read_by_tile_coordinate_when_the_grids_differ() {
-    use helio_pass_vg_cull::TILE_FIXED;
+fn dense_tiles_are_coarsened_like_any_other() {
     let Some(g) = gpu() else {
         return;
     };
@@ -1829,7 +2018,6 @@ fn the_dense_mask_is_read_by_tile_coordinate_when_the_grids_differ() {
     s.instances = (0..STACK).map(|i| make(i as u32)).collect();
     let r = upload(&g, &s);
     let eye = [-87.0, 0.0, 1500.0];
-    // The cull screen is small; the mask comes from a larger raster grid.
     let screen = (640, 360);
     let (cull_grid, mask_grid) = (tile_grid(screen.0, screen.1), tile_grid(1920, 1080));
     let config = |limit: f32| VgCullConfig {
@@ -1845,55 +2033,41 @@ fn the_dense_mask_is_read_by_tile_coordinate_when_the_grids_differ() {
     // The hot tiles of the cull grid, from an unvalved frame.
     let mut open = VgCullCore::new(&g.device, config(0.0));
     let (open_out, _) = sized_frame(&g, &mut open, &r, &r.inputs(), screen, eye);
-    let density = |t: &[u32; 3]| t[0] as f32 / (t[1] as f32).clamp(1.0, 256.0 * TILE_FIXED);
     let hot: Vec<u32> = tile_block(&g, &open)
         .iter()
         .enumerate()
-        .filter(|(_, t)| density(t) > 25.0)
+        .filter(|(_, t)| t.density() > 25.0)
         .map(|(i, _)| i as u32)
         .collect();
     assert!(!hot.is_empty(), "the stack is not hot");
-
-    // The mask marks exactly those tiles, in the mask grid layout.
     let mut mask = vec![0u32; (mask_grid[0] * mask_grid[1]) as usize];
-    let mut misread = 0;
     for &t in &hot {
         let (x, y) = (t % cull_grid[0], t / cull_grid[0]);
         mask[(y * mask_grid[0] + x) as usize] = 1;
-        misread += u32::from(mask[t as usize] == 0);
     }
-    assert!(misread > 0, "the test cannot tell the two readings apart");
     let mask_buf = buf(&g, "dense mask", &mask);
     let mut inputs = r.inputs();
     inputs.dense_mask = Some(&mask_buf);
     inputs.dense_tiles = mask_grid;
 
-    // Every hot tile is dense: the valve leaves the stack alone.
-    let mut valved = VgCullCore::new(&g.device, config(16.0));
-    let mut last = BTreeSet::new();
-    for _ in 0..40 {
-        last = sized_frame(&g, &mut valved, &r, &inputs, screen, eye)
-            .0
-            .items;
-    }
-    assert_eq!(
-        triangles(&last),
-        triangles(&open_out.items),
-        "tiles the mask marks dense were coarsened: the mask was read at the wrong tiles"
-    );
-
-    // Control: without the mask the same stack is coarsened.
-    let mut plain = VgCullCore::new(&g.device, config(16.0));
-    let mut coarse = BTreeSet::new();
-    for _ in 0..40 {
-        coarse = sized_frame(&g, &mut plain, &r, &r.inputs(), screen, eye)
-            .0
-            .items;
-    }
+    let settle = |inputs: &VgCullInputs<'_>| {
+        let mut core = VgCullCore::new(&g.device, config(16.0));
+        let mut last = BTreeSet::new();
+        for _ in 0..40 {
+            last = sized_frame(&g, &mut core, &r, inputs, screen, eye).0.items;
+        }
+        let scales: Vec<f32> = tile_block(&g, &core).iter().map(|t| t.scale).collect();
+        (triangles(&last), scales)
+    };
+    let (dense, dense_scales) = settle(&inputs);
+    let (plain, plain_scales) = settle(&r.inputs());
     assert!(
-        triangles(&coarse) * 10 < triangles(&open_out.items) * 9,
-        "the control was not coarsened, so the test proves nothing"
+        plain * 10 < triangles(&open_out.items) * 9,
+        "the stack was not coarsened, so the test proves nothing"
     );
+    assert_eq!(dense, plain, "the dense tiles were not coarsened like the others");
+    assert_eq!(dense_scales, plain_scales);
+    assert!(hot.iter().all(|&t| dense_scales[t as usize] > 1.0));
 }
 
 // ── The estimate's limit on cluster size ───────────────────────────────────
@@ -1915,7 +2089,6 @@ fn projected_radius_px(v: &RefView, inst: &RefInstance, c: &GpuCluster) -> f32 {
 /// the limit, however many large clusters there are (#1646).
 #[test]
 fn the_tile_estimate_leaves_out_clusters_wider_than_the_limit() {
-    use helio_pass_vg_cull::TILE_FIXED;
     let Some(g) = gpu() else {
         return;
     };
@@ -1956,10 +2129,7 @@ fn the_tile_estimate_leaves_out_clusters_wider_than_the_limit() {
         let v = set_camera(&g, &r, eye);
         let (out, _) = frame_at(&g, &mut core, &r, eye);
         let (small, large, large_clusters) = split(&out.items, &v);
-        let estimated: f32 = tile_block(&g, &core)
-            .iter()
-            .map(|t| t[0] as f32 / TILE_FIXED)
-            .sum();
+        let estimated: f32 = tile_block(&g, &core).iter().map(|t| t.triangles).sum();
         // Counted: the small ones (less what falls off screen). Not counted: the large.
         assert!(
             estimated <= small as f32 * 1.01 + 1.0,

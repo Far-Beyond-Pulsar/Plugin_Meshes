@@ -15,12 +15,20 @@
 //!   opacity), shared by every instance of the mesh; a hit's surface row is
 //!   its instance's custom data (the mesh's first row) plus the hit's
 //!   `geometry_index`. A mesh with `virtual_geometry` on is traced like any
-//!   other: its component holds the full source geometry (the `.vgeo` is
-//!   built from it, and it stays mirrored as the classic fallback), so its
-//!   BLAS is exact and needs no copy of the vertices. A coarse cut of the
-//!   cluster DAG would only add memory and error here (rays would hit a
-//!   surface up to the cut's error away from the one the raster draws, which
-//!   shows as wrong shadows and GI).
+//!   other, from the classic geometry its component holds: once its
+//!   virtual geometry is drawn that is its fallback, an error-bounded cut of
+//!   its cluster DAG (`crate::virtual_geometry_host`; the mesh asset's or the
+//!   project's error bound), so rays see at most that error, and its BLAS
+//!   reads the fallback's vertices already on the GPU (the full geometry is
+//!   no longer there). Until then, and where virtual geometry is not drawn,
+//!   it is the full geometry, exact.
+//! - **Deforming meshes.** A static mesh whose movability is `Dynamic` may
+//!   change its vertices in place (with no content key, in a private GPU
+//!   range, or under a new one). It gets a BLAS of its own, built for
+//!   refits; each change of the mesh (its journal) hashes its vertices and
+//!   indices, as the standalone projection does: new positions refit the
+//!   BLAS, new topology rebuilds it, and until that is recorded it is traced
+//!   as it was. A rigid mesh's BLAS is shared and never re-read.
 //! - **Incremental.** The world's change journals say what changed: a mesh,
 //!   its materials or its enabled state re-evaluates that mesh; a transform
 //!   or parent change re-places the meshes below that entity (an index of
@@ -76,7 +84,7 @@
 //! How others do it: Unreal's ray-tracing scene keeps one instance per
 //! primitive with a BLAS per mesh LOD whose segments are its sections (hit
 //! groups per segment), updated from primitive changes, BLAS builds
-//! budgeted and compacted, and Nanite meshes traced through fallback
+//! budgeted and compacted, and virtualized meshes traced through fallback
 //! meshes; Lumen's hit lighting uses a surface cache instead of the material.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -129,15 +137,25 @@ enum BlasKey {
         geometry: u128,
         sections: Vec<(u32, u32, bool)>,
     },
+    /// A deforming static mesh's own BLAS (its entity's bits; `Dynamic`
+    /// movability): its vertices may change in place, so it is shared with
+    /// no other instance, and its traced sections as a mesh's.
+    Deforming {
+        entity: u64,
+        sections: Vec<(u32, u32, bool)>,
+    },
 }
 
 /// Where a BLAS's triangles are, for its build.
 #[derive(Clone, Copy, Debug)]
 enum Source {
-    /// A mesh's ranges of the mirror's vertex and index pools.
+    /// A mesh's ranges of the mirror's vertex and index pools, and (for a
+    /// deforming mesh) the content hashes of its vertices and indices: a
+    /// new positions hash refits its BLAS, a new topology hash rebuilds it.
     Mesh {
         vertices: VarLenHandle,
         first_index: u32,
+        revisions: (u64, u64),
     },
     /// A skinned instance's vertices in the skin cache (by its entity), its
     /// indices in the mesh pool from `first_index`.
@@ -157,6 +175,9 @@ struct Blas {
     /// the frames its refit has waited.
     revision: u64,
     waited: u32,
+    /// A deforming mesh's BLAS whose vertices changed since it was built: it
+    /// stays traced as it was until its refit (or rebuild) is recorded.
+    refit_due: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -671,10 +692,30 @@ impl WorldRayScene {
         skins: &SkinCache,
         entity: Entity,
     ) {
-        if let Some(old) = self.entries.remove(&entity) {
+        let old = self.entries.remove(&entity);
+        let entry = self.entry(world, mirror, store, skins, entity);
+        // A deforming mesh traced again under the same key keeps its BLAS
+        // (its new vertices refit it): it is held across the forget.
+        let kept = match (&old, &entry) {
+            (
+                Some(Entry {
+                    state: Ok(before), ..
+                }),
+                Some(Entry {
+                    state: Ok(after), ..
+                }),
+            ) if before.key == after.key && matches!(after.key, BlasKey::Deforming { .. }) => {
+                Some(after.key.clone())
+            }
+            _ => None,
+        };
+        if let Some(blas) = kept.as_ref().and_then(|key| self.blases.get_mut(key)) {
+            blas.users += 1;
+        }
+        if let Some(old) = old {
             self.forget(entity, old);
         }
-        let Some(mut entry) = self.entry(world, mirror, store, skins, entity) else {
+        let Some(mut entry) = entry else {
             return;
         };
         if let Ok(traced) = &mut entry.state {
@@ -697,23 +738,58 @@ impl WorldRayScene {
             Ok(traced) => {
                 let source = traced.source_hint;
                 let skinned = traced.skinned;
-                let blas = self.blases.entry(traced.key.clone()).or_insert_with(|| {
-                    let id = self.next_id;
-                    self.next_id += 1;
-                    // Skinned BLASes are built by the refit budget.
-                    if !skinned {
-                        self.build_queue.push_back(traced.key.clone());
+                let blas = match self.blases.entry(traced.key.clone()) {
+                    std::collections::hash_map::Entry::Occupied(blas) => {
+                        let blas = blas.into_mut();
+                        if kept.is_some() {
+                            // The hold above becomes this trace's use.
+                            blas.users -= 1;
+                            // Its vertices or indices changed in place: the
+                            // next build refits (or rebuilds) it, and until
+                            // then it is traced as it was.
+                            let changed = match (blas.source, source.0) {
+                                (
+                                    Source::Mesh { revisions: was, .. },
+                                    Source::Mesh { revisions: now, .. },
+                                ) => was != now,
+                                _ => false,
+                            };
+                            blas.source = source.0;
+                            blas.triangles = source.1;
+                            match blas.state {
+                                BlasState::Built if changed && !blas.refit_due => {
+                                    blas.refit_due = true;
+                                    self.build_queue.push_back(traced.key.clone());
+                                }
+                                // A failed build is tried again on new data.
+                                BlasState::Failed if changed => {
+                                    blas.state = BlasState::Queued;
+                                    self.build_queue.push_back(traced.key.clone());
+                                }
+                                _ => {}
+                            }
+                        }
+                        blas
                     }
-                    Blas {
-                        id,
-                        users: 0,
-                        state: BlasState::Queued,
-                        source: source.0,
-                        triangles: source.1,
-                        revision: 0,
-                        waited: 0,
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        // Skinned BLASes are built by the refit budget.
+                        if !skinned {
+                            self.build_queue.push_back(traced.key.clone());
+                        }
+                        slot.insert(Blas {
+                            id,
+                            users: 0,
+                            state: BlasState::Queued,
+                            source: source.0,
+                            triangles: source.1,
+                            revision: 0,
+                            waited: 0,
+                            refit_due: false,
+                        })
                     }
-                });
+                };
                 blas.users += 1;
                 if !traced.culled {
                     self.awaiting_blas.insert(entity);
@@ -955,7 +1031,14 @@ impl WorldRayScene {
         owner: Entity,
     ) -> Result<Traced, Skip> {
         let world_matrix = Self::placed(world, link, owner)?;
-        if mesh.geometry_key == MeshGeometryKey::NONE || mesh.indices.is_empty() {
+        let movability = helio::Movability::from(mesh.movability);
+        // A deforming mesh may hold geometry with no content key (written in
+        // place, a private GPU range); any other needs its loaded geometry.
+        let deforming = movability.can_deform();
+        if (mesh.geometry_key == MeshGeometryKey::NONE && !deforming)
+            || mesh.vertices.is_empty()
+            || mesh.indices.is_empty()
+        {
             return Err(Skip::Unloaded);
         }
         let (Some(vertices), Some(indices)) = (
@@ -1006,19 +1089,46 @@ impl WorldRayScene {
                 program: surface.program,
                 _pad: [0; 2],
             };
-        let movable = helio::Movability::from(mesh.movability).can_move();
-        let key = BlasKey::Mesh {
-            geometry: mesh.geometry_key.0,
-            sections: sections
-                .iter()
-                .map(|(s, _, surface)| {
-                    (
-                        s.first_index,
-                        s.index_count,
-                        surface.flags & RAY_INSTANCE_MASKED == 0,
-                    )
-                })
-                .collect(),
+        let movable = movability.can_move();
+        let traced_sections = sections
+            .iter()
+            .map(|(s, _, surface)| {
+                (
+                    s.first_index,
+                    s.index_count,
+                    surface.flags & RAY_INSTANCE_MASKED == 0,
+                )
+            })
+            .collect();
+        // A deforming mesh: its own BLAS, and its geometry's content hashes
+        // (positions, topology), taken when it changes, decide whether it is
+        // refit or rebuilt, as the standalone projection does. A rigid mesh
+        // shares its loaded geometry's BLAS, built once.
+        let (key, revisions) = if deforming {
+            let hash = |bytes: &[u8]| {
+                use std::hash::Hasher;
+                let mut hash = twox_hash::XxHash3_64::default();
+                hash.write(bytes);
+                hash.finish()
+            };
+            (
+                BlasKey::Deforming {
+                    entity: entity_bits(entity),
+                    sections: traced_sections,
+                },
+                (
+                    hash(bytemuck::cast_slice(&mesh.vertices)),
+                    hash(bytemuck::cast_slice(&mesh.indices)),
+                ),
+            )
+        } else {
+            (
+                BlasKey::Mesh {
+                    geometry: mesh.geometry_key.0,
+                    sections: traced_sections,
+                },
+                (0, 0),
+            )
         };
         let rows = sections
             .iter()
@@ -1037,6 +1147,7 @@ impl WorldRayScene {
             Source::Mesh {
                 vertices,
                 first_index: indices.offset,
+                revisions,
             },
             sections
                 .iter()
@@ -1095,7 +1206,7 @@ impl WorldRayScene {
                 self.build_queue.pop_front();
                 continue;
             };
-            if blas.state != BlasState::Queued {
+            if blas.state != BlasState::Queued && !blas.refit_due {
                 self.build_queue.pop_front();
                 continue;
             }
@@ -1104,12 +1215,20 @@ impl WorldRayScene {
             }
             let key = self.build_queue.pop_front().expect("front");
             let blas = self.blases.get_mut(&key).expect("present");
+            let refit = blas.refit_due;
+            blas.refit_due = false;
+            let (sections, movability) = match &key {
+                BlasKey::Mesh { sections, .. } => (sections, helio_core::Movability::Static),
+                BlasKey::Deforming { sections, .. } => (sections, helio_core::Movability::Dynamic),
+                BlasKey::Skinned { sections, .. } => (sections, helio_core::Movability::Dynamic),
+            };
             let result = match (&key, blas.source) {
                 (
-                    BlasKey::Mesh { sections, .. },
+                    BlasKey::Mesh { .. } | BlasKey::Deforming { .. },
                     Source::Mesh {
                         vertices,
                         first_index,
+                        revisions: (positions_revision, topology_revision),
                     },
                 ) => match (&vertex_pool, &index_pool) {
                     (Some(vertex_pool), Some(index_pool)) => {
@@ -1118,8 +1237,8 @@ impl WorldRayScene {
                                 .iter()
                                 .map(|&(first, count, opaque)| BlasSegment {
                                     geometry: BlasGeometry {
-                                        positions_revision: 0,
-                                        topology_revision: 0,
+                                        positions_revision,
+                                        topology_revision,
                                         vertices: &vertex_pool.buffer,
                                         first_vertex: vertices.offset,
                                         vertex_count: vertices.count,
@@ -1135,13 +1254,14 @@ impl WorldRayScene {
                                 })
                                 .collect();
                         self.blas
-                            .build(blas.id, encoder, segments, helio_core::Movability::Static)
+                            .build(blas.id, encoder, segments, movability)
                             .map_err(|e| e.to_string())
                     }
                     _ => Err("the mesh pools are not registered".into()),
                 },
                 _ => Err("source does not match its key".into()),
             };
+            let triangles = blas.triangles;
             match result {
                 Ok(_) => blas.state = BlasState::Built,
                 Err(error) => {
@@ -1149,9 +1269,35 @@ impl WorldRayScene {
                     tracing::warn!(
                         "Meshes: a ray-tracing BLAS could not be built ({error}); its meshes are not traced"
                     );
+                    // A deforming mesh traced from its previous build: it
+                    // leaves the TLAS (the failed build removed its BLAS).
+                    if refit {
+                        let traced: Vec<usize> = self
+                            .slots
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, entity)| {
+                                matches!(
+                                    self.entries.get(entity).map(|e| &e.state),
+                                    Some(Ok(traced)) if traced.key == key
+                                )
+                            })
+                            .map(|(slot, _)| slot)
+                            .collect();
+                        for slot in traced.into_iter().rev() {
+                            let entity = self.slots[slot];
+                            if let Some(Ok(traced)) =
+                                self.entries.get_mut(&entity).map(|e| &mut e.state)
+                            {
+                                traced.slot = None;
+                            }
+                            self.leave_slot(slot);
+                            self.awaiting_blas.insert(entity);
+                        }
+                    }
                 }
             }
-            budget = budget.saturating_sub(blas.triangles);
+            budget = budget.saturating_sub(triangles);
             built_any = true;
         }
     }

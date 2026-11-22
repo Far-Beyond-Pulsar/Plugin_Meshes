@@ -271,14 +271,12 @@ geometric error tolerance are unchanged. The GPU regression
 under contention, urgent upgrades and a second reset epoch. Per-change
 timings of these steps are not in the log above.
 
-AAA comparison: Nanite
-([SIGGRAPH 2021](https://advances.realtimerendering.com/s2021/Karis_Nanite_SIGGRAPH_Advances_2021_final.pdf))
-uses the same GPU hierarchy traversal with persistent threads; the changes
-above remove synchronisation inside it without changing its geometric
-decisions. Epic's
-[content guidance](https://dev.epicgames.com/documentation/unreal-engine/working-with-naniteenabled-content)
-names aggregate foliage and overdraw as hard cases for simplification; the
-bookkeeping changes do not solve that representation cost (see Known limits).
+AAA comparison: published cluster-LOD renderers (SIGGRAPH 2021 Advances in
+Real-Time Rendering) use the same GPU hierarchy traversal with persistent
+threads; the changes above remove synchronisation inside it without changing
+its geometric decisions. Aggregate foliage and overdraw are the known hard
+cases for cluster simplification; the bookkeeping changes do not solve that
+representation cost (see Known limits).
 
 ## Known limits
 
@@ -289,7 +287,7 @@ bookkeeping changes do not solve that representation cost (see Known limits).
   not a clipmap or virtual-texture terrain.
 - **No aggregate foliage tier.** Distant trees are still their own cluster
   hierarchies down to the roots; there is no impostor or aggregate
-  representation (the Nanite Foliage equivalent is missing), which is why the
+  representation (no voxel or aggregate foliage representation), which is why the
   valve and tau dominate the far-field cost.
 - **No CLAS/PTLAS.** Cluster and partitioned TLAS acceleration structures
   ([DirectX preview](https://devblogs.microsoft.com/directx/clas-ptlas-preview/))

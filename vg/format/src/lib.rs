@@ -13,14 +13,18 @@ pub const WGSL: &str = include_str!("../shaders/vg_format.wgsl");
 pub const CLUSTER_MAX_TRIS: u32 = 128;
 pub const CLUSTER_MAX_VERTS: u32 = 128;
 pub const CLUSTER_MIN_TRIS: u32 = 32;
+/// Default of the overdraw valve's limit: triangles per covered pixel one
+/// 16x16 screen tile may hold before the clusters over it are coarsened.
+/// Measured on the museum and forest (RTX 4090, 1280x720, revision-13 caches):
+/// off, the overview selects 203M triangles in 29 ms of GPU; at 16 it selects
+/// 26M in 9.6 ms, and 32 measures the same within 3%, so the valve only acts
+/// on the pathological tiles (sub-pixel foliage) it exists for.
+pub const DEFAULT_TILE_DENSITY_LIMIT: f32 = 16.0;
 /// Streaming page size in bytes.
 pub const PAGE_BYTES: u32 = 128 * 1024;
-/// Groups are 4..=8 clusters.
-pub const GROUP_MIN_CLUSTERS: u32 = 4;
-pub const GROUP_MAX_CLUSTERS: u32 = 8;
-/// Larger groups the builder may form once few clusters remain (limited in
-/// practice by one group having to fit a 128 KiB page); the group ref stores
-/// the count in 16 bits, so readers must not assume `GROUP_MAX_CLUSTERS`.
+/// Most clusters one simplification group may have (limited in practice by
+/// one group having to fit a 128 KiB page); the group ref stores the count in
+/// 16 bits.
 pub const GROUP_MAX_CLUSTERS_LARGE: u32 = 32;
 /// Hierarchy fan-out (child slots per node).
 pub const NODE_FANOUT: usize = 4;
@@ -74,6 +78,104 @@ impl VertexAttr {
             uv1: [half(12), half(14)],
         })
     }
+
+    /// Encode a record in the [`ATTR_STRIDE`] layout [`Self::decode`] reads.
+    /// The normal is renormalised and the tangent made orthogonal to it
+    /// (Gram-Schmidt), so an interpolated or optimised record stays a valid
+    /// tangent frame; a tangent parallel to the normal is replaced by any
+    /// perpendicular.
+    pub fn encode(&self) -> [u8; ATTR_STRIDE as usize] {
+        let norm = |v: [f32; 3]| {
+            let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            (l > 1e-12).then(|| [v[0] / l, v[1] / l, v[2] / l])
+        };
+        let n = norm(self.normal).unwrap_or([0.0, 0.0, 1.0]);
+        let d = self.tangent[0] * n[0] + self.tangent[1] * n[1] + self.tangent[2] * n[2];
+        let t = norm([
+            self.tangent[0] - d * n[0],
+            self.tangent[1] - d * n[1],
+            self.tangent[2] - d * n[2],
+        ])
+        .unwrap_or_else(|| {
+            // Cross with the axis least aligned with the normal.
+            let a = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+            norm([
+                a[1] * n[2] - a[2] * n[1],
+                a[2] * n[0] - a[0] * n[2],
+                a[0] * n[1] - a[1] * n[0],
+            ])
+            .unwrap_or([1.0, 0.0, 0.0])
+        });
+        let snorm = |x: f32| (x.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8;
+        let mut out = [0u8; ATTR_STRIDE as usize];
+        out[0..3].copy_from_slice(&n.map(snorm));
+        out[4..7].copy_from_slice(&t.map(snorm));
+        out[7] = if self.bitangent_sign < 0.0 { 0x81 } else { 0x7f };
+        for (i, x) in [self.uv0[0], self.uv0[1], self.uv1[0], self.uv1[1]]
+            .into_iter()
+            .enumerate()
+        {
+            out[8 + 2 * i..10 + 2 * i].copy_from_slice(&f32_to_f16(x).to_le_bytes());
+        }
+        out
+    }
+}
+
+/// The [`ATTR_STRIDE`] record of a vertex whose normal and tangent are
+/// already packed snorm8x4 words (the mesh vertex layout): normal word as is,
+/// tangent xyz with its w replaced by the bitangent sign, uvs as halves.
+pub fn attr_record(
+    normal: u32,
+    tangent: u32,
+    bitangent_sign: f32,
+    uv0: [f32; 2],
+    uv1: [f32; 2],
+) -> [u8; ATTR_STRIDE as usize] {
+    let sign: u32 = if bitangent_sign < 0.0 { 0x81 } else { 0x7f };
+    let mut out = [0u8; ATTR_STRIDE as usize];
+    out[0..4].copy_from_slice(&normal.to_le_bytes());
+    out[4..8].copy_from_slice(&((tangent & 0x00ff_ffff) | (sign << 24)).to_le_bytes());
+    for (i, x) in [uv0[0], uv0[1], uv1[0], uv1[1]].into_iter().enumerate() {
+        out[8 + 2 * i..10 + 2 * i].copy_from_slice(&f32_to_f16(x).to_le_bytes());
+    }
+    out
+}
+
+/// Single to IEEE half precision, round to nearest even; overflow saturates
+/// to infinity and NaN stays NaN.
+pub fn f32_to_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let man = bits & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x0200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    let round = |v: u32, shift: u32| -> u32 {
+        // Round half to even on the bits shifted out.
+        let half = 1u32 << (shift - 1);
+        let rest = v & ((1u32 << shift) - 1);
+        let q = v >> shift;
+        if rest > half || (rest == half && q & 1 == 1) {
+            q + 1
+        } else {
+            q
+        }
+    };
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        // Subnormal: the carry of rounding up lands in the exponent, which is
+        // the correct smallest normal.
+        return sign | round(man | 0x0080_0000, (14 - e) as u32) as u16;
+    }
+    // A mantissa carry correctly bumps the exponent (up to infinity).
+    sign | ((((e as u32) << 10) + round(man, 13)) as u16)
 }
 
 /// IEEE half to single precision.
@@ -145,24 +247,47 @@ pub struct GpuVisibleCluster {
     pub cluster_slot: u32,
 }
 
-/// `vg_asset_ready` row for the scene derivation. 16 bytes; sorted ascending
-/// by `vertex_offset`; padding rows have `vertex_offset == u32::MAX`.
+/// `vg_asset_ready` row for the scene derivation: an asset by its content id
+/// (the identity a mesh instance carries on the GPU), its slot in the asset
+/// table and whether it is ready. 32 bytes; sorted ascending by `content`
+/// read as a `u128` (word 3 most significant, [`Self::sort_key`]); padding
+/// rows are [`Self::PADDING`] (every content word `u32::MAX`, never ready).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct VgAssetReadyRow {
-    pub vertex_offset: u32,
-    pub vertex_count: u32,
+    /// The content id's little-endian `u32` words.
+    pub content: [u32; 4],
     pub asset_slot: u32,
     pub flags: u32,
+    pub _pad: [u32; 2],
 }
 pub const VG_ASSET_READY_FLAG_READY: u32 = 1;
 impl VgAssetReadyRow {
     pub const PADDING: Self = Self {
-        vertex_offset: u32::MAX,
-        vertex_count: 0,
+        content: [u32::MAX; 4],
         asset_slot: 0,
         flags: 0,
+        _pad: [0; 2],
     };
+
+    /// The `u32` words of a content id given as `.vgeo` header words
+    /// (`[low, high]`).
+    pub fn content_words(content: [u64; 2]) -> [u32; 4] {
+        [
+            content[0] as u32,
+            (content[0] >> 32) as u32,
+            content[1] as u32,
+            (content[1] >> 32) as u32,
+        ]
+    }
+
+    /// The order rows are sorted in (and searched by, on the GPU).
+    pub fn sort_key(&self) -> u128 {
+        self.content
+            .iter()
+            .rev()
+            .fold(0u128, |key, &word| (key << 32) | u128::from(word))
+    }
 }
 
 /// Shared position/index/attribute decode. Needs `vg_page_pool` and
@@ -603,6 +728,33 @@ mod tests {
     }
 
     #[test]
+    fn vertex_attr_encode_round_trips_and_orthonormalises() {
+        let a = VertexAttr {
+            normal: [0.0, 2.0, 0.0],
+            tangent: [1.0, 1.0, 0.0],
+            bitangent_sign: -1.0,
+            uv0: [0.25, -3.5],
+            uv1: [1024.0, 6.0e-5],
+        };
+        let b = VertexAttr::decode(&a.encode()).unwrap();
+        assert_eq!(b.normal, [0.0, 1.0, 0.0]);
+        assert_eq!(b.tangent, [1.0, 0.0, 0.0]);
+        assert_eq!(b.bitangent_sign, -1.0);
+        assert_eq!(b.uv0, [0.25, -3.5]);
+        assert_eq!(b.uv1[0], 1024.0);
+        assert!((b.uv1[1] - 6.0e-5).abs() < 1e-7);
+        // Every finite half survives a round trip through f32.
+        for h in 0u16..=0xffff {
+            let f = f16_to_f32(h);
+            if f.is_finite() {
+                assert_eq!(f16_to_f32(f32_to_f16(f)).to_bits(), f.to_bits(), "{h:#x}");
+            }
+        }
+        assert_eq!(f32_to_f16(1.0e9), 0x7c00);
+        assert_eq!(f32_to_f16(1.0 + 1.0 / 4096.0), 0x3c00, "ties round to even");
+    }
+
+    #[test]
     fn layouts_are_stable() {
         assert_eq!(size_of::<GpuCluster>(), 64);
         assert_eq!(size_of::<GpuHierarchyNode>(), 96);
@@ -613,7 +765,7 @@ mod tests {
         assert_eq!(size_of::<PageHeader>(), 32);
         assert_eq!(size_of::<GpuAssetQuant>(), 16);
         assert_eq!(size_of::<GpuVisibleCluster>(), 8);
-        assert_eq!(size_of::<VgAssetReadyRow>(), 16);
+        assert_eq!(size_of::<VgAssetReadyRow>(), 32);
     }
 
     #[test]

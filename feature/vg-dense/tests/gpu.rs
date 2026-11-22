@@ -299,7 +299,7 @@ fn run_nonrt_layout(
     );
     let words: &[u32] = cast_slice(&raw);
     RunResult {
-        keys: words.chunks(2).map(|c| (c[0], c[1])).collect(),
+        keys: words.chunks(2).map(dense_key_words).collect(),
         stats,
     }
 }
@@ -469,6 +469,75 @@ fn nonrt_clamp_and_overflow_counters() {
     assert_eq!(r.stats.slot_overflow, 9, "{:?}", r.stats);
 }
 
+/// The key both Tier-3 backends write (`vg_raster_key`) is, word for word,
+/// `helio_vg_format::raster_key`: the layout `vis_resolve` and the software
+/// keys read (`[id, depth bits]`). Producers and the resolve once disagreed,
+/// which made every dense pixel unreadable (issue #1667).
+#[test]
+fn dense_key_is_the_raster_key() {
+    let Some(g) = gpu(false) else { return };
+    let cases = [(0.25f32, 0x0123_4567u32), (1.0, 7), (1.0e-3, u32::MAX >> 1)];
+    let mut body = String::new();
+    for (i, (z, id)) in cases.iter().enumerate() {
+        body += &format!(
+            "out[{i}] = vg_raster_key({z:?}, {id}u);\n\
+             if vg_raster_key_depth(out[{i}]) != {z:?} || vg_raster_key_id(out[{i}]) != {id}u {{ out[{i}] = vec2<u32>(0u); }}\n"
+        );
+    }
+    let src = format!(
+        "{}\n@group(0) @binding(0) var<storage, read_write> out: array<vec2<u32>>;\n\
+         @compute @workgroup_size(1) fn main() {{\n{body}}}",
+        helio_vg_format::WGSL
+    );
+    let device = &g.device;
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("raster key contract"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("raster key contract"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let size = cases.len() as u64 * 8;
+    let out = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("raster key contract"),
+        size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: out.as_entire_binding(),
+        }],
+    });
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    g.queue.submit(Some(enc.finish()));
+    let raw = read_buffer(device, &g.queue, &out, size);
+    let words: &[u32] = cast_slice(&raw);
+    for (i, &(z, id)) in cases.iter().enumerate() {
+        let key = helio_vg_format::raster_key(z, id);
+        assert_eq!(
+            [words[i * 2], words[i * 2 + 1]],
+            [key as u32, (key >> 32) as u32],
+            "case {i}: the WGSL key is not the Rust raster_key (or its accessors disagree)"
+        );
+        assert_eq!(dense_key_words(&words[i * 2..]), (z.to_bits(), id));
+    }
+}
+
 // ── 3-RT ───────────────────────────────────────────────────────────────────
 
 mod rt {
@@ -607,7 +676,7 @@ mod rt {
                 let want = hit(-5.0, 2.0)
                     .map(|h| (1u32, h))
                     .or_else(|| hit(-400.0, 200.0).map(|h| (2u32, h)));
-                let (zbits, id) = (keys[i * 2], keys[i * 2 + 1]);
+                let (zbits, id) = dense_key_words(&keys[i * 2..i * 2 + 2]);
                 match want {
                     None => assert_eq!(zbits, 0, "pixel ({x},{y}) should miss"),
                     Some((inst, (t, q))) => {

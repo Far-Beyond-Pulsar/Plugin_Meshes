@@ -146,11 +146,15 @@ fn fallback_texture(semantic: TextureSemantic) -> helio_mats::TextureUpload {
 }
 
 /// An image file one of a source material's texture slots names, located on
-/// disk.
+/// disk, with how the slot reads it: its UV set and its UV transform (glTF
+/// `KHR_texture_transform`, `helio_mats::TextureTransform`), as the
+/// material rows take them ([`crate::ConvertedMaterial::texture_data`]).
 #[derive(Debug, Clone)]
 pub struct MaterialImage {
     pub semantic: TextureSemantic,
     pub path: std::path::PathBuf,
+    pub uv_channel: u32,
+    pub transform: helio_mats::TextureTransform,
 }
 
 /// A source material: its name and the image files its texture slots name.
@@ -187,7 +191,13 @@ fn collect_material_sources(scene: &Scene, base_dir: &std::path::Path) -> Vec<Ma
                     texture.texture_index,
                     base_dir,
                 )?;
-                Some(MaterialImage { semantic, path })
+                let read = crate::material_converter::convert_texture_ref(texture, semantic);
+                Some(MaterialImage {
+                    semantic,
+                    path,
+                    uv_channel: read.uv_channel,
+                    transform: read.transform,
+                })
             })
             .collect(),
         })
@@ -579,8 +589,14 @@ fn merge_sectioned(name: String, subs: &[&ConvertedMesh]) -> ConvertedSectionedM
             mv.tex_coords1 = v.tex_coords1;
             group_verts[bucket].push(mv);
         }
-        for &idx in &sub.indices {
-            group_indices[bucket].push(base + idx);
+        // A mirroring transform reverses the triangles' winding; reverse
+        // their index order with it so each still faces its normal.
+        if handedness_sign < 0.0 {
+            for tri in sub.indices.chunks_exact(3) {
+                group_indices[bucket].extend([base + tri[0], base + tri[2], base + tri[1]]);
+            }
+        } else {
+            group_indices[bucket].extend(sub.indices.iter().map(|&idx| base + idx));
         }
     }
 
@@ -614,4 +630,108 @@ fn unpack_snorm4x8(packed: u32) -> [f32; 4] {
         bytes[2] as i8 as f32 / 127.0,
         bytes[3] as i8 as f32 / 127.0,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solid_rs::scene::{Image, Material, Texture, TextureRef, TextureTransform};
+
+    /// The face normal a triangle's winding gives (counter-clockwise is the
+    /// front), against its first vertex's authored normal.
+    fn winding_agrees_with_normal(mesh: &ConvertedSectionedMesh) -> bool {
+        let tri = &mesh.sections[0].indices[..3];
+        let p = |i: u32| glam::Vec3::from(mesh.vertices[i as usize].position);
+        let face = (p(tri[1]) - p(tri[0])).cross(p(tri[2]) - p(tri[0]));
+        let n = unpack_snorm4x8(mesh.vertices[tri[0] as usize].normal);
+        face.dot(glam::Vec3::new(n[0], n[1], n[2])) > 0.0
+    }
+
+    /// A node transform with a negative determinant (a mirrored node, or a
+    /// negative import scale) baked into the vertices keeps the triangles
+    /// facing the way their normals do: the winding is reversed with it.
+    #[test]
+    fn a_mirrored_node_transform_keeps_triangles_facing_their_normals() {
+        let up = [0.0, 0.0, 1.0];
+        let tangent = [1.0, 0.0, 0.0];
+        let vertices = vec![
+            PackedVertex::from_components([0.0, 0.0, 0.0], up, [0.0, 0.0], tangent, 1.0),
+            PackedVertex::from_components([1.0, 0.0, 0.0], up, [1.0, 0.0], tangent, 1.0),
+            PackedVertex::from_components([0.0, 1.0, 0.0], up, [0.0, 1.0], tangent, 1.0),
+        ];
+        let mesh = |node_transform| ConvertedMesh {
+            skin: None,
+            name: "tri".into(),
+            vertices: vertices.clone(),
+            indices: vec![0, 1, 2],
+            material_index: None,
+            source_mesh: 0,
+            instance: 0,
+            source_name: "tri".into(),
+            node_transform,
+        };
+        let plain = mesh(glam::Mat4::IDENTITY);
+        assert!(winding_agrees_with_normal(&merge_sectioned(
+            "tri".into(),
+            &[&plain]
+        )));
+        for scale in [
+            glam::Vec3::new(-1.0, 1.0, 1.0),
+            glam::Vec3::new(1.0, 1.0, -1.0),
+            glam::Vec3::new(-1.0, -1.0, -1.0),
+        ] {
+            let mirrored = mesh(glam::Mat4::from_scale(scale));
+            assert!(
+                winding_agrees_with_normal(&merge_sectioned("tri".into(), &[&mirrored])),
+                "mirrored by {scale}: the triangle faces away from its normal"
+            );
+        }
+    }
+
+    /// A material source's images keep how their slots read them: the UV
+    /// set and `KHR_texture_transform` (the Poly Haven tree's branches),
+    /// what the editor's import companion builds its graph from.
+    #[test]
+    // The converter locates images on the real file system (`texture_loader`
+    // has no engine_fs), so the fixture image is a real file.
+    #[allow(clippy::disallowed_methods)]
+    fn material_images_keep_their_slots_uv_set_and_transform() {
+        let dir = std::env::temp_dir().join(format!("asset-compat-sources-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bark.png"), b"png").unwrap();
+
+        let mut scene = Scene::new();
+        scene.images.push(Image::from_uri("bark", "bark.png"));
+        scene.textures.push(Texture::new("bark", 0));
+        let mut material = Material::new("branches");
+        material.base_color_texture = Some(TextureRef {
+            texture_index: 0,
+            uv_channel: 1,
+            transform: Some(TextureTransform {
+                offset: solid_rs::glam::Vec2::new(0.0, -2.4),
+                rotation: 0.25,
+                scale: solid_rs::glam::Vec2::new(15.0, 3.4),
+            }),
+        });
+        material.occlusion_texture = Some(TextureRef::new(0));
+        scene.materials.push(material);
+
+        let sources = collect_material_sources(&scene, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let images = &sources[0].images;
+        assert_eq!(images.len(), 2);
+        let base = &images[0];
+        assert_eq!(base.semantic, TextureSemantic::BaseColor);
+        assert_eq!(base.uv_channel, 1);
+        assert_eq!(
+            base.transform,
+            helio_mats::TextureTransform {
+                offset: [0.0, -2.4],
+                scale: [15.0, 3.4],
+                rotation_radians: 0.25,
+            }
+        );
+        assert_eq!(images[1].transform, helio_mats::TextureTransform::IDENTITY);
+        assert_eq!(images[1].uv_channel, 0);
+    }
 }
