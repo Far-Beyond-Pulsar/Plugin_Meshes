@@ -128,7 +128,7 @@ pub fn register_columns(
     LODComponent::register_gpu_columns_growable(store, 1024, device);
     // Per-instance virtual-geometry overrides, joined to mesh instances by
     // the VirtualGeometryInstances derivation (`vg_instance_overrides`).
-    VirtualGeometryComponent::register_gpu_columns_growable(store, 256, device);
+    VirtualGeometryOverrideRow::register_gpu_columns_growable(store, 256, device);
     SkeletalMeshComponent::register_gpu_columns_growable(store, 128, device);
     // The scene join's inputs; the object rows passes draw are the join's
     // output, not SceneDB's.

@@ -111,13 +111,27 @@ test = "plugins/installed/tests/render_acceptance.rs"
 status = "verified"
 
 [[schema]]
-type = "VirtualGeometryComponent"
-path = "meshes_component::components::virtual_geometry_component::VirtualGeometryComponent"
+type = "VirtualGeometryOverrideRow"
+path = "meshes_component::components::virtual_geometry_component::VirtualGeometryOverrideRow"
 buffers = ["vg_instance_overrides"]
 clears_on_remove = false
 releases_var_len = true
 registered = true
-writer = "its own SceneDB var-len dispatch: one VgOverrideGpu row (authored flags, tier lock, sanitised error scale) refreshed on decode and on every write of an authored property, freed on removal"
+writer = "VirtualGeometryComponent's GPU registration: one VgOverrideGpu row (authored flags, tier lock, sanitised error scale) derived from the value on every insert, guarded write and replay (never cached on the value, so every write path uploads its authored values), freed on removal"
+owner = "meshes_component::components::virtual_geometry_component"
+disposition = "keep: the per-instance virtual-geometry overrides; the VirtualGeometryInstances derivation reads them (vg_instance_overrides, vg_instance_overrides::handles)"
+target_contract = "Phase 4; 03-gpu-reflection-and-rendering.md"
+test = "plugins/vendor/meshes/tests/virtual_geometry_instances_gpu.rs; plugins/installed/tests/virtual_geometry_acceptance.rs (virtual_geometry_matches_the_classic_render_and_off_restores_it: force_root_only reaches the cull)"
+status = "verified"
+
+[[schema]]
+type = "VirtualGeometryComponent"
+path = "meshes_component::components::virtual_geometry_component::VirtualGeometryComponent"
+buffers = []
+clears_on_remove = true
+releases_var_len = false
+registered = false
+writer = "no columns of its own: the derived VirtualGeometryOverrideRow registration uploads its override row (see that schema)"
 owner = "meshes_component::components::virtual_geometry_component"
 disposition = "keep: the per-instance virtual-geometry overrides; the VirtualGeometryInstances derivation reads them (vg_instance_overrides, vg_instance_overrides::handles)"
 target_contract = "Phase 4; 03-gpu-reflection-and-rendering.md"
@@ -162,7 +176,7 @@ status = "verified"
 
 [[buffer]]
 key = "vg_instance_overrides"
-producers = ["VirtualGeometryComponent"]
+producers = ["VirtualGeometryOverrideRow"]
 consumers = ["meshes_component"]
 owner = "meshes_component::components::virtual_geometry_component (VgOverrideGpu pool)"
 disposition = "keep: a VirtualGeometryComponent's one override row; the VirtualGeometryInstances derivation scatters it to its owner object"
