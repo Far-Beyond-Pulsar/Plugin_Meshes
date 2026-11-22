@@ -456,8 +456,9 @@ with the change in percent, and lists shots present in only one of them:
 cargo run -p meshes-examples --features vg-stress --bin vg_stress --release -- --capture-diff before after
 ```
 
-`vg_stress_shots/vg_runtime.json` is the fixed list of the VG runtime work: 21
-shots (hero close-ups with triangle views, the forest crowd with tier and
+`vg_stress_shots/vg_runtime.json` is the fixed list of the VG runtime work: 23
+shots (hero close-ups with triangle views, among them the green dragon close-up
+reported as blotchy in Pulsar-Native#1651, the forest crowd with tier and
 dense views, a normal overview, and the page residency (107) and error vs tau
 (109) views of the overview and the forest at tau 1.0 and 0.25). Run it before
 and after a change that touches the cut or the cooked errors and diff the
