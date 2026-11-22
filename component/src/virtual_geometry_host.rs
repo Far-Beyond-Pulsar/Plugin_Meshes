@@ -60,7 +60,11 @@
 //! ray-traced scene (`crate::ray_scene`). Turning `virtual_geometry` off on an
 //! instance shows its full geometry again (the property hook), as does the
 //! project's mode `Off`, a renderer whose device cannot draw virtual geometry
-//! (`VgRuntime::draws_virtual_geometry`), or a failed build. A changed error
+//! (`VgRuntime::draws_virtual_geometry`), or a failed build. The fallback is
+//! written into the world, which every renderer of it draws, so it is shown
+//! only while all of them draw virtual geometry (`WorldRenderers`): a
+//! second viewport with virtual geometry off keeps the full geometry for
+//! both. A changed error
 //! bound cuts a new fallback; instances keep the old one until it arrives.
 //!
 //! Until an asset's root pages are resident its instances are not VG-active:
@@ -149,9 +153,88 @@ pub struct VgGeometryBytes {
     pub fallback: u64,
 }
 
+/// Whether each renderer of a world draws virtual geometry, by world (its
+/// address) and host. The fallback replaces the full geometry in the world
+/// itself, which every renderer of the world draws, so it is shown only when
+/// all of them draw virtual geometry; one that does not (its mode `Off`, a
+/// device without the features) draws the full geometry, and so do the
+/// others' instances until their clusters are resident. Without the
+/// agreement two renderers that disagree would swap the same meshes back and
+/// forth every frame.
+struct WorldRenderers {
+    votes: std::sync::Mutex<HashMap<usize, HashMap<u64, bool>>>,
+    next_host: std::sync::atomic::AtomicU64,
+}
+
+fn world_renderers() -> &'static WorldRenderers {
+    static RENDERERS: std::sync::OnceLock<WorldRenderers> = std::sync::OnceLock::new();
+    RENDERERS.get_or_init(|| WorldRenderers {
+        votes: std::sync::Mutex::new(HashMap::new()),
+        next_host: std::sync::atomic::AtomicU64::new(1),
+    })
+}
+
+/// A host's place in [`WorldRenderers`]: the world it last drew; its vote
+/// leaves with it.
+struct WorldVote {
+    host: u64,
+    world: Option<usize>,
+}
+
+impl WorldVote {
+    fn new() -> Self {
+        Self {
+            host: world_renderers()
+                .next_host
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            world: None,
+        }
+    }
+
+    /// Record whether this host's renderer `draws` virtual geometry of
+    /// `world`; whether every renderer of that world does.
+    fn vote(&mut self, world: &World, draws: bool) -> bool {
+        let key = std::ptr::from_ref(world) as usize;
+        let mut votes = world_renderers()
+            .votes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(old) = self.world.filter(|old| *old != key) {
+            Self::leave(&mut votes, old, self.host);
+        }
+        self.world = Some(key);
+        let world_votes = votes.entry(key).or_default();
+        world_votes.insert(self.host, draws);
+        world_votes.values().all(|draws| *draws)
+    }
+
+    fn leave(votes: &mut HashMap<usize, HashMap<u64, bool>>, world: usize, host: u64) {
+        if let Some(world_votes) = votes.get_mut(&world) {
+            world_votes.remove(&host);
+            if world_votes.is_empty() {
+                votes.remove(&world);
+            }
+        }
+    }
+}
+
+impl Drop for WorldVote {
+    fn drop(&mut self) {
+        if let Some(world) = self.world {
+            let mut votes = world_renderers()
+                .votes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::leave(&mut votes, world, self.host);
+        }
+    }
+}
+
 /// See the module doc. Owned by whoever owns the renderer.
 pub struct VirtualGeometryHost {
     runtime: VgRuntime,
+    /// This renderer's say in whether its world shows fallbacks.
+    vote: WorldVote,
     control: Option<VgInstanceControl>,
     /// Loaded, building or failed `.vgeo`s, by mesh content id.
     assets: HashMap<u128, HostAsset>,
@@ -168,7 +251,8 @@ pub struct VirtualGeometryHost {
     /// Generated full geometry kept while its instances show their fallback,
     /// shared by them.
     owned: HashMap<u128, Weak<MeshGeometry>>,
-    /// Whether virtual geometry was drawn last frame.
+    /// Whether the last sync showed fallbacks (every renderer of the world
+    /// drew virtual geometry).
     drawn: bool,
     /// The GPU bytes of the contents in use ([`Self::geometry_bytes`]).
     bytes: VgGeometryBytes,
@@ -187,6 +271,7 @@ impl VirtualGeometryHost {
     pub fn new() -> Self {
         Self {
             runtime: VgRuntime::new(VgRuntimeSettings::default()),
+            vote: WorldVote::new(),
             control: None,
             assets: HashMap::new(),
             fallbacks: HashMap::new(),
@@ -255,9 +340,10 @@ impl VirtualGeometryHost {
         self.collect_builds();
         self.collect_cuts();
 
-        // Drawing virtual geometry started or stopped: every instance may
+        // Fallbacks shown (this renderer and every other renderer of the
+        // world draw virtual geometry) started or stopped: every instance may
         // swap.
-        let drawn = self.runtime.draws_virtual_geometry();
+        let drawn = self.vote.vote(world, self.runtime.draws_virtual_geometry());
         if drawn != self.drawn {
             self.drawn = drawn;
             self.dirty.extend(self.instances.keys().copied());
@@ -1034,6 +1120,30 @@ mod tests {
                 material_slot: 0,
             }],
         })
+    }
+
+    /// Fallbacks are shown only while every renderer of a world draws
+    /// virtual geometry; a renderer's vote leaves with it, and votes of
+    /// another world do not count.
+    #[test]
+    fn the_renderers_of_a_world_agree_on_fallbacks() {
+        let world = World::new();
+        let other_world = World::new();
+        let mut vg = WorldVote::new();
+        let mut classic = WorldVote::new();
+        let mut elsewhere = WorldVote::new();
+        assert!(vg.vote(&world, true), "a lone VG renderer shows fallbacks");
+        assert!(!elsewhere.vote(&other_world, false));
+        assert!(vg.vote(&world, true), "another world's renderer has no say");
+        assert!(!classic.vote(&world, false));
+        assert!(!vg.vote(&world, true), "a classic renderer of the world vetoes");
+        drop(classic);
+        assert!(vg.vote(&world, true), "the vote left with its renderer");
+        // Drawing another world moves the vote.
+        let mut moving = WorldVote::new();
+        assert!(!moving.vote(&world, false));
+        assert!(!moving.vote(&other_world, true), "the other world's classic renderer vetoes");
+        assert!(vg.vote(&world, true));
     }
 
     /// The swap and its way back: a generated mesh's instances show the
