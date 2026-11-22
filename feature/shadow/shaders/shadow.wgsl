@@ -89,6 +89,9 @@ struct ShadowVertex {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) material_id: u32,
+    // 1 when the instance mirrors (`instance_mirrors`): `front_facing` is
+    // reversed for it.
+    @location(2) @interpolate(flat) mirrors: u32,
 }
 
 // ── Vertex stage ──────────────────────────────────────────────────────────────
@@ -103,7 +106,7 @@ fn vs_main(
     @location(15)            slot:     u32,
 ) -> ShadowVertex {
     // `_pad0` is the dirty bit this layer is gated on (1 dynamic, 2 static); 0 draws unconditionally.
-    if face._pad0 != 0u && (face_dirty[face.value] & face._pad0) == 0u { return ShadowVertex(vec4f(2,2,2,1), uv, 0u); }
+    if face._pad0 != 0u && (face_dirty[face.value] & face._pad0) == 0u { return ShadowVertex(vec4f(2,2,2,1), uv, 0u, 0u); }
     let inst  = instances[slot];
     let local_position = mesh_skinned_position(inst, position, vertex_index);
     let space = coordinate_spaces[(inst.flags >> 8u) & 0xFFu];
@@ -114,16 +117,19 @@ fn vs_main(
         let center = (space * vec4f(inst.bounds.xyz, 1.0)).xyz;
         let radius = inst.bounds.w * max(length(space[0].xyz), max(length(space[1].xyz), length(space[2].xyz)));
         let touched = sphere_pages(shadow_matrices[face.value].mat, center, radius) & face_pages[face.value];
-        if touched.x == 0u && touched.y == 0u { return ShadowVertex(vec4f(2, 2, 2, 1), uv, inst.material_id); }
+        if touched.x == 0u && touched.y == 0u { return ShadowVertex(vec4f(2, 2, 2, 1), uv, inst.material_id, 0u); }
     }
     let world = space * (inst.transform * vec4<f32>(local_position, 1.0));
-    return ShadowVertex(shadow_matrices[face.value].mat * world, uv, inst.material_id);
+    let mirrors = select(0u, 1u, instance_mirrors(inst));
+    return ShadowVertex(shadow_matrices[face.value].mat * world, uv, inst.material_id, mirrors);
 }
 
 @fragment
-fn fs_main(input: ShadowVertex, @builtin(front_facing) front: bool) {
+fn fs_main(input: ShadowVertex, @builtin(front_facing) facing: bool) {
     // Preserve the solid-mesh front-face policy, while both faces of a leaf
-    // card cast the same alpha-tested silhouette.
+    // card cast the same alpha-tested silhouette. A mirroring instance's
+    // triangles wind the other way, so its front faces raster as back faces.
+    let front = facing != (input.mirrors != 0u);
     if front && (material_at(input.material_id).flags & MATERIAL_FLAG_DOUBLE_SIDED) == 0u { discard; }
     reject_cutout(input.material_id, input.uv);
 }

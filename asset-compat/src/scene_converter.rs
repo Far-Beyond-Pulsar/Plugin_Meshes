@@ -589,8 +589,14 @@ fn merge_sectioned(name: String, subs: &[&ConvertedMesh]) -> ConvertedSectionedM
             mv.tex_coords1 = v.tex_coords1;
             group_verts[bucket].push(mv);
         }
-        for &idx in &sub.indices {
-            group_indices[bucket].push(base + idx);
+        // A mirroring transform reverses the triangles' winding; reverse
+        // their index order with it so each still faces its normal.
+        if handedness_sign < 0.0 {
+            for tri in sub.indices.chunks_exact(3) {
+                group_indices[bucket].extend([base + tri[0], base + tri[2], base + tri[1]]);
+            }
+        } else {
+            group_indices[bucket].extend(sub.indices.iter().map(|&idx| base + idx));
         }
     }
 
@@ -630,6 +636,57 @@ fn unpack_snorm4x8(packed: u32) -> [f32; 4] {
 mod tests {
     use super::*;
     use solid_rs::scene::{Image, Material, Texture, TextureRef, TextureTransform};
+
+    /// The face normal a triangle's winding gives (counter-clockwise is the
+    /// front), against its first vertex's authored normal.
+    fn winding_agrees_with_normal(mesh: &ConvertedSectionedMesh) -> bool {
+        let tri = &mesh.sections[0].indices[..3];
+        let p = |i: u32| glam::Vec3::from(mesh.vertices[i as usize].position);
+        let face = (p(tri[1]) - p(tri[0])).cross(p(tri[2]) - p(tri[0]));
+        let n = unpack_snorm4x8(mesh.vertices[tri[0] as usize].normal);
+        face.dot(glam::Vec3::new(n[0], n[1], n[2])) > 0.0
+    }
+
+    /// A node transform with a negative determinant (a mirrored node, or a
+    /// negative import scale) baked into the vertices keeps the triangles
+    /// facing the way their normals do: the winding is reversed with it.
+    #[test]
+    fn a_mirrored_node_transform_keeps_triangles_facing_their_normals() {
+        let up = [0.0, 0.0, 1.0];
+        let tangent = [1.0, 0.0, 0.0];
+        let vertices = vec![
+            PackedVertex::from_components([0.0, 0.0, 0.0], up, [0.0, 0.0], tangent, 1.0),
+            PackedVertex::from_components([1.0, 0.0, 0.0], up, [1.0, 0.0], tangent, 1.0),
+            PackedVertex::from_components([0.0, 1.0, 0.0], up, [0.0, 1.0], tangent, 1.0),
+        ];
+        let mesh = |node_transform| ConvertedMesh {
+            skin: None,
+            name: "tri".into(),
+            vertices: vertices.clone(),
+            indices: vec![0, 1, 2],
+            material_index: None,
+            source_mesh: 0,
+            instance: 0,
+            source_name: "tri".into(),
+            node_transform,
+        };
+        let plain = mesh(glam::Mat4::IDENTITY);
+        assert!(winding_agrees_with_normal(&merge_sectioned(
+            "tri".into(),
+            &[&plain]
+        )));
+        for scale in [
+            glam::Vec3::new(-1.0, 1.0, 1.0),
+            glam::Vec3::new(1.0, 1.0, -1.0),
+            glam::Vec3::new(-1.0, -1.0, -1.0),
+        ] {
+            let mirrored = mesh(glam::Mat4::from_scale(scale));
+            assert!(
+                winding_agrees_with_normal(&merge_sectioned("tri".into(), &[&mirrored])),
+                "mirrored by {scale}: the triangle faces away from its normal"
+            );
+        }
+    }
 
     /// A material source's images keep how their slots read them: the UV
     /// set and `KHR_texture_transform` (the Poly Haven tree's branches),
