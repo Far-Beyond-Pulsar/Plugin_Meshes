@@ -19,7 +19,7 @@ use crate::dag::ClusterNode;
 use crate::mesh::VertexStore;
 
 /// Clusters per group the partitioner aims for.
-const TARGET_GROUP: usize = 16;
+pub(crate) const TARGET_GROUP: usize = 16;
 
 /// Returns groups of ids taken from `cur` (each id indexes `clusters`).
 /// `cap` is the largest group a page holds.

@@ -17,10 +17,13 @@
 //!   instead of being forced to the target.
 //! * **floating** pieces (small connected components that lie entirely inside
 //!   the group, e.g. needle/leaf cards, branch fragments): nothing outside the
-//!   group references them, so nothing is locked. They are reduced by edge
-//!   collapse with island pruning and, when that stalls (disconnected pieces
-//!   cannot collapse into each other), by proximity merging (topology-free
-//!   vertex clustering), so canopies coarsen into fewer/larger cards.
+//!   group references them, so nothing is locked. Card-like pieces merge into
+//!   area-preserving quads, so canopies coarsen into fewer, larger cards;
+//!   larger pieces are reduced by edge collapse with island pruning. (Island
+//!   pruning under an unbounded error always reaches the target, so a
+//!   proximity-merging fallback never ran on any fixture and was removed;
+//!   permissive simplification only relaxes attribute seams, which pruning
+//!   does not stall on either.)
 //!
 //! Material sections are always simplified independently. Output references
 //! existing vertices where they did not move and [`NewVertex`]es where the
@@ -34,8 +37,11 @@ use meshopt::SimplifyVertex;
 use std::collections::{BTreeMap, HashMap};
 
 /// A connected component with at most this many triangles that touches no
-/// other group is "floating".
-pub const FLOATING_MAX_TRIS: usize = 1536;
+/// other group is "floating": the triangles of the smallest group the
+/// partitioner typically forms (a third under its target), so a floating
+/// piece usually lies inside one group.
+pub const FLOATING_MAX_TRIS: usize =
+    crate::partition::TARGET_GROUP * 3 / 4 * helio_vg_format::CLUSTER_MAX_TRIS as usize;
 /// Appearance error of a floating-dominated group (see
 /// [`SimplifyResult::coverage_tris`]): `COVERAGE_FACTOR` x the spacing of its
 /// output triangles, `r * cbrt(4pi/3 / n)` for `n` triangles in a group sphere
@@ -43,13 +49,10 @@ pub const FLOATING_MAX_TRIS: usize = 1536;
 /// the viewer cannot resolve (a node smaller than ~1/COVERAGE_FACTOR spacings
 /// per pixel).
 pub const COVERAGE_FACTOR: f32 = 0.05;
-/// ... and never below this many linear footprints (sqrt of mean triangle area) of
-/// the output: triangles smaller than a pixel add nothing.
+/// ... and never below this many linear footprints (sqrt of mean triangle area)
+/// of the output: two samples per feature (Nyquist), so the group is swapped in
+/// only once its triangles are at most half a pixel at the error threshold.
 pub const COVERAGE_FOOTPRINT: f32 = 2.0;
-/// Edge collapse that ends above this ratio of the target hands over to
-/// proximity merging.
-const SLOPPY_TRIGGER: (usize, usize) = (115, 100);
-
 /// A floating piece with at most this many triangles is a "card" (needle, leaf
 /// quad, small polygon): it is merged with its neighbours into area-preserving
 /// quads instead of being collapsed or pruned (see [`merge_cards`]).
@@ -1091,8 +1094,8 @@ fn merge_cards(
 }
 
 /// Reduce floating pieces of one material section to about `want` triangles:
-/// unlocked edge collapse with island pruning, then proximity merging if the
-/// pieces cannot collapse into each other. Returns (triangles, vertex count).
+/// unlocked edge collapse with island pruning. Returns (triangles, vertex
+/// count).
 fn collapse_floating(
     vs: &VertexStore,
     section: &[[u32; 3]],
@@ -1114,7 +1117,7 @@ fn collapse_floating(
         .collect();
     let vertices = meshopt::VertexDataAdapter::new(bytemuck::cast_slice(&positions), 12, 0)
         .expect("packed float3 positions");
-    let mut result = meshopt::simplify_with_locks(
+    let result = meshopt::simplify_with_locks(
         &indices,
         &vertices,
         &locks,
@@ -1123,21 +1126,10 @@ fn collapse_floating(
         meshopt::SimplifyOptions::ErrorAbsolute | meshopt::SimplifyOptions::Prune,
         None,
     );
-    if result.len() / 3 * SLOPPY_TRIGGER.1 > want * SLOPPY_TRIGGER.0 {
-        let merged = meshopt::simplify_sloppy_with_locks(
-            &result,
-            &vertices,
-            &locks,
-            want * 3,
-            f32::MAX,
-            None,
-        );
-        if !merged.is_empty() {
-            result = merged;
-        }
-    }
     let out: Vec<[u32; 3]> = result
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|t| [ids[t[0] as usize], ids[t[1] as usize], ids[t[2] as usize]])
         .filter(|t| {
             let p = t.map(|v| vs.pid[v as usize]);
