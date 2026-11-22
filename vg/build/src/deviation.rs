@@ -42,9 +42,11 @@
 //! * normal: the chord `|n_orig - n_interp|` is the tilt in radians; a tilt
 //!   `t` acting over half an output edge `e/2` displaces the shaded surface by
 //!   `t * e / 2`;
-//! * uv: the uv distance times the object-space length per uv unit of the
-//!   group's input triangles (`sqrt(sum area / sum uv-area)`), i.e. how far the
-//!   texture slides along the surface.
+//! * uv: the uv difference mapped through the original triangle's own
+//!   uv-to-surface Jacobian, i.e. how far the texture slides along the surface
+//!   there. Local, so a degenerate mapping (the poles of a sphere's uv grid,
+//!   where u spans every value around one point) slides by its true, tiny
+//!   amount instead of the mesh's average length per uv unit.
 //!
 //! Shading is a sampled appearance measure (attributes have no distance
 //! bound). Corners on attribute seams (vertices shared by several attribute
@@ -266,6 +268,30 @@ impl TriGrid {
     }
 
     /// Nearest triangle to `p`: (distance, index).
+    /// Every triangle within `r` of `p`.
+    fn within(&self, p: V3, r: f32) -> Vec<u32> {
+        let lo = self.key(sub(p, [r; 3]));
+        let hi = self.key(add(p, [r; 3]));
+        let mut out = Vec::new();
+        for z in lo[2]..=hi[2] {
+            for y in lo[1]..=hi[1] {
+                for x in lo[0]..=hi[0] {
+                    let cell = self.cell_index(x, y, z);
+                    for &i in &self.items[self.start[cell] as usize..self.start[cell + 1] as usize]
+                    {
+                        let t = &self.tris[i as usize];
+                        if point_tri_dist2(p, t[0], t[1], t[2]) <= r * r {
+                            out.push(i);
+                        }
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     fn nearest(&self, p: V3) -> (f32, u32) {
         let c = self.key(p);
         let max_r = self.dims[0].max(self.dims[1]).max(self.dims[2]);
@@ -736,10 +762,36 @@ pub struct Region<'a> {
     pub claimed: &'a [u32],
 }
 
+/// The surface's object-space length per uv unit at one original triangle,
+/// per uv channel: the uv-to-surface Jacobian `J` with `J * duv` the
+/// displacement a uv difference `duv` means there. `None` for a channel whose
+/// uvs are degenerate on the triangle (no texture is mapped across it).
+fn uv_jacobian(p: [V3; 3], s: [&Shading; 3], ch: usize) -> Option<[V3; 2]> {
+    let (e1, e2) = (sub(p[1], p[0]), sub(p[2], p[0]));
+    let d1 = [
+        s[1].uv[ch][0] - s[0].uv[ch][0],
+        s[1].uv[ch][1] - s[0].uv[ch][1],
+    ];
+    let d2 = [
+        s[2].uv[ch][0] - s[0].uv[ch][0],
+        s[2].uv[ch][1] - s[0].uv[ch][1],
+    ];
+    let det = d1[0] * d2[1] - d1[1] * d2[0];
+    let scale_uv = (d1[0].abs() + d1[1].abs() + d2[0].abs() + d2[1].abs()).max(1e-30);
+    if det.abs() <= 1e-6 * scale_uv * scale_uv {
+        return None;
+    }
+    // [e1 e2] = J [d1 d2]  =>  J = [e1 e2] [d1 d2]^-1.
+    let inv = [[d2[1] / det, -d2[0] / det], [-d1[1] / det, d1[0] / det]];
+    Some([
+        add(scale(e1, inv[0][0]), scale(e2, inv[1][0])),
+        add(scale(e1, inv[0][1]), scale(e2, inv[1][1])),
+    ])
+}
+
 /// Measure the simplified `pieces` (triangles per produced cluster) against
 /// the original surface `region` the group's input stands for, and hand that
-/// surface on to the pieces. `input` are the group's input triangles (they
-/// give the uv scale); `neighbours` are the triangles of the level's other
+/// surface on to the pieces. `neighbours` are the triangles of the level's other
 /// clusters that touch the group's border.
 ///
 /// An owned original triangle can straddle the group border; its part beyond
@@ -749,7 +801,6 @@ pub struct Region<'a> {
 pub fn measure(
     original: &[[u32; 3]],
     region: Region,
-    input: &[[u32; 3]],
     pieces: &[&[[u32; 3]]],
     neighbours: &[[V3; 3]],
     surf: &Surface,
@@ -818,13 +869,16 @@ pub fn measure(
             .sum();
         (sum / (3 * s_tris.len()) as f64) as f32
     };
-    let uv_len = uv_scale(input, surf);
     let shade = |a: Option<VertexAttr>| a.as_ref().and_then(Shading::of);
     let mut shading = 0.0f32;
     for &i in region.owned {
         let t = original[i as usize];
         let corners = t.map(|v| shade((surf.attr)(v)));
         let p = t.map(|v| pos[v as usize]);
+        let jacobian: [Option<[V3; 2]>; 2] = match (&corners[0], &corners[1], &corners[2]) {
+            (Some(a), Some(b), Some(c)) => [0, 1].map(|ch| uv_jacobian(p, [a, b, c], ch)),
+            _ => [None, None],
+        };
         let mut samples: [(V3, Option<Shading>); 4] = [(p[0], None); 4];
         for k in 0..3 {
             samples[k] = (p[k], corners[k].filter(|_| !surf.seam[t[k] as usize]));
@@ -838,27 +892,40 @@ pub fn measure(
         );
         for (q, want) in samples {
             let Some(want) = want else { continue };
-            let (_, s) = s_grid.nearest(q);
-            let sv = s_ids[s as usize];
-            let got = sv.map(|v| shade((surf.attr)(v)));
-            let (Some(c0), Some(c1), Some(c2)) = (&got[0], &got[1], &got[2]) else {
-                continue;
-            };
-            let st = &s_tris[s as usize];
-            let (_, w) = closest_on_tri(q, st[0], st[1], st[2]);
-            let Some(got) = Shading::blend([c0, c1, c2], w) else {
-                continue;
-            };
-            let tilt = length(sub(want.normal, got.normal));
-            let mut len = 0.5 * tilt * mean_edge;
-            for (ch, &per_uv) in uv_len.iter().enumerate() {
-                let du = [
-                    want.uv[ch][0] - got.uv[ch][0],
-                    want.uv[ch][1] - got.uv[ch][1],
-                ];
-                len = len.max((du[0] * du[0] + du[1] * du[1]).sqrt() * per_uv);
+            // The point of the result that stands for this sample lies within
+            // the group's proven position bound of it, not necessarily at the
+            // nearest point: beside an attribute seam that simplification
+            // straightened, the nearest point can be on the seam's other side,
+            // where the uvs legitimately differ. The sample is compared with the
+            // best match within that bound.
+            let (d, _) = s_grid.nearest(q);
+            let mut best = f32::INFINITY;
+            for s in s_grid.within(q, d.max(position) * (1.0 + 1e-5) + 1e-5 * mean_edge) {
+                let sv = s_ids[s as usize];
+                let got = sv.map(|v| shade((surf.attr)(v)));
+                let (Some(c0), Some(c1), Some(c2)) = (&got[0], &got[1], &got[2]) else {
+                    continue;
+                };
+                let st = &s_tris[s as usize];
+                let (_, w) = closest_on_tri(q, st[0], st[1], st[2]);
+                let Some(got) = Shading::blend([c0, c1, c2], w) else {
+                    continue;
+                };
+                let tilt = length(sub(want.normal, got.normal));
+                let mut len = 0.5 * tilt * mean_edge;
+                for (ch, j) in jacobian.iter().enumerate() {
+                    let Some([ju, jv]) = j else { continue };
+                    let slide = add(
+                        scale(*ju, want.uv[ch][0] - got.uv[ch][0]),
+                        scale(*jv, want.uv[ch][1] - got.uv[ch][1]),
+                    );
+                    len = len.max(length(slide));
+                }
+                best = best.min(len);
             }
-            shading = shading.max(len);
+            if best.is_finite() {
+                shading = shading.max(best);
+            }
         }
     }
     Measured {

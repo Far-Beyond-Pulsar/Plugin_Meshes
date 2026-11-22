@@ -454,14 +454,12 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
                     })
                     .collect();
                 let piece_tris: Vec<&[[u32; 3]]> = pieces.iter().map(|p| p.0.as_slice()).collect();
-                let input: Vec<[u32; 3]> = input.iter().map(|t| t.v).collect();
                 Some(measure(
                     &original,
                     Region {
                         owned: &owned,
                         claimed: &claimed,
                     },
-                    &input,
                     &piece_tris,
                     &neighbours,
                     &surface,
