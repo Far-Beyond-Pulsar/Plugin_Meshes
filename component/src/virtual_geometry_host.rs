@@ -5,7 +5,7 @@
 //! ```text
 //! host frame          VirtualGeometryHost::sync(world, mirror, settings)
 //!                       - settings -> VgRuntime, VgInstanceControl
-//!                       - meshes of owners with an enabled VirtualGeometryComponent
+//!                       - static meshes with `virtual_geometry` set
 //!                           -> embedded `.vgeo` chunk in the native `.mesh`
 //!                           -> VgRuntime::request_asset(content, interned vertex range)
 //! scene derivations   VgAssetReadyPublisher  -> `vg_asset_ready` (rows from the runtime)
@@ -21,7 +21,7 @@
 //! as a non-destructive fallback; the independently versioned VG chunk is
 //! embedded in the same native asset.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -30,11 +30,11 @@ use helio_core::{BufferKey, SceneDerivation, SceneDerivationContext, SceneDeriva
 use helio_mesh_api::PackedVertex;
 use helio_vg_format::{FORMAT_VERSION, VgAssetReadyRow};
 use helio_vg_stream::{VgRuntime, VgRuntimeSettings, VgeoBytes, VgeoSource, content_words};
+use pulsar_scenedb::World;
 use pulsar_scenedb::gpu::GpuMirrorHandle;
 use pulsar_scenedb::handle_ledger::HandleId;
-use pulsar_scenedb::{Entity, World};
 
-use crate::components::{MeshAssetPath, StaticMeshComponent, VirtualGeometryComponent};
+use crate::components::{MeshAssetPath, StaticMeshComponent};
 use crate::virtual_geometry_instances::{
     Output, VG_ASSET_READY_KEY, VG_ASSET_READY_ROW_BYTES, VgInstanceControl, VgInstanceKeys,
     VirtualGeometryInstances,
@@ -133,22 +133,14 @@ impl VirtualGeometryHost {
             return;
         }
 
-        // Meshes whose owner has an enabled `VirtualGeometryComponent`.
-        let owners: HashSet<Entity> =
-            pulsar_scene_model::attachments::enabled_components::<VirtualGeometryComponent>(world)
-                .filter(|(_, _, component)| component.enabled)
-                .map(|(_, owner, _)| owner)
-                .collect();
-        if owners.is_empty() {
-            return;
-        }
+        // Meshes whose instance asks for virtual geometry.
         let pool = mirror
             .store()
             .interned_var_len_pool::<PackedVertex>(BufferKey::of("builtin_mesh_vertex"));
-        for (_, owner, mesh) in
+        for (_, _, mesh) in
             pulsar_scene_model::attachments::enabled_components::<StaticMeshComponent>(world)
         {
-            if !owners.contains(&owner) || mesh.vertices.is_empty() || mesh.indices.len() < 3 {
+            if !mesh.virtual_geometry || mesh.vertices.is_empty() || mesh.indices.len() < 3 {
                 continue;
             }
             let content = mesh.geometry_key.0;

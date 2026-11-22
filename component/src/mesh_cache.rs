@@ -112,6 +112,22 @@ pub struct MeshAssetUpload {
     /// Authoritative local-space bounds. Imports derive this from final geometry;
     /// legacy files derive it once during decode.
     pub bounds: MeshLocalBounds,
+    /// Asset-level defaults a placed mesh is seeded from.
+    pub settings: MeshAssetSettings,
+}
+
+/// Defaults authored on the mesh asset itself (in the mesh viewer, through
+/// [`set_asset_settings`]). A `StaticMeshComponent` takes them when it is
+/// spawned for the asset or pointed at it; after that they are the instance's
+/// own properties, edited per instance.
+///
+/// Stored as the third element of the v3+ metadata. Files written before it
+/// existed have none, and read as [`MeshAssetSettings::default`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MeshAssetSettings {
+    /// Whether instances of this mesh render through virtual geometry.
+    #[serde(default)]
+    pub virtual_geometry: bool,
 }
 
 /// A validated local-space axis-aligned bound. Empty geometry is represented
@@ -175,6 +191,7 @@ impl Default for MeshAssetUpload {
             sections: Vec::new(),
             material_slots: Vec::new(),
             bounds: MeshLocalBounds::EMPTY,
+            settings: MeshAssetSettings::default(),
         }
     }
 }
@@ -560,9 +577,12 @@ pub fn encode(mesh: &MeshUpload, content_id: u128) -> Vec<u8> {
 /// Serialize a full mesh asset with section and imported material-slot
 /// metadata. Older `.mesh` files remain readable through [`decode_asset`].
 pub fn encode_asset(asset: &MeshAssetUpload, content_id: u128) -> Vec<u8> {
-    let metadata =
-        serde_json::to_vec(&(asset.sections.as_slice(), asset.material_slots.as_slice()))
-            .expect("mesh section metadata is serializable");
+    let metadata = serde_json::to_vec(&(
+        asset.sections.as_slice(),
+        asset.material_slots.as_slice(),
+        asset.settings,
+    ))
+    .expect("mesh section metadata is serializable");
     let mesh = &asset.geometry;
     let geometry_is_empty = asset.geometry.vertices.is_empty();
     let bounds = if asset.bounds.is_valid() && asset.bounds.is_empty == geometry_is_empty {
@@ -781,13 +801,13 @@ pub fn decode_asset(bytes: &[u8]) -> Option<(MeshAssetUpload, u128)> {
         None => content_id_for_bytes(&geometry),
     };
     let metadata_end = geometry_end.checked_add(metadata_len)?;
-    let (sections, material_slots) = if version == VERSION_WITH_SECTIONS
+    let (sections, material_slots, settings) = if version == VERSION_WITH_SECTIONS
         || version == VERSION_WITH_VGEO
         || version == VERSION_WITH_BOUNDS
     {
-        serde_json::from_slice(&bytes[geometry_end..metadata_end]).ok()?
+        decode_metadata(&bytes[geometry_end..metadata_end])?
     } else if geometry.indices.is_empty() {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), MeshAssetSettings::default())
     } else {
         (
             vec![MeshSection {
@@ -796,6 +816,7 @@ pub fn decode_asset(bytes: &[u8]) -> Option<(MeshAssetUpload, u128)> {
                 material_slot: 0,
             }],
             vec![MeshMaterialSlot::default()],
+            MeshAssetSettings::default(),
         )
     };
     let bounds = if version == VERSION_WITH_BOUNDS {
@@ -813,9 +834,79 @@ pub fn decode_asset(bytes: &[u8]) -> Option<(MeshAssetUpload, u128)> {
             sections,
             material_slots,
             bounds,
+            settings,
         },
         id,
     ))
+}
+
+type MeshMetadata = (Vec<MeshSection>, Vec<MeshMaterialSlot>, MeshAssetSettings);
+
+/// The v3+ metadata block: `[sections, material_slots, settings]`, or the
+/// two-element form written before [`MeshAssetSettings`] existed.
+fn decode_metadata(bytes: &[u8]) -> Option<MeshMetadata> {
+    serde_json::from_slice::<MeshMetadata>(bytes)
+        .ok()
+        .or_else(|| {
+            serde_json::from_slice::<(Vec<MeshSection>, Vec<MeshMaterialSlot>)>(bytes)
+                .ok()
+                .map(|(sections, slots)| (sections, slots, MeshAssetSettings::default()))
+        })
+}
+
+/// The [`MeshAssetSettings`] of the native `.mesh` at `path`, read from its
+/// header and metadata block only (the geometry is seeked over, so this is
+/// cheap enough for the moment a mesh is placed). Defaults for a file that is
+/// missing, not a native mesh, or older than the settings.
+pub fn read_asset_settings(path: &Path) -> MeshAssetSettings {
+    read_asset_settings_inner(path).unwrap_or_default()
+}
+
+fn read_asset_settings_inner(path: &Path) -> Option<MeshAssetSettings> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = engine_fs::virtual_fs::open_read(path).ok()?;
+    let mut header = [0u8; HEADER_V5];
+    let read = read_up_to(&mut file, &mut header)?;
+    if read < HEADER_V3 || &header[0..4] != MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes(header[4..8].try_into().ok()?);
+    let vstart = match version {
+        VERSION_WITH_SECTIONS => HEADER_V3,
+        VERSION_WITH_VGEO => HEADER_V4,
+        VERSION_WITH_BOUNDS => HEADER_V5,
+        _ => return None,
+    };
+    if read < vstart {
+        return None;
+    }
+    let vcount = u64::from_le_bytes(header[8..16].try_into().ok()?);
+    let icount = u64::from_le_bytes(header[16..24].try_into().ok()?);
+    let metadata_len = u64::from_le_bytes(header[HEADER_V2..HEADER_V3].try_into().ok()?);
+    let geometry_end = (vstart as u64)
+        .checked_add(vcount.checked_mul(std::mem::size_of::<PackedVertex>() as u64)?)?
+        .checked_add(icount.checked_mul(4)?)?;
+    // Metadata is a few KB of JSON; anything far larger is a corrupt header.
+    if metadata_len > 64 << 20 {
+        return None;
+    }
+    file.seek(SeekFrom::Start(geometry_end)).ok()?;
+    let mut metadata = vec![0u8; usize::try_from(metadata_len).ok()?];
+    file.read_exact(&mut metadata).ok()?;
+    decode_metadata(&metadata).map(|(_, _, settings)| settings)
+}
+
+fn read_up_to(reader: &mut impl std::io::Read, buf: &mut [u8]) -> Option<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(filled)
 }
 
 /// Resolve import options for a native asset — options stored from a previous
@@ -961,6 +1052,7 @@ fn sectioned_asset(
         sections,
         material_slots: std::mem::take(material_slots),
         bounds,
+        settings: MeshAssetSettings::default(),
     })
 }
 
@@ -1001,13 +1093,29 @@ pub fn ensure_uv0(mesh: &mut MeshUpload) {
 /// their shared GPU geometry; a mesh `AssetUpdated` is published so open
 /// levels re-resolve their slots.
 pub fn set_default_materials(path: &Path, materials: &[String]) -> Result<(), String> {
+    rewrite_metadata(path, |asset| {
+        for (slot, material) in asset.material_slots.iter_mut().zip(materials) {
+            slot.material_asset = material.trim().to_owned();
+        }
+    })
+}
+
+/// Rewrite the [`MeshAssetSettings`] of the native `.mesh` at `path`. Like
+/// [`set_default_materials`], geometry and content id are untouched and a
+/// mesh `AssetUpdated` is published. Placed meshes keep their own values: the
+/// settings seed an instance when it is placed, they do not drive it.
+pub fn set_asset_settings(path: &Path, settings: MeshAssetSettings) -> Result<(), String> {
+    rewrite_metadata(path, |asset| asset.settings = settings)
+}
+
+/// Decode the `.mesh` at `path`, apply `edit` to its metadata, and replace
+/// the file atomically, keeping its geometry, content id and embedded VG.
+fn rewrite_metadata(path: &Path, edit: impl FnOnce(&mut MeshAssetUpload)) -> Result<(), String> {
     let bytes = engine_fs::virtual_fs::read_file(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
     let (mut asset, id) =
         decode_asset(&bytes).ok_or_else(|| format!("{} is not a valid .mesh", path.display()))?;
-    for (slot, material) in asset.material_slots.iter_mut().zip(materials) {
-        slot.material_asset = material.trim().to_owned();
-    }
+    edit(&mut asset);
     let encoded = embedded_vgeo(&bytes)
         .filter(|vgeo| !vgeo.is_empty())
         .map(|vgeo| encode_asset_with_vgeo(&asset, id, Some(vgeo)))
@@ -1023,15 +1131,17 @@ pub fn set_default_materials(path: &Path, materials: &[String]) -> Result<(), St
     Ok(())
 }
 
-/// A reimport rewrites the `.mesh`; keep the default materials authored on
-/// the previous version. Slots match by source material index, then by name.
-fn carry_over_default_materials(native: &Path, upload: &mut MeshAssetUpload) {
+/// A reimport rewrites the `.mesh`; keep the default materials and asset
+/// settings authored on the previous version. Slots match by source material
+/// index, then by name.
+fn carry_over_authored_metadata(native: &Path, upload: &mut MeshAssetUpload) {
     let Some((previous, _)) = engine_fs::virtual_fs::read_file(native)
         .ok()
         .and_then(|b| decode_asset(&b))
     else {
         return;
     };
+    upload.settings = previous.settings;
     for slot in &mut upload.material_slots {
         let old = previous.material_slots.iter().find(|old| {
             (slot.source_material.is_some() && old.source_material == slot.source_material)
@@ -1159,7 +1269,7 @@ fn sanitize_file_name(name: &str) -> String {
 }
 
 fn write_mesh_asset(mut upload: MeshAssetUpload, native: &Path) -> Result<PathBuf, String> {
-    carry_over_default_materials(native, &mut upload);
+    carry_over_authored_metadata(native, &mut upload);
     let content_id = content_id_for_bytes(&upload.geometry);
     engine_fs::virtual_fs::write_file(native, &encode_asset(&upload, content_id))
         .map_err(|e| format!("failed to write native mesh {}: {e}", native.display()))?;
@@ -1323,6 +1433,7 @@ mod tests {
             }],
             material_slots: vec![MeshMaterialSlot::default()],
             bounds: MeshLocalBounds::EMPTY,
+            settings: MeshAssetSettings::default(),
         };
         std::fs::write(&path, encode_asset(&asset, 7)).unwrap();
         set_default_materials(&path, &["materials/A.mat".to_owned()]).unwrap();
@@ -1331,6 +1442,80 @@ mod tests {
         assert_eq!(decoded.material_slots[0].material_asset, "materials/A.mat");
         assert_eq!(decoded.geometry.indices, vec![0, 1, 2]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn triangle_asset() -> MeshAssetUpload {
+        let geometry = MeshUpload {
+            vertices: vec![PackedVertex::zeroed(); 3],
+            indices: vec![0, 1, 2],
+        };
+        MeshAssetUpload {
+            bounds: MeshLocalBounds::from_geometry(&geometry).unwrap(),
+            geometry,
+            sections: vec![MeshSection {
+                first_index: 0,
+                index_count: 3,
+                material_slot: 0,
+            }],
+            material_slots: vec![MeshMaterialSlot::default()],
+            settings: MeshAssetSettings::default(),
+        }
+    }
+
+    #[test]
+    fn asset_settings_round_trip_and_are_read_without_the_geometry() {
+        let dir = std::env::temp_dir().join(format!("mesh-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.mesh");
+        let asset = triangle_asset();
+        // An embedded VG chunk sits after the metadata; it must survive.
+        std::fs::write(&path, encode_asset_with_vgeo(&asset, 9, Some(b"vg"))).unwrap();
+        assert!(!read_asset_settings(&path).virtual_geometry);
+
+        let on = MeshAssetSettings {
+            virtual_geometry: true,
+        };
+        set_asset_settings(&path, on).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let (decoded, id) = decode_asset(&bytes).unwrap();
+        assert_eq!((decoded.settings, id), (on, 9));
+        assert_eq!(decoded.geometry.indices, vec![0, 1, 2]);
+        assert_eq!(embedded_vgeo(&bytes), Some(b"vg".as_slice()));
+        assert_eq!(read_asset_settings(&path), on);
+
+        // Editing the default materials keeps the settings.
+        set_default_materials(&path, &["materials/A.mat".to_owned()]).unwrap();
+        assert_eq!(read_asset_settings(&path), on);
+
+        // Missing or foreign files read as the defaults.
+        assert_eq!(
+            read_asset_settings(&dir.join("missing.mesh")),
+            MeshAssetSettings::default()
+        );
+        std::fs::write(dir.join("junk.mesh"), b"not a mesh").unwrap();
+        assert_eq!(
+            read_asset_settings(&dir.join("junk.mesh")),
+            MeshAssetSettings::default()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metadata_written_before_asset_settings_reads_as_defaults() {
+        let asset = triangle_asset();
+        let mut bytes = encode_asset(&asset, 3);
+        // Rewrite the metadata as the two-element form older builds wrote.
+        let old = serde_json::to_vec(&(asset.sections.as_slice(), asset.material_slots.as_slice()))
+            .unwrap();
+        let current_len =
+            u64::from_le_bytes(bytes[HEADER_V2..HEADER_V3].try_into().unwrap()) as usize;
+        let metadata_start = bytes.len() - current_len;
+        bytes.truncate(metadata_start);
+        bytes.extend_from_slice(&old);
+        bytes[HEADER_V2..HEADER_V3].copy_from_slice(&(old.len() as u64).to_le_bytes());
+        let (decoded, _) = decode_asset(&bytes).expect("legacy metadata decodes");
+        assert_eq!(decoded.settings, MeshAssetSettings::default());
+        assert_eq!(decoded.material_slots.len(), 1);
     }
 
     #[test]
@@ -1350,6 +1535,7 @@ mod tests {
         };
         let asset = MeshAssetUpload {
             bounds: MeshLocalBounds::from_geometry(&mesh).unwrap(),
+            settings: MeshAssetSettings::default(),
             geometry: mesh,
             sections: vec![],
             material_slots: vec![],
@@ -1383,6 +1569,7 @@ mod tests {
         };
         let asset = MeshAssetUpload {
             bounds: MeshLocalBounds::from_geometry(&mesh).unwrap(),
+            settings: MeshAssetSettings::default(),
             geometry: mesh,
             sections: vec![],
             material_slots: vec![],
@@ -1404,6 +1591,7 @@ mod tests {
             sections: vec![],
             material_slots: vec![],
             bounds: MeshLocalBounds::EMPTY,
+            settings: MeshAssetSettings::default(),
         };
         let mut contradictory_empty = encode_asset(&empty_asset, 10);
         contradictory_empty[HEADER_V4] = 0;
@@ -1435,6 +1623,7 @@ mod tests {
         };
         let asset = MeshAssetUpload {
             bounds: MeshLocalBounds::from_geometry(&geometry).unwrap(),
+            settings: MeshAssetSettings::default(),
             geometry,
             sections: vec![MeshSection {
                 first_index: 0,

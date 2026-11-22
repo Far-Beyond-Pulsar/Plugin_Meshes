@@ -33,7 +33,7 @@ pub struct Placement {
     /// `[pitch, yaw, roll]` degrees (the engine's YXZ Euler convention).
     pub rotation: [f32; 3],
     pub scale: [f32; 3],
-    /// Gets a `VirtualGeometryComponent` (see `scene::attach_virtual_geometry`).
+    /// Drawn through virtual geometry (the static mesh's `virtual_geometry`).
     pub virtual_geometry: bool,
     /// Source triangles this placement puts in the scene (for the startup report).
     pub triangles: u64,

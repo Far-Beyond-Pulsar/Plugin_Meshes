@@ -1,7 +1,7 @@
 //! The meshes' per-renderer state (a `RenderHostPartRegistration` the root
 //! submits): the
 //! virtual-geometry host (builds, caches and streams the cluster assets of
-//! meshes whose owner has a `VirtualGeometryComponent`; its runtime feeds
+//! static meshes with `virtual_geometry` set; its runtime feeds
 //! the VG passes), the authored LOD selection, the skin cache
 //! ([`crate::skin_cache`]: every drawer's and the ray-traced scene's skinned
 //! vertices) and the ray-traced scene ([`crate::ray_scene`]).

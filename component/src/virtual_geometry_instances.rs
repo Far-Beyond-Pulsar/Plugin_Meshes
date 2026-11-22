@@ -16,7 +16,8 @@
 //!
 //! Each frame any input changed (and never otherwise) it joins, on the GPU,
 //!
-//! * every static-mesh instance the scene join placed (`static_objects`,
+//! * every static-mesh instance the scene join placed (`static_objects`, whose
+//!   flags say whether the instance asked for virtual geometry,
 //!   `static_mesh_draw_sections::handles`, `builtin_mesh_vertex::handles`),
 //! * the optional [`VirtualGeometryComponent`](crate::components::VirtualGeometryComponent)
 //!   of the instance's owner object (`vg_instance_overrides` rows, linked to
@@ -34,10 +35,12 @@
 //! # VG-active
 //!
 //! An instance is VG-active iff virtual geometry is globally on
-//! ([`VgInstanceControl::set_enabled`]), the scene join placed it, its owner's
-//! `VirtualGeometryComponent` (if any) is `enabled`, and its mesh's asset is
-//! ready. Active rows carry `INST_ENABLED | INST_LOD_SUPPRESS`, the authored
-//! override bits (shadow caster, force root only, tier lock), `INST_CONE_CULL`
+//! ([`VgInstanceControl::set_enabled`]), the scene join placed it, its
+//! `static_objects` row carries `INSTANCE_FLAG_VIRTUAL_GEOMETRY` (the static
+//! mesh's own `virtual_geometry` property, seeded from its mesh asset), and its
+//! mesh's asset is ready. Active rows carry `INST_ENABLED | INST_LOD_SUPPRESS`,
+//! the tuning bits of the owner's `VirtualGeometryComponent` if it has one
+//! (shadow caster, force root only, tier lock), `INST_CONE_CULL`
 //! when the instance transform is a rotation, translation and a single
 //! non-zero uniform positive scale (cone culling is invalid under non-uniform
 //! scale or mirroring), the override's `lod_error_scale` (1 when absent) and
@@ -165,12 +168,15 @@ impl VgInstanceControl {
     }
 }
 
-/// The shader as compiled: the shared VG declarations, the scene join's
-/// rows (owner links, pool handles), then the derivation.
+/// The shader as compiled: the shared VG declarations, the meshes' object
+/// row and instance flags, the scene join's rows (owner links, pool handles),
+/// then the derivation.
 pub fn shader_source() -> String {
     helio_scene_join::join_source(&format!(
-        "{}\n{}",
+        "{}\n{}\n{}\n{}",
         helio_vg_format::WGSL,
+        helio_mesh_api::OBJECT_ROW_SNIPPET.source,
+        helio_mesh_api::DRAW_ROWS_SNIPPET.source,
         include_str!("virtual_geometry_instances.wgsl")
     ))
 }
