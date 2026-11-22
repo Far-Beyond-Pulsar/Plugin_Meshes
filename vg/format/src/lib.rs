@@ -145,24 +145,47 @@ pub struct GpuVisibleCluster {
     pub cluster_slot: u32,
 }
 
-/// `vg_asset_ready` row for the scene derivation. 16 bytes; sorted ascending
-/// by `vertex_offset`; padding rows have `vertex_offset == u32::MAX`.
+/// `vg_asset_ready` row for the scene derivation: an asset by its content id
+/// (the identity a mesh instance carries on the GPU), its slot in the asset
+/// table and whether it is ready. 32 bytes; sorted ascending by `content`
+/// read as a `u128` (word 3 most significant, [`Self::sort_key`]); padding
+/// rows are [`Self::PADDING`] (every content word `u32::MAX`, never ready).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct VgAssetReadyRow {
-    pub vertex_offset: u32,
-    pub vertex_count: u32,
+    /// The content id's little-endian `u32` words.
+    pub content: [u32; 4],
     pub asset_slot: u32,
     pub flags: u32,
+    pub _pad: [u32; 2],
 }
 pub const VG_ASSET_READY_FLAG_READY: u32 = 1;
 impl VgAssetReadyRow {
     pub const PADDING: Self = Self {
-        vertex_offset: u32::MAX,
-        vertex_count: 0,
+        content: [u32::MAX; 4],
         asset_slot: 0,
         flags: 0,
+        _pad: [0; 2],
     };
+
+    /// The `u32` words of a content id given as `.vgeo` header words
+    /// (`[low, high]`).
+    pub fn content_words(content: [u64; 2]) -> [u32; 4] {
+        [
+            content[0] as u32,
+            (content[0] >> 32) as u32,
+            content[1] as u32,
+            (content[1] >> 32) as u32,
+        ]
+    }
+
+    /// The order rows are sorted in (and searched by, on the GPU).
+    pub fn sort_key(&self) -> u128 {
+        self.content
+            .iter()
+            .rev()
+            .fold(0u128, |key, &word| (key << 32) | u128::from(word))
+    }
 }
 
 /// Shared position/index/attribute decode. Needs `vg_page_pool` and

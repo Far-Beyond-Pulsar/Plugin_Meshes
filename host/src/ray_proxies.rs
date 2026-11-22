@@ -1,22 +1,34 @@
 //! Virtual-geometry instances in the scene's TLAS ([`super::ray_tracing`]),
 //! through one proxy per asset.
 //!
-//! A VG instance is an ordinary static object whose mesh's interned vertex
-//! range is a VG asset's identity (`VgRuntime::request_asset`); its classic
-//! mesh is a fallback or a zero-area placeholder, never the shape rays
-//! should see, and the asset's full geometry is far too big for a BLAS. So
-//! each asset is traced through ONE coarse cut of its cluster DAG
-//! ([`ProxyOptions::trace`]: at most 1 % of its bounding radius off the
-//! surface, at most 32 Ki triangles), built on worker threads from the
-//! asset's bytes ([`ProxyCache`]) the first time an object uses it, shared
-//! by all its instances. Its triangles are grouped by the asset's material
-//! sections ([`VgRayProxies::sections`], `helio_vg_stream::ProxySection`),
-//! so a projection makes each section a BLAS segment with its own row and
+//! A standalone host's VG instance is an ordinary static object whose mesh
+//! entity carries a [`VirtualGeometryMesh`] naming the asset's content id
+//! (the identity `VgRuntime::request_asset` registered it under); its
+//! classic mesh is a fallback or a zero-area placeholder, never the shape
+//! rays should see, and the asset's full geometry is far too big for a
+//! BLAS. So each asset is traced through ONE cut of its cluster DAG at an
+//! explicit error bound ([`ProxyOptions::trace`]: at most
+//! [`VgRayProxySettings::relative_error`] of its bounding radius off the
+//! surface), built on worker threads from the asset's bytes ([`ProxyCache`])
+//! the first time an object uses it, shared by all its instances. Its
+//! triangles are grouped by the asset's material sections
+//! ([`VgRayProxies::sections`], `helio_vg_stream::ProxySection`), so a
+//! projection makes each section a BLAS segment with its own row and
 //! material: a ray hit on it is shaded as its section's material is
 //! (`RayInstance` rows flagged [`helio_mesh_api::RAY_INSTANCE_PROXY`], the
 //! face's winding as its normal, the tangent from its uv0); its vertices
 //! keep their uv0, so an alpha-tested material is tested on it, and its
 //! textures read, as on a classic mesh.
+//!
+//! **The error bound is authoritative; memory is budgeted scene-wide.** A
+//! proxy is never coarsened to fit a triangle cap. Its vertices and indices
+//! count against one scene budget ([`VgRayProxySettings::budget_bytes`]);
+//! a finished proxy that does not fit what the others left is not admitted:
+//! its instances stay out of the TLAS (rays pass them, as any object the
+//! projection cannot represent yet), it is logged once with what it needs,
+//! and it is counted in [`VgRayStats::over_budget`] (and the frame stats,
+//! `helio_mesh_api::stats::VG_RAY_PROXIES_OVER_BUDGET`). When proxies leave
+//! or the budget grows, the ones that now fit are built again and admitted.
 //!
 //! The proxies live in one pool of packed vertices (position, then uv0) and
 //! indices (the proxy pool a frame publishes, `helio_mesh_api::RAY_PROXY_VERTICES`), used directly as BLAS input
@@ -34,10 +46,34 @@ use std::sync::Arc;
 
 /// Bytes of a pool vertex: a `Float32x3` position, then a `Float32x2` uv0.
 const VERTEX_BYTES: u64 = helio_mesh_api::RAY_PROXY_VERTEX_BYTES;
-/// The cache's accounting budget for proxies not yet uploaded. Every proxy
-/// an object uses stays (live ones are pinned); this only bounds a single
-/// build ([`ProxyOptions::TRACE_MAX_TRIANGLES`] keeps it far below).
-const CACHE_BUDGET: usize = 512 << 20;
+
+/// Marks a standalone host's mesh entity as the stand-in of a
+/// virtual-geometry asset: objects drawing the mesh are traced through the
+/// asset's proxy. `content` is the content id the asset was requested under
+/// (`VgRuntime::request_asset`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtualGeometryMesh {
+    pub content: u128,
+}
+
+/// How a projection's proxies are cut and how much memory they may take.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VgRayProxySettings {
+    /// Error bound of every proxy, a fraction of its asset's bounding radius
+    /// (`ProxyOptions::DEFAULT_RELATIVE_ERROR` by default).
+    pub relative_error: f32,
+    /// Bytes of proxy vertices and indices the scene may hold.
+    pub budget_bytes: u64,
+}
+
+impl Default for VgRayProxySettings {
+    fn default() -> Self {
+        Self {
+            relative_error: ProxyOptions::DEFAULT_RELATIVE_ERROR,
+            budget_bytes: 256 << 20,
+        }
+    }
+}
 
 /// Where one asset's proxy is in the pool.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -48,12 +84,20 @@ pub struct ProxyRange {
     pub index_count: u32,
 }
 
+impl ProxyRange {
+    fn bytes(&self) -> u64 {
+        u64::from(self.vertex_count) * VERTEX_BYTES + u64::from(self.index_count) * 4
+    }
+}
+
 /// What a mesh is to the projection.
 pub enum Lookup {
     /// Not a virtual-geometry asset: traced as its classic mesh.
     Classic,
     /// A VG asset whose proxy is not built (or failed): left out.
     Pending,
+    /// A VG asset whose proxy does not fit the scene budget: left out.
+    OverBudget,
     /// Traced through its proxy, by key.
     Proxy(u64, ProxyRange),
 }
@@ -72,6 +116,12 @@ pub struct VgRayStats {
     /// Live bytes of vertices and indices, and the pool's allocated bytes.
     pub live_bytes: u64,
     pub pool_bytes: u64,
+    /// The scene budget for live bytes.
+    pub budget_bytes: u64,
+    /// Proxies built at their bound that the budget could not admit, and
+    /// the bytes they need.
+    pub over_budget: u32,
+    pub over_budget_bytes: u64,
 }
 
 struct Pool {
@@ -124,11 +174,14 @@ struct Proxy {
 /// The scene projection's VG proxies (module docs).
 pub struct VgRayProxies {
     runtime: VgRuntime,
+    settings: VgRayProxySettings,
     cache: ProxyCache,
-    /// Runtime assets by interned vertex range: their proxy key and bytes.
-    assets: HashMap<(u32, u32), (u64, Arc<dyn helio_vg_stream::VgeoSource>)>,
+    /// Runtime assets by content id: their proxy key and bytes.
+    assets: HashMap<u128, (u64, Arc<dyn helio_vg_stream::VgeoSource>)>,
     assets_version: Option<u64>,
     proxies: HashMap<u64, Proxy>,
+    /// Proxies the budget did not admit, by key: the bytes each needs.
+    over_budget: HashMap<u64, u64>,
     /// Keys the last build used: kept pinned in the cache.
     live: Vec<u64>,
     pool: Option<Pool>,
@@ -137,13 +190,17 @@ pub struct VgRayProxies {
 }
 
 impl VgRayProxies {
-    pub fn new(runtime: VgRuntime) -> Self {
+    pub fn new(runtime: VgRuntime, settings: VgRayProxySettings) -> Self {
         Self {
             runtime,
-            cache: ProxyCache::new(CACHE_BUDGET, ProxyOptions::trace()),
+            settings,
+            // The scene budget is this projection's (`upload`); the cache
+            // only builds and hands over.
+            cache: ProxyCache::new(usize::MAX, ProxyOptions::trace(settings.relative_error)),
             assets: HashMap::new(),
             assets_version: None,
             proxies: HashMap::new(),
+            over_budget: HashMap::new(),
             live: Vec::new(),
             pool: None,
             compact_pool: false,
@@ -151,9 +208,34 @@ impl VgRayProxies {
         }
     }
 
+    pub fn settings(&self) -> VgRayProxySettings {
+        self.settings
+    }
+
+    /// Takes effect at the next [`Self::poll`]: a new error bound rebuilds
+    /// every proxy; a new budget re-admits what now fits (a smaller one
+    /// keeps what is in until it leaves).
+    pub fn set_settings(&mut self, settings: VgRayProxySettings) {
+        if settings == self.settings {
+            return;
+        }
+        if settings.relative_error != self.settings.relative_error {
+            self.cache = ProxyCache::new(usize::MAX, ProxyOptions::trace(settings.relative_error));
+            self.proxies.clear();
+            self.over_budget.clear();
+            self.compact_pool = true;
+        }
+        self.settings = settings;
+    }
+
+    fn live_bytes(&self) -> u64 {
+        self.proxies.values().map(|p| p.range.bytes()).sum()
+    }
+
     /// Per frame, before the projection builds: follows the runtime's
-    /// assets, collects finished proxy builds and uploads them. True when
-    /// the projection must rebuild (an asset or a proxy came or went).
+    /// assets, collects finished proxy builds and uploads the ones the
+    /// budget admits. True when the projection must rebuild (an asset or a
+    /// proxy came or went).
     pub fn poll(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
         self.frame += 1;
         let mut changed = false;
@@ -165,10 +247,8 @@ impl VgRayProxies {
                 .assets()
                 .into_iter()
                 .map(|a| {
-                    (
-                        (a.vertex_offset, a.vertex_count),
-                        (proxy_key(a.content), a.source),
-                    )
+                    let content = u128::from(a.content[0]) | (u128::from(a.content[1]) << 64);
+                    (content, (proxy_key(a.content), a.source))
                 })
                 .collect();
             changed = true;
@@ -184,6 +264,7 @@ impl VgRayProxies {
             self.upload(device, queue, ready);
             changed = true;
         }
+        changed |= self.readmit();
         if self.compact_pool && self.pool_is_sparse() {
             self.grow(device, queue, 0, 0);
             changed = true;
@@ -192,14 +273,46 @@ impl VgRayProxies {
         changed
     }
 
-    /// What the mesh with interned vertex range `range` is to the
-    /// projection; a VG asset met for the first time starts its build.
-    pub fn lookup(&mut self, range: (u32, u32)) -> Lookup {
-        let Some((key, source)) = self.assets.get(&range) else {
-            return Lookup::Classic;
+    /// Over-budget proxies that fit what is free now are built again (the
+    /// build data was not kept) and admitted when they arrive.
+    fn readmit(&mut self) -> bool {
+        let mut free = self.settings.budget_bytes.saturating_sub(self.live_bytes());
+        let mut fitting: Vec<(u64, u64)> = self
+            .over_budget
+            .iter()
+            .map(|(key, bytes)| (*key, *bytes))
+            .collect();
+        fitting.sort_unstable_by_key(|(_, bytes)| *bytes);
+        let mut any = false;
+        for (key, bytes) in fitting {
+            if bytes > free {
+                break;
+            }
+            free -= bytes;
+            self.over_budget.remove(&key);
+            self.cache.forget(key);
+            any = true;
+        }
+        any
+    }
+
+    /// What the mesh entity carrying `asset` (its [`VirtualGeometryMesh`],
+    /// if any) is to the projection; a VG asset met for the first time
+    /// starts its build.
+    pub fn lookup(&mut self, asset: Option<VirtualGeometryMesh>) -> Lookup {
+        let Some((key, source)) = asset.and_then(|asset| self.assets.get(&asset.content)) else {
+            return if asset.is_some() {
+                // Named, but not (yet) an asset of the runtime.
+                Lookup::Pending
+            } else {
+                Lookup::Classic
+            };
         };
         if let Some(proxy) = self.proxies.get(key) {
             return Lookup::Proxy(*key, proxy.range);
+        }
+        if self.over_budget.contains_key(key) {
+            return Lookup::OverBudget;
         }
         if self.cache.state(*key).is_none() {
             self.cache.request(*key, source.clone(), self.frame);
@@ -256,13 +369,15 @@ impl VgRayProxies {
     pub fn stats(&self) -> VgRayStats {
         let mut stats = VgRayStats {
             proxies: self.proxies.len() as u32,
+            budget_bytes: self.settings.budget_bytes,
+            over_budget: self.over_budget.len() as u32,
+            over_budget_bytes: self.over_budget.values().sum(),
             ..Default::default()
         };
         for proxy in self.proxies.values() {
             stats.triangles += u64::from(proxy.range.index_count / 3);
             stats.source_triangles += u64::from(proxy.source_triangles);
-            stats.live_bytes += u64::from(proxy.range.vertex_count) * VERTEX_BYTES
-                + u64::from(proxy.range.index_count) * 4;
+            stats.live_bytes += proxy.range.bytes();
         }
         for (key, _) in self.assets.values() {
             match self.cache.state(*key) {
@@ -275,19 +390,45 @@ impl VgRayProxies {
         stats
     }
 
-    /// Appends finished builds to the pool, growing (and packing) it when
-    /// they do not fit.
+    /// Admits finished builds the budget holds, appending them to the pool
+    /// (growing and packing it when they do not fit); the others are
+    /// recorded over budget.
     fn upload(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         ready: Vec<(u64, Arc<ProxyBuild>)>,
     ) {
-        let builds: Vec<(u64, Arc<ProxyBuild>)> = ready
-            .into_iter()
-            .filter(|(_, b)| !b.lods.is_empty())
-            .collect();
-        let (new_vertices, new_indices) = builds.iter().fold((0u32, 0u32), |(v, i), (_, b)| {
+        let mut free = self.settings.budget_bytes.saturating_sub(self.live_bytes());
+        let mut admitted = Vec::new();
+        for (key, build) in ready {
+            let Some(lod) = build.lods.first() else {
+                continue;
+            };
+            let bytes = lod.positions.len() as u64 * VERTEX_BYTES + lod.indices.len() as u64 * 4;
+            if bytes > free {
+                log::warn!(
+                    "VG ray proxy {key:#018x}: {} triangles at error {:.4} ({:.2} % of its bounding radius {:.3}) need {} KiB; \
+                     the scene's proxy budget ({} MiB, {} KiB free) cannot hold them, so its instances are not traced. \
+                     Raise the budget or the proxies' error bound.",
+                    lod.triangle_count(),
+                    lod.error,
+                    self.settings.relative_error * 100.0,
+                    build.radius,
+                    bytes / 1024,
+                    self.settings.budget_bytes >> 20,
+                    free / 1024,
+                );
+                self.over_budget.insert(key, bytes);
+                continue;
+            }
+            free -= bytes;
+            admitted.push((key, build));
+        }
+        if admitted.is_empty() {
+            return;
+        }
+        let (new_vertices, new_indices) = admitted.iter().fold((0u32, 0u32), |(v, i), (_, b)| {
             (
                 v + b.lods[0].positions.len() as u32,
                 i + b.lods[0].indices.len() as u32,
@@ -301,7 +442,7 @@ impl VgRayProxies {
             self.grow(device, queue, new_vertices, new_indices);
         }
         let pool = self.pool.as_mut().expect("pool allocated above");
-        for (key, build) in builds {
+        for (key, build) in admitted {
             let lod = &build.lods[0];
             let range = ProxyRange {
                 first_vertex: pool.vertex_end,
@@ -335,8 +476,8 @@ impl VgRayProxies {
                 lod.triangle_count(),
                 build.source_triangles,
                 lod.error,
-                build.bounds[3],
-                (u64::from(range.vertex_count) * VERTEX_BYTES + u64::from(range.index_count) * 4) / 1024,
+                build.radius,
+                range.bytes() / 1024,
             );
             self.proxies.insert(
                 key,

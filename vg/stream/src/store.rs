@@ -315,12 +315,13 @@ impl VgAssetStore {
 
     /// See [`StoreCore::asset_ready_rows`]; upload the result as the
     /// `vg_asset_ready` scene buffer whenever [`Self::content_version`] changes.
-    pub fn asset_ready_rows(
-        &self,
-        mapping: &[([u64; 2], u32, u32)],
-        min_rows: usize,
-    ) -> Vec<VgAssetReadyRow> {
-        self.core.asset_ready_rows(mapping, min_rows)
+    pub fn asset_ready_rows(&self, contents: &[[u64; 2]], min_rows: usize) -> Vec<VgAssetReadyRow> {
+        self.core.asset_ready_rows(contents, min_rows)
+    }
+
+    /// Bytes of the page pool the asset holds (its resident pages).
+    pub fn resident_page_bytes(&self, handle: VgAssetHandle) -> u64 {
+        u64::from(self.core.resident_pages(handle.0)) * u64::from(PAGE_BYTES)
     }
 
     pub fn header(&self, handle: VgAssetHandle) -> Option<GpuAssetHeader> {

@@ -28,16 +28,20 @@
 //! Limitations (documented, not hidden): a proxy is a *uniform* cut, so error
 //! is bounded by the level's `error` in object space, not per pixel; one level
 //! per asset per frame (large instances spanning a wide distance range use the
-//! level for their nearest point); no per-triangle material data. With
-//! [`ProxyOptions::uvs`] each vertex also carries its uv0 (the attribute
-//! stream's, decoded from f16), so alpha-tested materials can be tested at
-//! a hit; vertices then weld on lattice coordinate and uv, keeping UV seams.
+//! level for their nearest point). [`ProxyOptions::vertices`] says what each
+//! vertex carries besides its position: nothing, its uv0 (the attribute
+//! stream's, decoded from f16, so alpha-tested materials can be tested at a
+//! hit), or its whole attribute record (normal, tangent, both uvs: what a
+//! classic draw of the cut needs). Vertices weld on lattice coordinate and on
+//! what they carry, so UV and normal seams stay apart.
 //!
-//! Two ladders use this: the dense tier's ([`ProxyOptions::default`]: the
-//! leaves, then cuts up to the root, one picked per instance and frame from
-//! its projected error) and the scene TLAS's ([`ProxyOptions::trace`]: ONE
-//! coarse cut per asset, shared by all its instances, for rays that need the
-//! object's shape, not its pixels: GI probes, ray-traced shadows).
+//! Two kinds of ladder use this: the dense tier's ([`ProxyOptions::default`]:
+//! the leaves, then cuts up to the root, one picked per instance and frame
+//! from its projected error) and single cuts made to an explicit error bound
+//! ([`ProxyOptions::trace`] for a scene TLAS, [`ProxyOptions::fallback`] for a
+//! mesh's classic stand-in). A single cut's bound is authoritative: no
+//! triangle cap coarsens it. What it costs is the caller's to budget and to
+//! report.
 
 use crate::source::VgeoSource;
 use helio_vg_format::testing::dequantize;
@@ -45,6 +49,17 @@ use helio_vg_format::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+
+/// What each proxy vertex carries besides its position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProxyVertexData {
+    /// Positions only.
+    Positions,
+    /// Its uv0, in [`ProxyLodCpu::uvs`].
+    Uv0,
+    /// Its uv0, and its whole attribute record in [`ProxyLodCpu::records`].
+    Records,
+}
 
 /// Controls of [`build_proxy`].
 #[derive(Clone, Copy, Debug)]
@@ -55,7 +70,9 @@ pub struct ProxyOptions {
     /// `0, Emax/ratio^(n-2), ..., Emax/ratio, Emax`).
     pub ratio: f32,
     /// Levels with more triangles than this are skipped (the finest *kept*
-    /// level then exceeds tau closer in, which the RT path reports).
+    /// level then exceeds tau closer in, which the RT path reports). Only
+    /// the dense tier's ladder has one: a single cut to an error bound has
+    /// none.
     pub max_triangles_per_lod: u32,
     /// Error of the finest level as a fraction of the asset's bounding
     /// radius. Zero: the finest level is the leaves (the original geometry)
@@ -64,8 +81,8 @@ pub struct ProxyOptions {
     pub finest_relative_error: f32,
     /// Keep at most this many levels: the finest that fit the triangle cap.
     pub max_lods: usize,
-    /// Decode each vertex's uv0 into [`ProxyLodCpu::uvs`].
-    pub uvs: bool,
+    /// What each vertex carries besides its position.
+    pub vertices: ProxyVertexData,
 }
 
 impl Default for ProxyOptions {
@@ -76,40 +93,50 @@ impl Default for ProxyOptions {
             max_triangles_per_lod: 8 << 20,
             finest_relative_error: 0.0,
             max_lods: usize::MAX,
-            uvs: false,
+            vertices: ProxyVertexData::Positions,
         }
     }
 }
 
 impl ProxyOptions {
-    /// Error bound of the scene TLAS's proxies, as a fraction of the asset's
+    /// The default error bound of a single cut, as a fraction of the asset's
     /// bounding radius: 1 cm on a statue 2 m across, 10 cm on a building
     /// 20 m across. GI probes are 0.5 m apart at the finest and integrate
     /// whole hemispheres; a ray-traced shadow of a surface displaced this
     /// little stays on it. A coarser bound shows as light leaking through
-    /// thin VG walls and creases; a finer one only costs memory.
-    pub const TRACE_RELATIVE_ERROR: f32 = 0.01;
-    /// Triangle budget of a scene TLAS proxy. Its BLAS costs roughly 60 to
-    /// 100 bytes a triangle on current hardware (2 to 3 MiB at the budget),
-    /// plus about 18 bytes a triangle of positions and indices. An asset
-    /// whose cut at [`Self::TRACE_RELATIVE_ERROR`] needs more takes the
-    /// first coarser cut (each twice the error) that fits.
-    pub const TRACE_MAX_TRIANGLES: u32 = 32 * 1024;
+    /// thin walls and creases; a finer one only costs memory. A project and
+    /// each mesh asset may set their own (the meshes' virtual-geometry
+    /// settings).
+    pub const DEFAULT_RELATIVE_ERROR: f32 = 0.01;
 
-    /// One proxy per asset for the scene's TLAS: the finest cut whose error
-    /// is at most [`Self::TRACE_RELATIVE_ERROR`] of the asset's bounding
-    /// radius and that fits [`Self::TRACE_MAX_TRIANGLES`], else the first
-    /// coarser cut (each twice the error, up to the root) that fits. With
-    /// UVs: rays alpha-test cut-out materials on it.
-    pub fn trace() -> Self {
+    /// One cut at `relative_error` of the asset's bounding radius and
+    /// nothing coarser: the clusters with `self_error <= bound <
+    /// parent_error`.
+    fn single_cut(relative_error: f32, vertices: ProxyVertexData) -> Self {
         Self {
-            levels: 12,
+            levels: 1,
             ratio: 2.0,
-            max_triangles_per_lod: Self::TRACE_MAX_TRIANGLES,
-            finest_relative_error: Self::TRACE_RELATIVE_ERROR,
+            max_triangles_per_lod: u32::MAX,
+            finest_relative_error: relative_error.max(f32::MIN_POSITIVE),
             max_lods: 1,
-            uvs: true,
+            vertices,
         }
+    }
+
+    /// One proxy per asset for a scene's TLAS, at most `relative_error` of
+    /// the asset's bounding radius off its surface, each vertex with its uv0
+    /// (rays alpha-test cut-out materials on it). Its size is what the bound
+    /// costs: a tracer budgets proxies scene-wide and reports what does not
+    /// fit; it never coarsens one.
+    pub fn trace(relative_error: f32) -> Self {
+        Self::single_cut(relative_error, ProxyVertexData::Uv0)
+    }
+
+    /// A mesh's classic stand-in for its virtual geometry: one cut at most
+    /// `relative_error` of the asset's bounding radius off its surface, each
+    /// vertex with its attribute record (what a classic draw shades with).
+    pub fn fallback(relative_error: f32) -> Self {
+        Self::single_cut(relative_error, ProxyVertexData::Records)
     }
 }
 
@@ -119,8 +146,13 @@ pub struct ProxyLodCpu {
     /// Object-space error bound of this cut (units of `GpuCluster::self_error`).
     pub error: f32,
     pub positions: Vec<[f32; 3]>,
-    /// Per vertex, uv0 ([`ProxyOptions::uvs`]; else empty).
+    /// Per vertex, uv0 ([`ProxyVertexData::Uv0`] or
+    /// [`ProxyVertexData::Records`]; else empty).
     pub uvs: Vec<[f32; 2]>,
+    /// Per vertex, its attribute record as the asset stores it
+    /// ([`ProxyVertexData::Records`]; else empty); decode with
+    /// `helio_vg_format::VertexAttr::decode`.
+    pub records: Vec<[u8; ATTR_STRIDE as usize]>,
     pub indices: Vec<u32>,
     /// Per triangle: `proxy cluster ordinal << VIS_TRI_BITS | triangle in cluster`.
     pub prim_map: Vec<u32>,
@@ -157,6 +189,7 @@ impl ProxyLodCpu {
     pub fn bytes(&self) -> usize {
         self.positions.len() * 12
             + self.uvs.len() * 8
+            + self.records.len() * ATTR_STRIDE as usize
             + self.indices.len() * 4
             + self.prim_map.len() * 4
             + self.clusters.len() * 8
@@ -173,6 +206,9 @@ pub struct ProxyBuild {
     pub source_triangles: u32,
     /// Levels dropped because they exceeded `max_triangles_per_lod`.
     pub skipped_levels: u32,
+    /// The bounding radius a relative error bound is taken of (the root
+    /// cut's); zero when the levels were not relative to it.
+    pub radius: f32,
 }
 
 impl ProxyBuild {
@@ -212,7 +248,7 @@ fn root_cut_radius(source: &dyn VgeoSource, quant: &GpuAssetQuant) -> Result<f32
                 .map(bytemuck::pod_read_unaligned)
                 .ok_or_else(|| format!("proxy: page {page_id} cluster {local} out of range"))?;
             if c.flags & GpuCluster::FLAG_ROOT != 0 {
-                points.extend(decode_cluster(&bytes, &c, quant, false)?.positions);
+                points.extend(decode_cluster(&bytes, &c, quant, ProxyVertexData::Positions)?.positions);
             }
         }
     }
@@ -255,14 +291,16 @@ struct LodBuild {
     error: f32,
     positions: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
+    records: Vec<[u8; ATTR_STRIDE as usize]>,
     indices: Vec<u32>,
     prim_map: Vec<u32>,
     clusters: Vec<u32>,
     cluster_pages: Vec<u32>,
     /// Per proxy cluster: its material slot.
     cluster_materials: Vec<u32>,
-    /// Lattice coordinate and uv0 bits (zero without UVs) to vertex.
-    weld: HashMap<([u32; 3], u32), u32>,
+    /// Lattice coordinate and what the vertex carries (zero without it) to
+    /// vertex.
+    weld: HashMap<([u32; 3], [u8; ATTR_STRIDE as usize]), u32>,
     over_cap: bool,
 }
 
@@ -293,6 +331,7 @@ pub fn build_proxy(
             error,
             positions: Vec::new(),
             uvs: Vec::new(),
+            records: Vec::new(),
             indices: Vec::new(),
             prim_map: Vec::new(),
             clusters: Vec::new(),
@@ -334,7 +373,7 @@ pub fn build_proxy(
                     continue;
                 }
                 if decoded.is_none() {
-                    decoded = Some(decode_cluster(&bytes, &c, &quant, opts.uvs)?);
+                    decoded = Some(decode_cluster(&bytes, &c, &quant, opts.vertices)?);
                 }
                 let d = decoded.as_ref().unwrap();
                 let ordinal = lod.clusters.len() as u32;
@@ -343,16 +382,22 @@ pub fn build_proxy(
                 lod.cluster_materials.push(c.material_slot());
                 // Weld on the lattice coordinate: shared vertices decode
                 // bit-identically across clusters (asset-global lattice).
-                // With UVs, on the uv too: a seam's two sides stay apart.
+                // And on what the vertex carries: a seam's two sides stay
+                // apart.
                 let mut map = [0u32; 128];
                 for (v, (p, q)) in d.positions.iter().zip(&d.lattice).enumerate() {
-                    let uv_bits = d.uv_bits.get(v).copied().unwrap_or(0);
+                    let record = d.records.get(v).copied().unwrap_or_default();
                     let next = lod.positions.len() as u32;
-                    let id = *lod.weld.entry((*q, uv_bits)).or_insert(next);
+                    let id = *lod.weld.entry((*q, record)).or_insert(next);
                     if id == next {
                         lod.positions.push(*p);
-                        if opts.uvs {
-                            lod.uvs.push(uv0(uv_bits));
+                        match opts.vertices {
+                            ProxyVertexData::Positions => {}
+                            ProxyVertexData::Uv0 => lod.uvs.push(uv0(&record)),
+                            ProxyVertexData::Records => {
+                                lod.uvs.push(uv0(&record));
+                                lod.records.push(record);
+                            }
                         }
                     }
                     map[v] = id;
@@ -372,6 +417,7 @@ pub fn build_proxy(
                     lod.over_cap = true;
                     lod.positions = Vec::new();
                     lod.uvs = Vec::new();
+                    lod.records = Vec::new();
                     lod.indices = Vec::new();
                     lod.prim_map = Vec::new();
                     lod.clusters = Vec::new();
@@ -412,6 +458,7 @@ pub fn build_proxy(
             error: lod.error,
             positions: lod.positions,
             uvs: lod.uvs,
+            records: lod.records,
             indices,
             prim_map,
             clusters: lod.clusters,
@@ -430,6 +477,7 @@ pub fn build_proxy(
         bounds,
         source_triangles,
         skipped_levels: skipped,
+        radius,
     })
 }
 
@@ -490,28 +538,27 @@ fn bounding_sphere(points: &[[f32; 3]]) -> [f32; 4] {
 struct Decoded {
     positions: Vec<[f32; 3]>,
     lattice: Vec<[u32; 3]>,
-    /// uv0 as stored (f16x2 bits), when asked for.
-    uv_bits: Vec<u32>,
+    /// The attribute records as stored, when asked for: the uv0 alone (the
+    /// rest zero) for [`ProxyVertexData::Uv0`], whole for
+    /// [`ProxyVertexData::Records`].
+    records: Vec<[u8; ATTR_STRIDE as usize]>,
     tris: Vec<[u8; 3]>,
 }
 
-/// uv0 of f16x2 bits.
-fn uv0(bits: u32) -> [f32; 2] {
-    [
-        helio_vg_format::f16_to_f32(bits as u16),
-        helio_vg_format::f16_to_f32((bits >> 16) as u16),
-    ]
+/// The uv0 of an attribute record (`helio_vg_format::VertexAttr`).
+fn uv0(record: &[u8; ATTR_STRIDE as usize]) -> [f32; 2] {
+    VertexAttr::decode(record).map_or([0.0; 2], |a| a.uv0)
 }
 
-/// CPU decode of one cluster's positions (lattice + dequantized), its uv0s
-/// (`uvs`; word 2 of each [`ATTR_STRIDE`] attribute record, whose stream
-/// starts at the position block's word 4) and indices; the mirror of
+/// CPU decode of one cluster's positions (lattice + dequantized), its
+/// attribute records (`vertices`; the [`ATTR_STRIDE`] record stream starts
+/// at the position block's word 4) and indices; the mirror of
 /// `vg_decode.wgsl` / `vg_alpha_uv.wgsl` / `VgeoReader::decode_cluster`.
 fn decode_cluster(
     page: &[u8],
     c: &GpuCluster,
     quant: &GpuAssetQuant,
-    uvs: bool,
+    vertices: ProxyVertexData,
 ) -> Result<Decoded, String> {
     let (nv, nt) = (c.vert_count() as usize, c.tri_count() as usize);
     let po = c.vertex_offset as usize;
@@ -564,21 +611,29 @@ fn decode_cluster(
     if tris.iter().flatten().any(|&i| i as usize >= nv) {
         return Err("proxy: triangle index out of range".into());
     }
-    let mut uv_bits = Vec::new();
-    if uvs {
+    let mut records = Vec::new();
+    if vertices != ProxyVertexData::Positions {
         let attributes = word(4)? as usize;
+        let stride = ATTR_STRIDE as usize;
         for v in 0..nv {
-            let at = attributes + v * ATTR_STRIDE as usize + 8;
+            let at = attributes + v * stride;
             let bytes = page
-                .get(at..at + 4)
+                .get(at..at + stride)
                 .ok_or_else(|| "proxy: attribute stream out of range".to_string())?;
-            uv_bits.push(u32::from_le_bytes(bytes.try_into().unwrap()));
+            let mut record = [0u8; ATTR_STRIDE as usize];
+            match vertices {
+                // The uv0 alone (bytes 8..12 of a `VertexAttr` record), so
+                // vertices still weld across normal seams.
+                ProxyVertexData::Uv0 => record[8..12].copy_from_slice(&bytes[8..12]),
+                _ => record.copy_from_slice(bytes),
+            }
+            records.push(record);
         }
     }
     Ok(Decoded {
         positions,
         lattice,
-        uv_bits,
+        records,
         tris,
     })
 }

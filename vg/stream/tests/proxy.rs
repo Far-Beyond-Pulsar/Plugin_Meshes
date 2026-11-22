@@ -127,9 +127,13 @@ fn proxy_triangle_cap_skips_the_fine_levels() {
 /// The trace proxy without UVs: the test assets' attributes are their
 /// positions, not the runtime's 16-byte records ([`ATTR_STRIDE`]).
 fn untextured_trace() -> ProxyOptions {
+    untextured_trace_at(ProxyOptions::DEFAULT_RELATIVE_ERROR)
+}
+
+fn untextured_trace_at(relative_error: f32) -> ProxyOptions {
     ProxyOptions {
-        uvs: false,
-        ..ProxyOptions::trace()
+        vertices: ProxyVertexData::Positions,
+        ..ProxyOptions::trace(relative_error)
     }
 }
 
@@ -184,11 +188,8 @@ fn trace_proxy_vertices_keep_their_uvs() {
     };
     let source = VgeoBytes::new(build_vgeo(&input, &BuildOptions::default()).unwrap()).unwrap();
     for opts in [
-        ProxyOptions::trace(),
-        ProxyOptions {
-            finest_relative_error: 0.08,
-            ..ProxyOptions::trace()
-        },
+        ProxyOptions::trace(ProxyOptions::DEFAULT_RELATIVE_ERROR),
+        ProxyOptions::trace(0.08),
     ] {
         let proxy = build_proxy(&source, &opts, None).unwrap();
         let lod = &proxy.lods[0];
@@ -225,9 +226,8 @@ fn trace_proxy_is_one_coarse_closed_cut_within_its_error() {
     let proxy = build_proxy(&source, &untextured_trace(), None).unwrap();
     assert_eq!(proxy.lods.len(), 1);
     let lod = &proxy.lods[0];
-    // 1 % of the radius, measured around the root cut's bounding box centre
-    // (a few percent over the sphere's own radius).
-    let bound = ProxyOptions::TRACE_RELATIVE_ERROR * proxy.bounds[3] * 1.05;
+    // 1 % of the bounding radius the build measured (the root cut's).
+    let bound = ProxyOptions::DEFAULT_RELATIVE_ERROR * proxy.radius;
     assert!(
         lod.error > 0.0 && lod.error <= bound,
         "error {} over {bound}",
@@ -238,7 +238,6 @@ fn trace_proxy_is_one_coarse_closed_cut_within_its_error() {
         "{} of {source_tris} triangles",
         lod.triangle_count()
     );
-    assert!(lod.triangle_count() as u32 <= ProxyOptions::TRACE_MAX_TRIANGLES);
     let open = edge_uses(lod).values().filter(|&&n| n != 2).count();
     assert_eq!(open, 0, "{open} open or non-manifold edges");
     let off = lod
@@ -253,23 +252,83 @@ fn trace_proxy_is_one_coarse_closed_cut_within_its_error() {
     );
 }
 
-/// Over the triangle budget, the trace proxy takes the first coarser cut
-/// that fits instead.
+/// A single cut's error bound is authoritative (#2047): each bound gives
+/// exactly one cut at that bound, however many triangles it takes, never a
+/// coarser one; a finer bound costs triangles, not error.
 #[test]
-fn trace_proxy_coarsens_to_fit_its_triangle_budget() {
-    let (bytes, _) = asset(5);
+fn a_single_cut_is_made_at_its_error_bound_whatever_it_costs() {
+    let (bytes, source_tris) = asset(6);
     let source = VgeoBytes::new(bytes).unwrap();
-    let fine = build_proxy(&source, &untextured_trace(), None).unwrap();
-    let budget = fine.lods[0].triangle_count() as u32 / 3;
-    let opts = ProxyOptions {
-        max_triangles_per_lod: budget,
-        ..untextured_trace()
+    let mut previous: Option<(f32, usize)> = None;
+    for relative in [0.0005, 0.002, 0.01, 0.04] {
+        let proxy = build_proxy(&source, &untextured_trace_at(relative), None).unwrap();
+        assert_eq!(proxy.lods.len(), 1);
+        assert_eq!(proxy.skipped_levels, 0, "a single cut skips nothing");
+        let lod = &proxy.lods[0];
+        let bound = relative * proxy.radius;
+        assert!(
+            lod.error <= bound,
+            "relative {relative}: error {} over its bound {bound}",
+            lod.error
+        );
+        if let Some((error, tris)) = previous {
+            assert!(lod.error > error);
+            assert!(
+                lod.triangle_count() <= tris,
+                "relative {relative}: {} triangles, more than the finer bound's {tris}",
+                lod.triangle_count()
+            );
+        }
+        eprintln!(
+            "relative error {relative}: {} of {source_tris} triangles at error {}",
+            lod.triangle_count(),
+            lod.error
+        );
+        previous = Some((lod.error, lod.triangle_count()));
+    }
+}
+
+/// A mesh's fallback cut carries each vertex's attribute record as the asset
+/// stores it: normals of a sphere stay radial, uv0 matches the record.
+#[test]
+fn a_fallback_cut_carries_its_vertices_attribute_records() {
+    let mesh = common::icosphere(5);
+    let mut attributes = Vec::new();
+    for p in &mesh.positions {
+        let l = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        let n = [p[0] / l, p[1] / l, p[2] / l];
+        let record = helio_vg_format::VertexAttr {
+            normal: n,
+            tangent: [-n[1], n[0], 0.0],
+            bitangent_sign: 1.0,
+            uv0: [n[0] * 0.5 + 0.5, n[1] * 0.5 + 0.5],
+            uv1: [0.0, 0.0],
+        }
+        .encode();
+        attributes.extend_from_slice(&record);
+    }
+    let input = helio_vg_build::MeshInput {
+        positions: &mesh.positions,
+        attributes: &attributes,
+        attribute_stride: ATTR_STRIDE as usize,
+        indices: &mesh.indices,
+        tri_material: &[],
     };
-    let proxy = build_proxy(&source, &opts, None).unwrap();
-    assert_eq!(proxy.lods.len(), 1);
-    assert!(proxy.skipped_levels > 0);
-    assert!(proxy.lods[0].triangle_count() as u32 <= budget);
-    assert!(proxy.lods[0].error > fine.lods[0].error);
+    let source = VgeoBytes::new(build_vgeo(&input, &BuildOptions::default()).unwrap()).unwrap();
+    let proxy = build_proxy(&source, &ProxyOptions::fallback(0.01), None).unwrap();
+    let lod = &proxy.lods[0];
+    assert!(lod.triangle_count() * 2 < mesh.tri_count());
+    assert_eq!(lod.records.len(), lod.positions.len());
+    assert_eq!(lod.uvs.len(), lod.positions.len());
+    let mut worst = 1.0f32;
+    for ((p, record), uv) in lod.positions.iter().zip(&lod.records).zip(&lod.uvs) {
+        let attr = helio_vg_format::VertexAttr::decode(record).expect("a whole record");
+        let l = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        let radial = attr.normal[0] * p[0] / l + attr.normal[1] * p[1] / l + attr.normal[2] * p[2] / l;
+        worst = worst.min(radial);
+        assert_eq!(attr.uv0, *uv);
+    }
+    assert!(worst > 0.95, "a fallback normal {worst} off the radial direction");
 }
 
 #[test]

@@ -32,6 +32,19 @@ pub const RAY_INSTANCES: &str = "meshes.ray_instances";
 /// Instances the ray-tracing culling left out this frame (past the culling
 /// radius and smaller than the culling angle).
 pub const RAY_INSTANCES_CULLED: &str = "meshes.ray_instances_culled";
+/// Bytes of the virtual-geometry ray proxies a standalone projection holds
+/// (vertices and indices), and the scene budget they live in.
+pub const VG_RAY_PROXY_BYTES: &str = "meshes.vg_ray_proxy_bytes";
+pub const VG_RAY_PROXY_BUDGET_BYTES: &str = "meshes.vg_ray_proxy_budget_bytes";
+/// Virtual-geometry ray proxies built at their error bound that the scene
+/// budget could not admit (their instances are not traced).
+pub const VG_RAY_PROXIES_OVER_BUDGET: &str = "meshes.vg_ray_proxies_over_budget";
+/// Bytes of the virtual-geometry fallbacks the engine world's meshes hold on
+/// the GPU (their classic stand-ins: drawn while virtual geometry is not,
+/// and by shadows and rays), and of the full classic geometry they replaced
+/// that is still resident.
+pub const VG_FALLBACK_BYTES: &str = "meshes.vg_fallback_bytes";
+pub const VG_CLASSIC_BYTES: &str = "meshes.vg_classic_bytes";
 /// Programs the ray-traced scene's rows name this frame
 /// (`crate::RAY_PROGRAMS`), the table-driven one included.
 pub const RAY_PROGRAMS: &str = "meshes.ray_programs";
