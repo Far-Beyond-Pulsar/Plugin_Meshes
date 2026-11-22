@@ -758,7 +758,7 @@ mod tests {
         assert_eq!(size_of::<PageHeader>(), 32);
         assert_eq!(size_of::<GpuAssetQuant>(), 16);
         assert_eq!(size_of::<GpuVisibleCluster>(), 8);
-        assert_eq!(size_of::<VgAssetReadyRow>(), 16);
+        assert_eq!(size_of::<VgAssetReadyRow>(), 32);
     }
 
     #[test]
