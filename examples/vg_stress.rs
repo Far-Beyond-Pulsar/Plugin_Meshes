@@ -500,6 +500,17 @@ fn prepare() {
 
 fn main() {
     env_logger::init();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some((before, after)) = vg_stress_capture::diff_requested(&args) {
+        match vg_stress_capture::diff(&before, &after) {
+            Ok(table) => print!("{table}"),
+            Err(e) => {
+                eprintln!("[Capture diff] {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if prepare_requested() {
         return prepare();
     }
@@ -1418,7 +1429,7 @@ impl AppState {
             self.loaded_objects += 1;
         }
         if let Some(bench) = &mut self.bench {
-            if vg {
+            if vg.is_some() {
                 bench.spawn_ms += spawn_started.elapsed().as_secs_f64() * 1000.0;
                 bench.spawned_objects += (self.loaded_objects - objects_before) as u64;
                 bench.private_before_spawn = private_before;

@@ -2147,3 +2147,127 @@ fn tile_density_json(s: &AppState) -> serde_json::Value {
         "tiles_with_hits_ge": ladder.iter().map(|&t| serde_json::json!({"threshold": t, "tiles": over(&hits, t)})).collect::<Vec<_>>(),
     })
 }
+
+// ── comparing two captures ───────────────────────────────────────────────────
+
+/// `--capture-diff <before> <after>`: the two capture directories to compare.
+pub fn diff_requested(args: &[String]) -> Option<(PathBuf, PathBuf)> {
+    let at = args.iter().position(|a| a == "--capture-diff")?;
+    Some((
+        PathBuf::from(args.get(at + 1)?),
+        PathBuf::from(args.get(at + 2)?),
+    ))
+}
+
+/// The per-shot stats JSONs of a capture directory, by shot name.
+fn read_stats(dir: &Path) -> Result<BTreeMap<String, serde_json::Value>, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut out = BTreeMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json")
+            || path.file_stem().is_some_and(|s| s == "index")
+        {
+            continue;
+        }
+        let Some(stats) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        else {
+            continue;
+        };
+        if let Some(name) = stats["name"].as_str() {
+            out.insert(name.to_string(), stats);
+        }
+    }
+    Ok(out)
+}
+
+/// The numbers a VG change is judged by, as (label, JSON pointer).
+const DIFF_METRICS: &[(&str, &str)] = &[
+    ("selected tris", "/vg/selected_triangles"),
+    ("HW clusters", "/vg/tier_clusters/hw"),
+    ("SW clusters", "/vg/tier_clusters/sw"),
+    ("dense clusters", "/vg/tier_clusters/dense"),
+    ("dense tiles", "/vg/tier3/dense_tiles"),
+    ("resident MB", "/vg/pool/resident_bytes"),
+    ("GPU ms", "/gpu_ms/TOTAL"),
+];
+
+/// A table of every metric of every shot present in either capture, with the
+/// change in percent; shots in only one capture are listed as such.
+pub fn diff_stats(
+    before: &BTreeMap<String, serde_json::Value>,
+    after: &BTreeMap<String, serde_json::Value>,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<28} {:<15} {:>14} {:>14} {:>9}",
+        "shot", "metric", "before", "after", "change"
+    );
+    let names: std::collections::BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    for name in names {
+        let (Some(b), Some(a)) = (before.get(name), after.get(name)) else {
+            let side = if before.contains_key(name) { "before" } else { "after" };
+            let _ = writeln!(out, "{name:<28} only in the {side} capture");
+            continue;
+        };
+        for (label, pointer) in DIFF_METRICS {
+            let scale = if label.ends_with("MB") { 1e-6 } else { 1.0 };
+            let value = |s: &serde_json::Value| s.pointer(pointer).and_then(|v| v.as_f64()).map(|v| v * scale);
+            let (vb, va) = (value(b), value(a));
+            if vb.is_none() && va.is_none() {
+                continue;
+            }
+            let show = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.3}"));
+            let change = match (vb, va) {
+                (Some(b), Some(a)) if b != 0.0 => format!("{:+.1}%", (a - b) / b * 100.0),
+                (Some(b), Some(a)) if a == b => "0.0%".to_string(),
+                _ => "-".to_string(),
+            };
+            let _ = writeln!(
+                out,
+                "{name:<28} {label:<15} {:>14} {:>14} {change:>9}",
+                show(vb),
+                show(va)
+            );
+        }
+    }
+    out
+}
+
+/// Print the comparison of two capture directories.
+pub fn diff(before: &Path, after: &Path) -> Result<String, String> {
+    Ok(diff_stats(&read_stats(before)?, &read_stats(after)?))
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    #[test]
+    fn diff_lists_every_metric_with_its_change_and_unmatched_shots() {
+        let shot = |tris: u64, ms: f64| {
+            serde_json::json!({"vg": {"selected_triangles": tris, "tier_clusters": {"hw": 10, "sw": 0, "dense": 0}}, "gpu_ms": {"TOTAL": ms}})
+        };
+        let before = BTreeMap::from([
+            ("hero".to_string(), shot(200, 4.0)),
+            ("gone".to_string(), shot(1, 1.0)),
+        ]);
+        let after = BTreeMap::from([("hero".to_string(), shot(100, 5.0))]);
+        let table = diff_stats(&before, &after);
+        assert!(table.contains("hero") && table.contains("-50.0%"), "{table}");
+        assert!(table.contains("+25.0%"), "{table}");
+        assert!(table.contains("gone") && table.contains("only in the before capture"), "{table}");
+        assert!(!table.contains("dense tiles"), "absent metrics are skipped: {table}");
+    }
+
+    #[test]
+    fn diff_arguments_name_two_directories() {
+        let args = ["--capture-diff", "a", "b"].map(String::from);
+        assert_eq!(diff_requested(&args), Some((PathBuf::from("a"), PathBuf::from("b"))));
+        assert_eq!(diff_requested(&args[..2]), None);
+    }
+}

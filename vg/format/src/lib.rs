@@ -114,6 +114,26 @@ impl VertexAttr {
     }
 }
 
+/// The [`ATTR_STRIDE`] record of a vertex whose normal and tangent are
+/// already packed snorm8x4 words (the mesh vertex layout): normal word as is,
+/// tangent xyz with its w replaced by the bitangent sign, uvs as halves.
+pub fn attr_record(
+    normal: u32,
+    tangent: u32,
+    bitangent_sign: f32,
+    uv0: [f32; 2],
+    uv1: [f32; 2],
+) -> [u8; ATTR_STRIDE as usize] {
+    let sign: u32 = if bitangent_sign < 0.0 { 0x81 } else { 0x7f };
+    let mut out = [0u8; ATTR_STRIDE as usize];
+    out[0..4].copy_from_slice(&normal.to_le_bytes());
+    out[4..8].copy_from_slice(&((tangent & 0x00ff_ffff) | (sign << 24)).to_le_bytes());
+    for (i, x) in [uv0[0], uv0[1], uv1[0], uv1[1]].into_iter().enumerate() {
+        out[8 + 2 * i..10 + 2 * i].copy_from_slice(&f32_to_f16(x).to_le_bytes());
+    }
+    out
+}
+
 /// Single to IEEE half precision, round to nearest even; overflow saturates
 /// to infinity and NaN stays NaN.
 pub fn f32_to_f16(x: f32) -> u16 {

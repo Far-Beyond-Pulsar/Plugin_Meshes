@@ -816,56 +816,20 @@ fn display_name(mesh: &MeshAssetPath, content: u128) -> String {
         .map_or_else(|| mesh.as_str().to_owned(), |n| n.to_string_lossy().into_owned())
 }
 
-fn f32_to_f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x007f_ffff;
-    if exponent == 0xff {
-        return sign | 0x7c00 | if mantissa != 0 { 0x0200 } else { 0 };
-    }
-    let unbiased = exponent - 127 + 15;
-    if unbiased >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if unbiased <= 0 {
-        if unbiased < -10 {
-            return sign;
-        }
-        let m = mantissa | 0x0080_0000;
-        let shift = (14 - unbiased) as u32;
-        let half = (m >> shift) as u16;
-        let round = ((m >> (shift - 1)) & 1) as u16;
-        return sign | (half + round);
-    }
-    let half = sign | ((unbiased as u16) << 10) | (mantissa >> 13) as u16;
-    // Round to nearest.
-    if mantissa & 0x1000 != 0 {
-        half.wrapping_add(1)
-    } else {
-        half
-    }
-}
-
-/// The 16-byte attribute record of the `.vgeo` (`helio_vg_format::ATTR_STRIDE`):
-/// normal snorm8x4, tangent snorm8x4 (w = bitangent sign), uv0 f16x2, uv1 f16x2.
+/// The `.vgeo` attribute records of `vertices` (`helio_vg_format::attr_record`).
 fn attribute_bytes(vertices: &[PackedVertex]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vertices.len() * 16);
-    for v in vertices {
-        let tangent = (v.tangent & 0x00ff_ffff)
-            | (if v.bitangent_sign < 0.0 {
-                0x81u32
-            } else {
-                0x7fu32
-            } << 24);
-        out.extend_from_slice(&v.normal.to_le_bytes());
-        out.extend_from_slice(&tangent.to_le_bytes());
-        for uv in [v.tex_coords0, v.tex_coords1] {
-            out.extend_from_slice(&f32_to_f16_bits(uv[0]).to_le_bytes());
-            out.extend_from_slice(&f32_to_f16_bits(uv[1]).to_le_bytes());
-        }
-    }
-    out
+    vertices
+        .iter()
+        .flat_map(|v| {
+            helio_vg_format::attr_record(
+                v.normal,
+                v.tangent,
+                v.bitangent_sign,
+                v.tex_coords0,
+                v.tex_coords1,
+            )
+        })
+        .collect()
 }
 
 /// Load or build the mesh's `.vgeo` as a background task and keep it where

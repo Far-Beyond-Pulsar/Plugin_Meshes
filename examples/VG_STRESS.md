@@ -448,6 +448,14 @@ pool counters, `gpu_ms`) and `index.json` listing every shot with its image,
 stats file, frame count, `selected_triangles` and total `gpu_ms`. A shot
 list entry that is a camera path writes a numbered sequence in `<name>/`.
 
+Comparing two captures (no window or GPU) prints, per shot, the selected
+triangles, tier cluster counts, dense tiles, resident pool MB and total GPU ms
+with the change in percent, and lists shots present in only one of them:
+
+```powershell
+cargo run -p meshes-examples --features vg-stress --bin vg_stress --release -- --capture-diff before after
+```
+
 `vg_stress_shots/vg_runtime.json` is the fixed list of the VG runtime work: 21
 shots (hero close-ups with triangle views, the forest crowd with tier and
 dense views, a normal overview, and the page residency (107) and error vs tau

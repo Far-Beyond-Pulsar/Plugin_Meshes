@@ -195,14 +195,18 @@ fn trace_proxy_vertices_keep_their_uvs() {
         let lod = &proxy.lods[0];
         assert_eq!(lod.uvs.len(), lod.positions.len());
         let mut seam = 0;
+        // Placed vertices interpolate their uv at the optimum, so it may slide
+        // along the surface by up to the cut's error (one uv unit is one unit of
+        // length here); half-float rounding is the floor.
+        let tol = lod.error.max(2e-3);
         for (p, uv) in lod.positions.iter().zip(&lod.uvs) {
-            let u = if (uv[0] - p[0]).abs() < 2e-3 {
+            let u = if (uv[0] - p[0]).abs() < tol {
                 p[0]
             } else {
                 p[0] - 0.5
             };
             assert!(
-                (uv[0] - u).abs() < 2e-3 && (uv[1] - p[2]).abs() < 2e-3,
+                (uv[0] - u).abs() < tol && (uv[1] - p[2]).abs() < tol,
                 "vertex at {p:?} has uv {uv:?}"
             );
             seam += usize::from((p[0] - 0.5).abs() < 1e-4);
