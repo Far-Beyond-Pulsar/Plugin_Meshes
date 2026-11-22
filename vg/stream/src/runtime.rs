@@ -41,9 +41,8 @@ pub struct VgRuntimeSettings {
     pub prefetch_factor: f32,
     /// Overdraw valve: triangles per covered pixel one 16x16 screen tile may hold
     /// before the groups covering it are coarsened (0 = off). Per tile, bounded
-    /// (by at most `helio_pass_vg_cull::TILE_SCALE_MAX`), and a tile resolved
-    /// as dense is exempt; it only engages on
-    /// pathological overdraw.
+    /// (by at most `helio_pass_vg_cull::TILE_SCALE_MAX`), dense tiles included;
+    /// it only engages on pathological overdraw.
     pub tile_density_limit: f32,
     /// Divides the dense-tile classifier's thresholds (64 triangles or 64 pixel
     /// hits per 16x16 tile): higher classifies a tile dense sooner.

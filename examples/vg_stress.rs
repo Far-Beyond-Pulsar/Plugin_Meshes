@@ -20,6 +20,7 @@ mod vg_stress_cook;
 mod vg_stress_loading;
 /// Self-provisioning of the scan meshes (shared with `build.rs`).
 mod vg_stress_prep;
+mod vg_stress_valve;
 mod vg_stress_data {
     pub mod dims;
     pub mod forest;
@@ -506,6 +507,22 @@ fn main() {
             Ok(table) => print!("{table}"),
             Err(e) => {
                 eprintln!("[Capture diff] {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if let Some(dir) = vg_stress_valve::check_requested(&args) {
+        match vg_stress_valve::check_dir(&dir) {
+            Ok((report, passed)) => {
+                print!("{report}");
+                if !passed {
+                    eprintln!("[Valve check] FAILED: {}", dir.display());
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("[Valve check] {e}");
                 std::process::exit(1);
             }
         }

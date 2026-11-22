@@ -109,8 +109,8 @@ pub fn sw_masked_source(binding: helio_mats::MaterialBindingConfig, clip: bool) 
         ])
     )
 }
-/// `classify_main` and `dense_args_main` (standalone, no scene bindings; the
-/// cull's tile-block constants are prepended).
+/// `classify_kept_main`, `classify_new_main` and `dense_args_main` (standalone,
+/// no scene bindings; the cull's tile-block constants are prepended).
 pub fn tile_classify_source() -> String {
     format!("{}{}", helio_pass_vg_cull::tile_block_wgsl(), TILE_CLASSIFY)
 }

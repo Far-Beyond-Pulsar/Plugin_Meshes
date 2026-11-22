@@ -14,8 +14,8 @@
 // Hysteresis: a tile that was dense in the previous frame stays dense until
 // both counters fall below `hysteresis * threshold` (hysteresis in (0, 1]).
 //
-// Dispatch `classify_main` over ceil(tile_count / 64) workgroups, then
-// `dense_args_main` with one workgroup.
+// Dispatch `classify_kept_main`, then `classify_new_main`, each over
+// ceil(tile_count / 64) workgroups, then `dense_args_main` with one workgroup.
 //
 // Mask format: one u32 per tile, 1 = dense (row-major tile index).
 // `dense_args` (u32 x 4): [0..3] = DispatchIndirect (x, y, z) for one workgroup
@@ -48,18 +48,37 @@ struct ClassifyParams {
 // Persistent per-tile latch age (frames of dense status left). Never cleared.
 @group(0) @binding(7) var<storage, read_write> dense_age: array<u32>;
 
+// Two dispatches share the `max_dense` slots: first the tiles that were dense
+// last frame (`classify_kept_main`), then the others (`classify_new_main`). A
+// tile that stays dense therefore keeps its slot, and only free slots go to
+// newly qualifying tiles. With one dispatch the slots went to whichever tiles
+// reached the counter first, a different set every frame once more than
+// `max_dense` tiles qualify: the mask flickered on a still camera, and with it
+// the cull's overdraw valve, which relaxes dense tiles and coarsens the others.
+// The previous frame had at most `max_dense` dense tiles, so every kept tile
+// fits.
 @compute @workgroup_size(64)
-fn classify_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn classify_kept_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = gid.x;
-    if (t >= cp.tile_count) { return; }
-    let was_dense = prev_mask[t] != 0u;
+    if (t >= cp.tile_count || prev_mask[t] == 0u) { return; }
+    classify_tile(t, true);
+}
+
+@compute @workgroup_size(64)
+fn classify_new_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= cp.tile_count || prev_mask[t] != 0u) { return; }
+    classify_tile(t, false);
+}
+
+fn classify_tile(t: u32, was_dense: bool) {
     // The cull's estimate counts every emitted cluster, so a tile whose clusters
     // were diverted to Tier 3 (and left the software counters) keeps its state,
     // and a tile of hardware-class clusters can qualify without the software
     // raster having run.
     var est_tris = 0.0;
     if cp.est_base != 0xffffffffu {
-        est_tris = f32(est[cp.est_base + t * VGC_TILE_WORDS]) / VGC_TILE_FIXED;
+        est_tris = f32(est[cp.est_base + t * VGC_TILE_WORDS + VGC_TW_TRIANGLES]) / VGC_TILE_FIXED;
     }
     let tris = max(f32(tile_counters[t * 2u]), est_tris);
     let hits = f32(tile_counters[t * 2u + 1u]);

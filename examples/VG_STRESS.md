@@ -278,14 +278,18 @@ Three bounded mechanisms sit around that one rule, all in `VirtualGeometrySettin
   flips a cut),
 - `prefetch_factor` (default 2): child pages are requested while the error is
   above `tau / prefetch_factor`, urgent requests first,
-- `tile_density_limit` (default 8 triangles per covered pixel, 0 = off): an
-  overdraw safety valve that coarsens only the 16x16 tiles above the limit, at
-  most 32x (`TILE_SCALE_MAX`), with a dead band; a tile resolved as dense is
-  exempt. It also gates the hierarchy walk: a node stops the descent under
+- `tile_density_limit` (default 16 triangles per covered pixel,
+  `helio_vg_format::DEFAULT_TILE_DENSITY_LIMIT`; 0 = off): an overdraw safety
+  valve that coarsens only the 16x16 tiles above the limit, at most 32x
+  (`TILE_SCALE_MAX`), with a dead band; a tile resolved as dense gets the same
+  law, and a tile whose density jumps across the whole band when one group
+  swaps (a cliff in the cut) parks at the coarse side until its content
+  changes. It also gates the hierarchy walk: a node stops the descent under
   `tau * tile_scale_min` (the smallest scale over its tiles), so a distant
-  instance on saturated tiles is not walked at all. The defaults were 16 and
-  4x until the forest scene (`VG_FOREST.md`) showed 4x cannot bring aggregate
-  foliage (about 77 triangles per pixel at tau 1) down to the limit.
+  instance on saturated tiles is not walked at all. The cap was 4x until the
+  forest scene (`VG_FOREST.md`) showed 4x cannot bring aggregate foliage (about
+  77 triangles per pixel at tau 1) down to the limit. "Valve check" under
+  "Capture mode" below measures it on the forest shots.
 
 The stored error is used as is, and it is the true deviation (cook revision 12):
 the largest object-space distance, normal change or uv slide that swapping the
@@ -467,9 +471,9 @@ stats JSON and the images.
 Reading view 109 (error vs tau): a pixel is heat-coloured while the drawn
 cluster's projected error is under tau and magenta above it. With the default
 settings some hot pixels are magenta on purpose: the per-tile valve
-(`tile_density_limit`, 8) raises the effective tau, up to 32x, in 16x16 tiles
-above 8 triangles per covered pixel. With the valve off (`tile_density_limit`
-0) the museum overview at tau 1.0 shows no magenta. Shots use a fixed 240
+(`tile_density_limit`, 16) raises the effective tau, up to 32x, in 16x16 tiles
+above 20 (16 plus the 25 % band) triangles per covered pixel. With the valve off
+(`tile_density_limit` 0) the museum overview at tau 1.0 shows no magenta. Shots use a fixed 240
 settle frames, not a streaming-ready signal, so a shot that needs many pages
 (the cook revision 12 cut at tau 0.25) can still be filling the pool; compare
 `vg.pool.resident_pages` between runs.
@@ -480,6 +484,73 @@ slots, and the loader bakes the base colour slot's transform into the
 vertices (`load_scene` in `vg_stress_loading.rs`), since the museum's
 materials sample the vertex UVs as they are. A `<name>.vgimport.gltf` left
 beside a tree by an older loader is no longer read and can be deleted.
+
+### Valve check
+
+Every single-image shot reads the overdraw valve's tile block back over its
+last 32 settle frames (`VgCullEarlyPass::watch_tile_valve`, asynchronous, so
+the frames stay pipelined) and writes a `valve` section into its stats JSON:
+the limit, the scale's maximum and p99, tiles scaled, at the cap and parked,
+the worst triangles per covered pixel after the valve (overall and on tiles
+below the cap), the largest scale step between frames, the tiles that reversed
+direction, and the worst tile frame by frame. Checking a capture needs no
+window or GPU:
+
+```powershell
+cargo run -p meshes-examples --features vg-stress --bin vg_stress --release -- --capture-check-valve out
+```
+
+It prints one row per shot and exits non-zero, with a line per failure, when a
+tile's scale exceeds `TILE_SCALE_MAX`, when a still shot has a tile that
+reverses direction twice or more in the window (a cycle; one reversal is the
+valve settling at a cliff or answering a content change), when a tile below
+the cap stays over the band's upper edge (`limit * 1.25`, the valve should
+still be coarsening it), or when the shot has no consecutive samples. The
+`dropped` column is `vg.overflow.visible` (clusters lost to full bins; such a
+frame is not coverage-complete). To check the forest at the default limit
+(16), capture both scenes' forest shots and check each directory:
+
+```powershell
+$env:VG_STRESS_CAPTURE = 'valve-museum'; $env:VG_STRESS_SHOTS = 'vg_stress_shots/vg_runtime.json'
+$env:VG_STRESS_CAPTURE_ONLY = 'forest'
+cargo run -p meshes-examples --features vg-stress --bin vg_stress --release
+Remove-Item Env:VG_STRESS_CAPTURE_ONLY
+$env:VG_STRESS_SCENE = 'forest'; $env:VG_STRESS_CAPTURE = 'valve-forest'
+$env:VG_STRESS_SHOTS = 'vg_stress_shots/forest.json'
+cargo run -p meshes-examples --features vg-stress --bin vg_stress --release
+cargo run -p meshes-examples --features vg-stress --bin vg_stress --release -- --capture-check-valve valve-museum
+cargo run -p meshes-examples --features vg-stress --bin vg_stress --release -- --capture-check-valve valve-forest
+```
+
+Measured (RTX 4090, Vulkan, 2026-11-22; museum shots 1280x720 at 240 or 300
+settle frames, forest scene 1920x1080 at 300, tau 1, limit 16): every shot
+passes. Scale max and p99 are 32 (the cap) on every shot, no tile reverses
+twice, the worst density on a tile below the cap is 19.96 to 20.0 (the band's
+edge), and no cluster is dropped.
+
+| Shot | Selected tris | Tiles covered / at cap / parked | Density p99, max (tris/px) | GPU ms |
+|---|---|---|---|---|
+| `crowd-forest` | 35.2 M | 1724 / 1077 / 0 | 317, 415 | 11.8 |
+| `crowd-forest-dense-peel` | 40.5 M | 1724 / 1077 / 0 | 484, 791 | 168 |
+| `error-forest-tau1p0` | 35.3 M | 1724 / 1077 / 0 | 317, 416 | 11.8 |
+| `error-forest-tau0p25` | 62.2 M | 1733 / 1125 / 0 | 965, 1402 | 17.3 |
+| `forest-ground` | 15.6 M | 1322 / 689 / 66 | 249, 349 | 8.0 |
+| `forest-overview` | 16.1 M | 2414 / 1111 / 512 | 185, 341 | 8.3 |
+| `forest-peaks` | 7.5 M | 1733 / 666 / 702 | 138, 302 | 6.2 |
+| `forest-valley` | 14.2 M | 2278 / 889 / 472 | 163, 320 | 8.2 |
+
+The check found two regressions, both fixed (#1642). The dense-tile
+classifier gave its 512 slots to whichever tiles reached its counter first, a
+different set every frame, and the valve exempted dense tiles, so 645 to 737
+tiles of the dense shots flapped; with the mask held still the 512 exempt
+tiles relaxed to full detail (145 M triangles, 590 k clusters dropped), so
+dense tiles now get the valve's law (96 M to 40.5 M triangles, 240 to 168 ms on
+`crowd-forest-dense-peel`). And on the forest scene 17 to 303 tiles per shot
+cycled across cliffs in the cut, where one group swapping moves a tile's
+density across the whole band; those tiles now park. What the check also
+shows: on about 60 % of the covered forest tiles the valve sits at its 32x
+cap with 140 to 960 triangles per covered pixel (p99), so the cap, not the
+limit, bounds aggregate foliage there.
 
 ## Tier 3 measurements (dense tiles)
 
@@ -529,7 +600,9 @@ created): `HELIO_VG_DENSE_TRI` (base triangles per tile, default 64),
 `HELIO_VG_DENSE_HIT` (base depth-passing hits per tile, default 64),
 `HELIO_VG_DENSE_LATCH` (frames a tile stays dense, default 8) and
 `HELIO_VG_DENSE_MAX_TILES` (qualifying tiles per frame, default 512; the
-thresholds are scaled by sensitivity too).
+thresholds are scaled by sensitivity too). When more tiles qualify than fit,
+the tiles dense last frame keep their slots and only free slots go to new ones,
+so a still camera keeps one mask (#1642).
 `VG_STRESS_PAGE_MB` sets the page-pool budget. `VG_STRESS_TILE_DENSITY=<n>` sets the
 overdraw valve's limit (triangles per covered pixel per 16x16 tile, 0 = off).
 

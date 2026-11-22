@@ -305,6 +305,97 @@ struct Readback {
     revision: u64,
 }
 
+/// Staging buffers of the tile-valve readback: enough for the frames a host keeps
+/// in flight plus the one being mapped, so watching never waits for the GPU.
+const TILE_VALVE_SLOTS: usize = 8;
+
+enum ValveSlotState {
+    Free,
+    /// The copy is recorded in frame `frame`'s commands (maybe not submitted yet).
+    Copied {
+        frame: u64,
+        tiles: [u32; 2],
+    },
+    /// Submitted and mapping; the callback fills `ready`.
+    Mapping {
+        frame: u64,
+        tiles: [u32; 2],
+        ready: Arc<Mutex<Option<bool>>>,
+    },
+}
+
+struct ValveSlot {
+    buffer: wgpu::Buffer,
+    state: ValveSlotState,
+}
+
+/// The owned, asynchronous readback of the tile block ([`VgCullCore::watch_tile_valve`]).
+#[derive(Default)]
+struct TileValveReadback {
+    slots: Vec<ValveSlot>,
+    /// Frames still to copy.
+    remaining: u32,
+    samples: std::collections::VecDeque<crate::TileValveSample>,
+}
+
+impl TileValveReadback {
+    /// Starts mapping every copied slot. Only once its frame is submitted: the
+    /// core calls this at the next `begin_frame` (or from the blocking read).
+    fn map_copied(&mut self) {
+        for slot in &mut self.slots {
+            if let ValveSlotState::Copied { frame, tiles } = slot.state {
+                let ready = Arc::new(Mutex::new(None));
+                let done = ready.clone();
+                slot.buffer
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |r| {
+                        *done.lock().unwrap_or_else(|p| p.into_inner()) = Some(r.is_ok());
+                    });
+                slot.state = ValveSlotState::Mapping {
+                    frame,
+                    tiles,
+                    ready,
+                };
+            }
+        }
+    }
+
+    /// Moves every mapped slot's block into `samples`, oldest frame first.
+    fn collect(&mut self) {
+        let mut got = Vec::new();
+        for slot in &mut self.slots {
+            let ValveSlotState::Mapping {
+                frame,
+                tiles,
+                ref ready,
+            } = slot.state
+            else {
+                continue;
+            };
+            let Some(ok) = *ready.lock().unwrap_or_else(|p| p.into_inner()) else {
+                continue;
+            };
+            if ok {
+                let words = (crate::TILE_WORDS * tiles[0] * tiles[1]) as usize;
+                if let Ok(view) = slot.buffer.slice(..).get_mapped_range() {
+                    let all = bytemuck::cast_slice::<u8, u32>(&view);
+                    got.push(crate::TileValveSample::decode(frame, tiles, &all[..words]));
+                }
+                slot.buffer.unmap();
+            }
+            slot.state = ValveSlotState::Free;
+        }
+        got.sort_by_key(|s| s.frame);
+        self.samples.extend(got);
+    }
+
+    fn busy(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|s| !matches!(s.state, ValveSlotState::Free))
+    }
+}
+
 struct Pipelines {
     tiles: wgpu::ComputePipeline,
     seed: wgpu::ComputePipeline,
@@ -337,6 +428,7 @@ pub struct VgCullCore {
     bind_cache: [BindCache; 2],
     frame: u64,
     readback: Readback,
+    valve_readback: TileValveReadback,
     last_stats: Option<Vec<u32>>,
     pending_capacity_stats: Option<Vec<u32>>,
     size: (u32, u32),
@@ -553,6 +645,7 @@ impl VgCullCore {
                 in_flight: false,
                 revision: 0,
             },
+            valve_readback: TileValveReadback::default(),
             last_stats: None,
             pending_capacity_stats: None,
             size: (1, 1),
@@ -584,6 +677,98 @@ impl VgCullCore {
     /// Whether `begin_frame` ran this frame (the late pass skips otherwise).
     pub fn prepared(&self) -> bool {
         self.prepared
+    }
+
+    /// Reads back the tile block (the overdraw valve's scales and the estimates
+    /// they were stepped from) at the end of each of the next `frames` frames,
+    /// asynchronously: the frame records one copy into a staging buffer the core
+    /// owns and nothing waits. Collect them with [`Self::take_tile_valve_samples`].
+    /// A frame that finds every staging buffer still in flight is skipped (its
+    /// sample is missing, so frame numbers show the gap). Replaces any earlier
+    /// request; 0 stops.
+    pub fn watch_tile_valve(&mut self, frames: u32) {
+        self.valve_readback.remaining = frames;
+    }
+
+    /// The tile-valve samples whose readback has completed, oldest first. Never
+    /// waits for the GPU.
+    pub fn take_tile_valve_samples(&mut self) -> Vec<crate::TileValveSample> {
+        self.valve_readback.collect();
+        self.valve_readback.samples.drain(..).collect()
+    }
+
+    /// Diagnostics (capture and tests only: it BLOCKS on the GPU). Every watched
+    /// frame's sample, waiting for those still in flight. Call it after the
+    /// frames' commands are submitted.
+    pub fn tile_valve_samples_blocking(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Vec<crate::TileValveSample> {
+        self.valve_readback.map_copied();
+        while self.valve_readback.busy() {
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            self.valve_readback.collect();
+        }
+        self.take_tile_valve_samples()
+    }
+
+    /// Records the copy of the tile block for a watched frame (after the frame's
+    /// last phase: the estimate is complete and the scale is the one it used).
+    fn record_tile_valve_copy(&mut self, rec: &mut CommandRecorder<'_>, device: &wgpu::Device) {
+        let rb = &mut self.valve_readback;
+        if rb.remaining == 0 {
+            return;
+        }
+        rb.remaining -= 1;
+        let b = &self.buffers;
+        let bytes = VgCullBuffers::tile_block_words(b.tiles) * 4;
+        let free = rb
+            .slots
+            .iter()
+            .position(|s| matches!(s.state, ValveSlotState::Free) && s.buffer.size() >= bytes);
+        let slot = match free {
+            Some(i) => i,
+            None => {
+                // A slot too small for the grid is replaced; otherwise grow up to
+                // the cap, and past it the frame is skipped.
+                let small = rb.slots.iter().position(|s| {
+                    matches!(s.state, ValveSlotState::Free) && s.buffer.size() < bytes
+                });
+                if small.is_none() && rb.slots.len() >= TILE_VALVE_SLOTS {
+                    return;
+                }
+                let slot = ValveSlot {
+                    buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("VgCull Tile Valve Readback"),
+                        size: bytes.max(16),
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    state: ValveSlotState::Free,
+                };
+                match small {
+                    Some(i) => {
+                        rb.slots[i] = slot;
+                        i
+                    }
+                    None => {
+                        rb.slots.push(slot);
+                        rb.slots.len() - 1
+                    }
+                }
+            }
+        };
+        rec.copy_buffer_to_buffer(
+            &b.state,
+            u64::from(b.tile_base()) * 4,
+            &rb.slots[slot].buffer,
+            0,
+            bytes,
+        );
+        rb.slots[slot].state = ValveSlotState::Copied {
+            frame: self.frame,
+            tiles: b.tiles,
+        };
     }
 
     /// Start of frame: finish any stats read-back (growing capacities), size
@@ -707,6 +892,9 @@ impl VgCullCore {
     }
 
     fn poll_readback(&mut self) {
+        // Last frame's tile-valve copy is submitted by now.
+        self.valve_readback.collect();
+        self.valve_readback.map_copied();
         let rb = &mut self.readback;
         if rb.copied && !rb.in_flight {
             let ready = rb.ready.clone();
@@ -855,6 +1043,9 @@ impl VgCullCore {
                 state::WORDS as u64 * 4,
             );
             self.readback.copied = true;
+        }
+        if phase == last {
+            self.record_tile_valve_copy(rec, device);
         }
     }
 

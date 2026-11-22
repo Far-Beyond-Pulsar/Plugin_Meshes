@@ -944,6 +944,9 @@ pub struct Capture {
     derive_baseline: (u64, u64),
     /// Bound CPU lead without draining the GPU after every measured frame.
     in_flight: VecDeque<wgpu::SubmissionIndex>,
+    /// The overdraw valve over the current shot's last settle frames
+    /// (`vg_stress_valve::summarize`), `None` for shots it does not cover.
+    valve: Option<serde_json::Value>,
 }
 
 impl Capture {
@@ -990,6 +993,7 @@ impl Capture {
             bvh_modes: [0; 3],
             derive_baseline: (0, 0),
             in_flight: VecDeque::new(),
+            valve: None,
         }
     }
 
@@ -1331,10 +1335,15 @@ impl Capture {
         let Phase::Shot(run) = &mut self.phase else {
             return false;
         };
-        let (frame_now, settle_now) = (run.frame, run.settle);
+        let (frame_now, settle_now, frames_now) = (run.frame, run.settle, run.frames);
         let pose = shot.camera.pose(frame_now);
         let pose = self.lensed(s, &shot, pose, size);
         let total_settle = if frame_now == 0 { settle_now } else { 2 };
+        // The overdraw valve over the last settle frames of a single-image shot
+        // (read back asynchronously; the frames stay pipelined).
+        let valve_from = (frames_now == 1 && total_settle >= super::vg_stress_valve::WINDOW)
+            .then(|| total_settle - super::vg_stress_valve::WINDOW);
+        self.valve = None;
         // Settle frames (the first frame of a sequence only; later frames follow the path).
         let mut gpu_window: BTreeMap<&'static str, (f64, u32)> = BTreeMap::new();
         let mut last_generation = match &self.phase {
@@ -1342,6 +1351,14 @@ impl Capture {
             _ => 0,
         };
         for i in 0..total_settle.max(1) {
+            if valve_from == Some(i) {
+                if let Some(cull) = s
+                    .renderer
+                    .find_pass::<helio_pass_vg_cull::VgCullEarlyPass>()
+                {
+                    cull.watch_tile_valve(super::vg_stress_valve::WINDOW);
+                }
+            }
             self.render(s, pose, size);
             if i + 30 >= total_settle {
                 let snap = s.renderer.timing_snapshot();
@@ -1360,6 +1377,19 @@ impl Capture {
                         e.1 += 1;
                     }
                 }
+            }
+        }
+        if valve_from.is_some() {
+            if let Some(cull) = s
+                .renderer
+                .find_pass::<helio_pass_vg_cull::VgCullEarlyPass>()
+            {
+                let samples = cull.tile_valve_samples_blocking(&s.device);
+                self.valve = Some(super::vg_stress_valve::summarize(
+                    &samples,
+                    s.runtime.settings().tile_density_limit,
+                    !self.moving,
+                ));
             }
         }
         let Phase::Shot(run) = &mut self.phase else {
@@ -1514,6 +1544,7 @@ impl Capture {
                 },
             },
             "tile_density": tile_density,
+            "valve": self.valve,
             "bench": self.bench_json(s),
             "gpu_ms": gpu,
             "gpu_ms_note": "mean of distinct asynchronous timestamp samples in the last 30 settle iterations; up to 3 frames in flight",
@@ -2160,7 +2191,7 @@ pub fn diff_requested(args: &[String]) -> Option<(PathBuf, PathBuf)> {
 }
 
 /// The per-shot stats JSONs of a capture directory, by shot name.
-fn read_stats(dir: &Path) -> Result<BTreeMap<String, serde_json::Value>, String> {
+pub fn read_stats(dir: &Path) -> Result<BTreeMap<String, serde_json::Value>, String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut out = BTreeMap::new();
     for entry in entries.flatten() {

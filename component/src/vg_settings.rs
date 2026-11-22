@@ -115,7 +115,7 @@ pub struct VirtualGeometrySettings {
     pub prefetch_factor: f32,
     /// Overdraw valve: triangles per covered pixel one 16x16 screen tile may hold
     /// before the clusters over it are coarsened (0 = off). Only engages on
-    /// pathological overdraw; a tile resolved as dense is exempt.
+    /// pathological overdraw; dense tiles get the same limit.
     pub tile_density_limit: f32,
     /// Dense-tile classifier sensitivity: higher classifies a tile dense with
     /// less overlap (thresholds are divided by it). Only matters with `tier3`.
