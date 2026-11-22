@@ -57,7 +57,14 @@ fn measure_dag(dag: &Dag, max_points: usize) -> Vec<LevelReport> {
     let original = Soup::new(orig);
     let mut out = Vec::new();
     for level in 1..=top {
-        let cl: Vec<_> = dag.clusters.iter().filter(|c| c.level == level).collect();
+        // The cut after `level` simplification rounds: clusters made by then
+        // and consumed later. A group that keeps its triangles in a round
+        // passes its clusters on to the next one, so a cut can mix levels.
+        let cl: Vec<_> = dag
+            .clusters
+            .iter()
+            .filter(|c| c.level <= level && dag.groups[c.consumer as usize].level >= level)
+            .collect();
         let tris: Vec<Vec<[V3; 3]>> = cl
             .iter()
             .map(|c| c.tris.iter().map(tri).collect())
@@ -530,4 +537,106 @@ fn harness_top_stall() {
     }
     let out = meshopt::simplify_sloppy(&indices, &adapter, 200 * 3, f32::MAX, None);
     println!("  sloppy: -> {} tris", out.len() / 3);
+}
+
+/// Dense barycentric samples of a triangle (`(n + 1)(n + 2) / 2` points).
+fn dense_samples(t: &[V3; 3], n: u32) -> Vec<V3> {
+    let mut out = Vec::new();
+    for i in 0..=n {
+        for j in 0..=(n - i) {
+            let (u, v) = (i as f32 / n as f32, j as f32 / n as f32);
+            let w = 1.0 - u - v;
+            out.push(std::array::from_fn(|k| {
+                t[0][k] * w + t[1][k] * u + t[2][k] * v
+            }));
+        }
+    }
+    out
+}
+
+/// Thin spikes, sharp narrow ridges and high-frequency noise: the features a
+/// sampled deviation misses between its samples, where a level measured
+/// against the previous level (not the original) under-counts what earlier
+/// levels removed, and that no tuned margin covers. The builder before
+/// revision 13 (sampled, previous-level, 1.4x margin) stored 1.6x too
+/// little here.
+fn spiky_noisy_sphere() -> (Vec<V3>, Vec<u32>) {
+    let (mut p, idx) = noisy_sphere(5); // 20,480 triangles
+    for (i, v) in p.iter_mut().enumerate() {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        // 30 sharp ridges around the axis...
+        let a = v[1].atan2(v[0]) * 30.0 / std::f32::consts::PI;
+        let ridge = 2.0 * (a - a.floor() - 0.5).abs();
+        let mut s = 1.0 + 0.12 * ridge * ridge * ridge;
+        // ... and every 97th vertex a thin spike (a needle cone).
+        if i % 97 == 0 {
+            s += 0.15 * ((i / 97) % 5) as f32 / 4.0;
+        }
+        *v = [v[0] / l * s, v[1] / l * s, v[2] / l * s];
+    }
+    (p, idx)
+}
+
+#[test]
+fn stored_error_bounds_dense_deviation_on_spikes_and_noise() {
+    let (p, idx) = spiky_noisy_sphere();
+    let attrs = pos_attrs(&p);
+    let dag = build_dag(&input(&p, &attrs, &idx)).unwrap();
+    let tri = |t: &[u32; 3]| [0, 1, 2].map(|k| dag.vs.pos[t[k] as usize]);
+    let original = Soup::new(
+        dag.clusters
+            .iter()
+            .filter(|c| c.level == 0)
+            .flat_map(|c| c.tris.iter().map(tri))
+            .collect(),
+    );
+    let top = dag.clusters.iter().map(|c| c.level).max().unwrap();
+    let mut worst = (0.0f32, 0u32);
+    for level in 1..=top {
+        // The cut after `level` rounds (see `measure_dag`).
+        let cut: Vec<&ClusterNode> = dag
+            .clusters
+            .iter()
+            .filter(|c| c.level <= level && dag.groups[c.consumer as usize].level >= level)
+            .collect();
+        let mut tris = Vec::new();
+        let mut owner = Vec::new();
+        for (ci, c) in cut.iter().enumerate() {
+            for t in &c.tris {
+                tris.push(tri(t));
+                owner.push(ci);
+            }
+        }
+        let surface = Soup::new(tris.clone());
+        // Simplified -> original, densely.
+        for (t, &ci) in tris.iter().zip(&owner) {
+            for q in dense_samples(t, 8) {
+                let d = original.nearest(q).0;
+                let r = d / cut[ci].self_error.max(1e-12);
+                if r > worst.0 {
+                    worst = (r, level);
+                }
+            }
+        }
+        // Original -> simplified, charged to the cluster it lands on.
+        for t in original.tris.iter() {
+            for q in dense_samples(t, 4) {
+                let (d, ti) = surface.nearest(q);
+                let r = d / cut[owner[ti as usize]].self_error.max(1e-12);
+                if r > worst.0 {
+                    worst = (r, level);
+                }
+            }
+        }
+    }
+    println!(
+        "worst dense deviation / stored error: {:.3} at level {}",
+        worst.0, worst.1
+    );
+    assert!(
+        worst.0 <= 1.0 + 1e-3,
+        "level {}: densely sampled deviation is {:.3}x the stored error",
+        worst.1,
+        worst.0
+    );
 }

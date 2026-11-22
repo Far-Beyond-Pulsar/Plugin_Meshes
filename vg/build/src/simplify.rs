@@ -1,12 +1,20 @@
 //! Group simplification using meshoptimizer.
 //!
-//! Collapse ordering comes from meshoptimizer; the error of a group is not
-//! taken from it but measured by `deviation`.
+//! Collapse ordering and vertex placement come from meshoptimizer; the error
+//! stored for a group is not taken from it but measured by `deviation`.
 //!
 //! A group's triangles fall into two classes:
 //! * **anchored** geometry (connected surfaces that touch other groups, or big
-//!   open/non-manifold components): boundary, non-manifold edges and attribute
-//!   seams stay locked, so neighbouring groups never crack.
+//!   open/non-manifold components): group-boundary and non-manifold edges stay
+//!   locked (bit-exact), so neighbouring groups never crack. Everything else is
+//!   simplified with attribute-aware quadrics (normal, uv0, uv1, weighted into
+//!   object-space length, see [`AttrWeights`]) and every collapse places the
+//!   surviving vertex at the quadric optimum, updating its position and
+//!   attributes (`meshopt_simplifyWithUpdate`). Attribute seams are not
+//!   locked: the simplifier moves seam vertices only along their seam and
+//!   keeps all wedges of a vertex at one position. Simplification stops at the
+//!   group's error limit (see `dag`), so a hard region keeps its triangles
+//!   instead of being forced to the target.
 //! * **floating** pieces (small connected components that lie entirely inside
 //!   the group, e.g. needle/leaf cards, branch fragments): nothing outside the
 //!   group references them, so nothing is locked. They are reduced by edge
@@ -15,12 +23,15 @@
 //!   vertex clustering), so canopies coarsen into fewer/larger cards.
 //!
 //! Material sections are always simplified independently. Output references
-//! original vertices, preserving their attribute bytes and exact positions.
+//! existing vertices where they did not move and [`NewVertex`]es where the
+//! simplifier placed one.
 
-use crate::deviation::point_deviations;
+use crate::deviation::{uv_scale, Surface};
 use crate::math::{add, cross, dist, dot, edge_key, length, normalize, scale, sub, V3};
 use crate::mesh::{Tri, VertexStore};
-use std::collections::BTreeMap;
+use helio_vg_format::{VertexAttr, ATTR_STRIDE};
+use meshopt::SimplifyVertex;
+use std::collections::{BTreeMap, HashMap};
 
 /// A connected component with at most this many triangles that touches no
 /// other group is "floating".
@@ -47,12 +58,41 @@ const CARD_MAX_TRIS: usize = 6;
 /// cell radius is split further.
 const CELL_RADIUS_SPREAD: f32 = 2.0;
 
+/// Attribute record of a [`NewVertex`].
+#[derive(Clone, Copy, Debug)]
+pub enum NewAttr {
+    /// An existing record (index for [`VertexStore::attr`]).
+    Record(u32),
+    /// A record the simplifier computed.
+    Bytes([u8; ATTR_STRIDE as usize]),
+}
+
+/// Position id of a [`NewVertex`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewPid {
+    /// The vertex sits exactly on an existing vertex's position.
+    Existing(u32),
+    /// A new position; new vertices with the same wedge number share it
+    /// (wedges of one placed vertex). Numbered from 0 per group.
+    Wedge(u32),
+}
+
+/// A vertex placed by this simplification.
+#[derive(Clone, Copy, Debug)]
+pub struct NewVertex {
+    pub pos: V3,
+    pub attr: NewAttr,
+    pub pid: NewPid,
+    pub floating: bool,
+}
+
 pub struct SimplifyResult {
     pub tris: Vec<([u32; 3], u32)>,
-    /// Vertices created by this simplification (position, source vertex whose
-    /// attributes they use); output corners reference them as `vs.len() +
-    /// index`. Only card merging creates them, and all of them are floating.
-    pub new_verts: Vec<(V3, u32)>,
+    /// Vertices placed by this simplification; output corners reference them
+    /// as `vs.len() + index`.
+    pub new_verts: Vec<NewVertex>,
+    /// Number of distinct [`NewPid::Wedge`] positions in `new_verts`.
+    pub wedges: u32,
     /// Diagnostics: locked / total vertices of the input group.
     pub locked: usize,
     pub verts: usize,
@@ -112,20 +152,75 @@ impl GlobalEdges {
 
 // Include non-manifold multiplicities: locking vertices alone does not stop
 // a simplifier from removing a duplicate face incident to a locked edge.
-fn boundary_signature(vs: &VertexStore, tris: &[[u32; 3]], strict: bool) -> BTreeMap<u64, usize> {
+fn edge_counts(tris: &[[u32; 3]], pid: &dyn Fn(u32) -> u32) -> BTreeMap<u64, usize> {
     let mut edges = BTreeMap::new();
     for t in tris {
         for e in 0..3 {
             *edges
-                .entry(edge_key(
-                    vs.pid[t[e] as usize],
-                    vs.pid[t[(e + 1) % 3] as usize],
-                ))
+                .entry(edge_key(pid(t[e]), pid(t[(e + 1) % 3])))
                 .or_insert(0) += 1;
         }
     }
+    edges
+}
+
+fn boundary_signature(
+    tris: &[[u32; 3]],
+    pid: &dyn Fn(u32) -> u32,
+    strict: bool,
+) -> BTreeMap<u64, usize> {
+    let mut edges = edge_counts(tris, pid);
     edges.retain(|_, n| *n == 1 || (strict && *n > 2));
     edges
+}
+
+/// Number of edges used by more than two triangles.
+fn nonmanifold(tris: &[[u32; 3]], pid: &dyn Fn(u32) -> u32) -> usize {
+    edge_counts(tris, pid).values().filter(|&&n| n > 2).count()
+}
+
+/// Weights that turn attribute differences into object-space length, the
+/// unit of the position error, so the simplifier's combined error is the
+/// same quantity `deviation` measures and the error limit bounds:
+/// * normal: a tilt `t` (the chord `|n_a - n_b|`) acting over half an output
+///   edge displaces the shaded surface by `t * e / 2`. Output edges of a
+///   group simplified to half its triangles are `sqrt(2)` times the input's
+///   mean edge `m`, so the weight is `m / sqrt(2)`.
+/// * uv: object-space length per uv unit of the section
+///   (`sqrt(area / uv area)`, per channel), i.e. how far the texture slides
+///   along the surface.
+///
+/// Tangents carry no weight: they are re-derived from the normal when a
+/// record is written ([`VertexAttr::encode`]).
+struct AttrWeights([f32; ATTR_FLOATS]);
+
+/// Floats per vertex handed to the simplifier: normal xyz, uv0, uv1.
+const ATTR_FLOATS: usize = 7;
+
+impl AttrWeights {
+    fn of(vs: &VertexStore, section: &[[u32; 3]], surf: &Surface) -> Self {
+        let mut sum = 0.0f64;
+        for t in section {
+            let p = t.map(|v| vs.pos[v as usize]);
+            sum += f64::from(dist(p[0], p[1]) + dist(p[1], p[2]) + dist(p[2], p[0]));
+        }
+        let mean_edge = (sum / (3 * section.len().max(1)) as f64) as f32;
+        let n = mean_edge * std::f32::consts::FRAC_1_SQRT_2;
+        let [u0, u1] = uv_scale(section, surf);
+        Self([n, n, n, u0, u0, u1, u1])
+    }
+}
+
+fn attr_floats(a: &VertexAttr) -> [f32; ATTR_FLOATS] {
+    [
+        a.normal[0],
+        a.normal[1],
+        a.normal[2],
+        a.uv0[0],
+        a.uv0[1],
+        a.uv1[0],
+        a.uv1[1],
+    ]
 }
 
 fn find(p: &mut [u32], mut x: u32) -> u32 {
@@ -188,13 +283,12 @@ fn floating_flags(
         .collect()
 }
 
-/// Simplify a group to about `target` triangles with its boundary locked.
+/// Simplify a group toward `target` triangles with its boundary locked.
 ///
-/// `budget` is an object-space deviation allowance: input vertices that the
-/// result leaves further than `budget` from the simplified surface (typically
-/// the tips of thin spikes, whose quadric cost is deceptively low) are locked
-/// and the group is re-simplified, so one hard feature cannot make the whole
-/// group's error (and that of all its ancestors) explode.
+/// `limit` is the largest object-space error (position, and attributes in
+/// the same unit, see [`AttrWeights`]) any collapse may introduce; the
+/// simplifier stops there, so the result can keep more than `target`
+/// triangles (the caller decides whether that is progress).
 ///
 /// `whole` marks a single group covering every remaining cluster: there is no
 /// neighbour to crack against, so only open (single-use) edges are protected
@@ -203,13 +297,18 @@ fn floating_flags(
 /// `global` gives the level's open/non-manifold edge counts (needed to tell
 /// floating pieces from group-boundary geometry); `None` when the group is
 /// the whole level.
+///
+/// `attr` decodes a vertex's record when the mesh uses the format's attribute
+/// layout (`None` for opaque layouts: positions are then placed optimally and
+/// the record of the surviving vertex is kept).
 pub fn simplify_group(
     vs: &VertexStore,
     tris: &[Tri],
     target: usize,
-    budget: f32,
+    limit: f32,
     whole: bool,
     global: Option<&GlobalEdges>,
+    attr: Option<&(dyn Fn(u32) -> Option<VertexAttr> + Sync)>,
 ) -> SimplifyResult {
     let mut edges = Vec::with_capacity(tris.len() * 3);
     for t in tris {
@@ -221,6 +320,10 @@ pub fn simplify_group(
         }
     }
     edges.sort_unstable();
+    // Edges another group also uses (or non-manifold ones) lock their
+    // vertices: the neighbour must meet this group exactly. The mesh's own
+    // open border is locked too, so separate meshes placed edge to edge (a
+    // modular kit) keep meeting at every level of detail.
     let mut boundary = Vec::new();
     let mut i = 0;
     while i < edges.len() {
@@ -228,9 +331,11 @@ pub fn simplify_group(
         while end < edges.len() && edges[end] == edges[i] {
             end += 1;
         }
-        if end - i == 1 || (!whole && end - i > 2) {
-            boundary.push((edges[i] >> 32) as u32);
-            boundary.push(edges[i] as u32);
+        let n = end - i;
+        let shared = global.is_some_and(|g| g.count(edges[i]) != n as u32);
+        let ends = [(edges[i] >> 32) as u32, edges[i] as u32];
+        if shared || n == 1 || (!whole && n > 2) {
+            boundary.extend(ends);
         }
         i = end;
     }
@@ -250,8 +355,13 @@ pub fn simplify_group(
     for (t, &f) in tris.iter().zip(&floating) {
         sections.entry((t.mat, f)).or_default().push(t.v);
     }
+    let base0 = vs.len() as u32;
+    let mut placed = Placed {
+        base0,
+        verts: Vec::new(),
+        wedges: 0,
+    };
     let mut output = Vec::new();
-    let mut new_verts: Vec<(V3, u32)> = Vec::new();
     let mut merged_cards = false;
     let (mut n_locked, mut n_verts) = (0usize, 0usize);
     for ((material, is_floating), section) in sections {
@@ -285,106 +395,26 @@ pub fn simplify_group(
             }
             pinned.sort_unstable();
             pinned.dedup();
-            let (reduced, nv, merged) =
-                simplify_floating(vs, &section, want, &pinned, &mut new_verts);
+            let (reduced, nv, merged) = simplify_floating(vs, &section, want, &pinned, &mut placed);
             merged_cards |= merged;
             n_verts += nv;
             output.extend(reduced.into_iter().map(|t| (t, material)));
             continue;
         }
-        let mut ids: Vec<u32> = section.iter().flatten().copied().collect();
-        ids.sort_unstable();
-        ids.dedup();
-        let positions: Vec<_> = ids.iter().map(|&g| vs.pos[g as usize]).collect();
-        let mut locks: Vec<_> = ids
-            .iter()
-            .map(|&g| vs.seam[g as usize] || boundary.binary_search(&vs.pid[g as usize]).is_ok())
-            .collect();
-        n_locked += locks.iter().filter(|&&l| l).count();
-        n_verts += locks.len();
-        let indices: Vec<_> = section
-            .iter()
-            .flatten()
-            .map(|g| ids.binary_search(g).unwrap() as u32)
-            .collect();
-        let vertices = meshopt::VertexDataAdapter::new(bytemuck::cast_slice(&positions), 12, 0)
-            .expect("packed float3 positions");
-        let mut section_error = 0.0f32;
-        let expected = boundary_signature(vs, &section, !whole);
-        let nm_in = if whole { nonmanifold(vs, &section) } else { 0 };
-        let mut reduced = section.clone();
-        let mut budget_rounds = 0;
-        for _ in 0..16 {
-            let result = meshopt::simplify_with_locks(
-                &indices,
-                &vertices,
-                &locks,
-                want * 3,
-                f32::MAX,
-                meshopt::SimplifyOptions::LockBorder | meshopt::SimplifyOptions::ErrorAbsolute,
-                Some(&mut section_error),
-            );
-            reduced = result
-                .chunks_exact(3)
-                .map(|t| [ids[t[0] as usize], ids[t[1] as usize], ids[t[2] as usize]])
-                .collect();
-            let actual = boundary_signature(vs, &reduced, !whole);
-            if expected == actual
-                && !reduced.is_empty()
-                && (!whole || nonmanifold(vs, &reduced) <= nm_in)
-            {
-                budget_rounds += 1;
-                if budget.is_infinite() || budget_rounds > 3 {
-                    break;
-                }
-                let out: Vec<[V3; 3]> = reduced
-                    .iter()
-                    .map(|t| t.map(|v| vs.pos[v as usize]))
-                    .collect();
-                let dev = point_deviations(&positions, &out);
-                let mut any = false;
-                for (l, d) in locks.iter_mut().zip(dev) {
-                    if d > budget && !*l {
-                        *l = true;
-                        any = true;
-                    }
-                }
-                if !any {
-                    break;
-                }
-                continue;
-            }
-            // Freeze the one-ring around changed topology, then retry the
-            // original section. Preserve as much safe reduction as possible.
-            let mut affected = std::collections::BTreeSet::new();
-            for (&edge, count) in expected.iter().chain(actual.iter()) {
-                if expected.get(&edge) != actual.get(&edge) {
-                    let _ = count;
-                    affected.insert((edge >> 32) as u32);
-                    affected.insert(edge as u32);
-                }
-            }
-            for t in &section {
-                if t.iter().any(|&v| affected.contains(&vs.pid[v as usize])) {
-                    for v in t {
-                        locks[ids.binary_search(v).unwrap()] = true;
-                    }
-                }
-            }
-        }
-        if !reduced.is_empty()
-            && expected == boundary_signature(vs, &reduced, !whole)
-            && (!whole || nonmanifold(vs, &reduced) <= nm_in)
-        {
-            // The simplifier's own error estimate is ignored: the DAG builder
-            // measures the real deviation against the original surface
-            // (`deviation.rs`).
-            output.extend(reduced.into_iter().map(|t| (t, material)));
-        } else {
-            // Malformed/non-manifold input must retain its geometry instead
-            // of opening a crack between independently selected groups.
-            output.extend(section.into_iter().map(|t| (t, material)));
-        }
+        let (reduced, locked, verts) = simplify_anchored(
+            vs,
+            &section,
+            &edges,
+            want,
+            &boundary,
+            whole,
+            limit,
+            attr,
+            &mut placed,
+        );
+        n_locked += locked;
+        n_verts += verts;
+        output.extend(reduced.into_iter().map(|t| (t, material)));
     }
     // Dominance is by source pieces (small components of the input mesh), also when
     // some of them currently straddle a group border and stay anchored.
@@ -394,19 +424,292 @@ pub fn simplify_group(
     let coverage = (!merged_cards && src_floating * 10 >= tris.len() * 9).then(|| {
         let float_out: Vec<[u32; 3]> = output
             .iter()
-            .filter(|(t, _)| vs.floating[t[0] as usize])
+            .filter(|(t, _)| placed.floating(vs, t[0]))
             .map(|(t, _)| *t)
             .collect();
-        (!float_out.is_empty()).then(|| (float_out.len(), mean_footprint(vs, &float_out)))
+        (!float_out.is_empty()).then(|| (float_out.len(), placed.mean_footprint(vs, &float_out)))
     });
     SimplifyResult {
         tris: output,
-        new_verts,
+        new_verts: placed.verts,
+        wedges: placed.wedges,
         locked: n_locked,
         verts: n_verts,
         floating: n_floating,
         coverage_tris: coverage.flatten(),
     }
+}
+
+/// Vertices one group's simplification placed so far.
+struct Placed {
+    base0: u32,
+    verts: Vec<NewVertex>,
+    wedges: u32,
+}
+
+impl Placed {
+    fn pos(&self, vs: &VertexStore, v: u32) -> V3 {
+        if v >= self.base0 {
+            self.verts[(v - self.base0) as usize].pos
+        } else {
+            vs.pos[v as usize]
+        }
+    }
+
+    fn floating(&self, vs: &VertexStore, v: u32) -> bool {
+        if v >= self.base0 {
+            self.verts[(v - self.base0) as usize].floating
+        } else {
+            vs.floating[v as usize]
+        }
+    }
+
+    /// Position id for topology checks; placed positions get ids past every
+    /// existing one.
+    fn pid(&self, vs: &VertexStore, v: u32) -> u32 {
+        if v < self.base0 {
+            return vs.pid[v as usize];
+        }
+        match self.verts[(v - self.base0) as usize].pid {
+            NewPid::Existing(p) => p,
+            NewPid::Wedge(w) => vs.pid_count() + w,
+        }
+    }
+
+    /// Square root of the mean triangle area: the linear footprint of one
+    /// output triangle (thin needles count as thin, not as long).
+    fn mean_footprint(&self, vs: &VertexStore, tris: &[[u32; 3]]) -> f32 {
+        let mut s = 0.0f64;
+        for t in tris {
+            let p = t.map(|v| self.pos(vs, v));
+            s += 0.5 * f64::from(length(cross(sub(p[1], p[0]), sub(p[2], p[0]))));
+        }
+        (s / tris.len().max(1) as f64).sqrt() as f32
+    }
+}
+
+/// One anchored section: attribute-aware simplification with optimal vertex
+/// placement, verified crack-free. `boundary` are the position ids that must
+/// not move (shared with other groups, the open border, or non-manifold).
+/// Edges the section shares with the group's other material
+/// sections are locked too. Returns (triangles, locked vertices, vertices).
+#[allow(clippy::too_many_arguments)]
+fn simplify_anchored(
+    vs: &VertexStore,
+    section: &[[u32; 3]],
+    group_edges: &[u64],
+    want: usize,
+    boundary: &[u32],
+    whole: bool,
+    limit: f32,
+    attr: Option<&(dyn Fn(u32) -> Option<VertexAttr> + Sync)>,
+    placed: &mut Placed,
+) -> (Vec<[u32; 3]>, usize, usize) {
+    let mut ids: Vec<u32> = section.iter().flatten().copied().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let local = |g: &u32| ids.binary_search(g).unwrap() as u32;
+    let positions: Vec<V3> = ids.iter().map(|&g| vs.pos[g as usize]).collect();
+    let records: Option<Vec<VertexAttr>> =
+        attr.and_then(|attr| ids.iter().map(|&g| attr(g)).collect());
+    let (floats, weights): (Vec<f32>, Vec<f32>) = match (&records, attr) {
+        (Some(r), Some(attr)) => (
+            r.iter().flat_map(attr_floats).collect(),
+            AttrWeights::of(
+                vs,
+                section,
+                &Surface {
+                    pos: &vs.pos,
+                    attr,
+                    seam: &vs.seam,
+                },
+            )
+            .0
+            .to_vec(),
+        ),
+        _ => (Vec::new(), Vec::new()),
+    };
+    let stride = weights.len() * 4;
+    // Locked position ids: the group's boundary plus edges shared with other
+    // material sections of the group (simplified independently, they must
+    // still meet).
+    let orig_pid = |v: u32| vs.pid[v as usize];
+    let mut fixed: Vec<u32> = boundary.to_vec();
+    for (&key, &n) in &edge_counts(section, &orig_pid) {
+        let all =
+            group_edges.partition_point(|&e| e <= key) - group_edges.partition_point(|&e| e < key);
+        if all > n {
+            fixed.push((key >> 32) as u32);
+            fixed.push(key as u32);
+        }
+    }
+    fixed.sort_unstable();
+    fixed.dedup();
+    let is_fixed = |p: u32| fixed.binary_search(&p).is_ok();
+    let mut locks: Vec<SimplifyVertex> = ids
+        .iter()
+        .map(|&g| {
+            if is_fixed(vs.pid[g as usize]) {
+                SimplifyVertex::Lock
+            } else {
+                SimplifyVertex::None
+            }
+        })
+        .collect();
+    let n_locked = locks
+        .iter()
+        .filter(|l| l.contains(SimplifyVertex::Lock))
+        .count();
+    let indices: Vec<u32> = section.iter().flatten().map(local).collect();
+    // The locked edges must survive exactly: open (or non-manifold) edges
+    // between two locked vertices.
+    let protected = |tris: &[[u32; 3]], pid: &dyn Fn(u32) -> u32| {
+        let mut e = boundary_signature(tris, pid, !whole);
+        e.retain(|&k, _| is_fixed((k >> 32) as u32) && is_fixed(k as u32));
+        e
+    };
+    let expected = protected(section, &orig_pid);
+    let nm_in = if whole {
+        nonmanifold(section, &orig_pid)
+    } else {
+        0
+    };
+    // Existing positions of the section, so a placed vertex landing exactly
+    // on one shares its position id.
+    let existing: HashMap<[u32; 3], u32> = positions
+        .iter()
+        .zip(&ids)
+        .map(|(p, &g)| (p.map(f32::to_bits), vs.pid[g as usize]))
+        .collect();
+    let (mark_verts, mark_wedges) = (placed.verts.len(), placed.wedges);
+    for _ in 0..16 {
+        let mut idx = indices.clone();
+        let mut pos = positions.clone();
+        let mut att = floats.clone();
+        let n = meshopt::simplify_with_update(
+            &mut idx,
+            &mut pos,
+            &mut att,
+            &weights,
+            stride,
+            Some(&locks),
+            want * 3,
+            limit,
+            meshopt::SimplifyOptions::ErrorAbsolute,
+            None,
+        );
+        idx.truncate(n);
+        // Vertices whose position or attributes changed become new vertices;
+        // the rest keep their ids (and locked ones are bit-exact by contract).
+        let mut remap: HashMap<u32, u32> = HashMap::new();
+        let mut wedge_of: HashMap<[u32; 3], u32> = HashMap::new();
+        let mut out: Vec<[u32; 3]> = Vec::with_capacity(n / 3);
+        for t in idx.as_chunks::<3>().0 {
+            let mut tri = [0u32; 3];
+            for (k, &l) in t.iter().enumerate() {
+                let li = l as usize;
+                tri[k] = *remap.entry(l).or_insert_with(|| {
+                    let g = ids[li];
+                    let a = &att[li * weights.len()..(li + 1) * weights.len()];
+                    let a0 = &floats[li * weights.len()..(li + 1) * weights.len()];
+                    let moved = pos[li].map(f32::to_bits) != positions[li].map(f32::to_bits);
+                    let reshaded = a.iter().zip(a0).any(|(x, y)| x.to_bits() != y.to_bits());
+                    if locks[li].contains(SimplifyVertex::Lock) || (!moved && !reshaded) {
+                        return g;
+                    }
+                    let key = pos[li].map(f32::to_bits);
+                    let pid = match existing.get(&key) {
+                        Some(&p) => NewPid::Existing(p),
+                        None => {
+                            let next = placed.wedges;
+                            let w = *wedge_of.entry(key).or_insert(next);
+                            if w == next {
+                                placed.wedges += 1;
+                            }
+                            NewPid::Wedge(w)
+                        }
+                    };
+                    let rec = match &records {
+                        Some(r) if reshaded => {
+                            let base = r[li];
+                            NewAttr::Bytes(
+                                VertexAttr {
+                                    normal: [a[0], a[1], a[2]],
+                                    uv0: [a[3], a[4]],
+                                    uv1: [a[5], a[6]],
+                                    ..base
+                                }
+                                .encode(),
+                            )
+                        }
+                        _ => NewAttr::Record(vs.attr[g as usize]),
+                    };
+                    placed.verts.push(NewVertex {
+                        pos: pos[li],
+                        attr: rec,
+                        pid,
+                        floating: vs.floating[g as usize],
+                    });
+                    placed.base0 + placed.verts.len() as u32 - 1
+                });
+            }
+            out.push(tri);
+        }
+        let pid = |v: u32| placed.pid(vs, v);
+        let actual = protected(&out, &pid);
+        // Any other open edge is a hole.
+        let border_ok = |v: u32| v < placed.base0 && is_fixed(vs.pid[v as usize]);
+        let open_edges = edge_counts(&out, &pid);
+        // Source vertex of every output vertex (placed ones: the slot they
+        // came from).
+        let source: HashMap<u32, u32> = remap.iter().map(|(&l, &o)| (o, ids[l as usize])).collect();
+        let mut hole_pids: Vec<u32> = Vec::new();
+        for t in &out {
+            for e in 0..3 {
+                let (a, b) = (t[e], t[(e + 1) % 3]);
+                if open_edges[&edge_key(pid(a), pid(b))] == 1 && !(border_ok(a) && border_ok(b)) {
+                    hole_pids.extend([a, b].map(|v| vs.pid[source[&v] as usize]));
+                }
+            }
+        }
+        let holes = !hole_pids.is_empty();
+        if expected == actual
+            && !holes
+            && !out.is_empty()
+            && (!whole || nonmanifold(&out, &pid) <= nm_in)
+        {
+            return (out, n_locked, ids.len());
+        }
+        placed.verts.truncate(mark_verts);
+        placed.wedges = mark_wedges;
+        // Freeze the one-ring around changed topology (around a hole, the
+        // one-ring of every triangle the hole touches), then retry the original
+        // section. Preserve as much safe reduction as possible.
+        let mut affected = std::collections::BTreeSet::new();
+        for edge in expected.keys().chain(actual.keys()) {
+            if expected.get(edge) != actual.get(edge) {
+                affected.insert((edge >> 32) as u32);
+                affected.insert(*edge as u32);
+            }
+        }
+        affected.extend(hole_pids);
+        let mut changed = false;
+        for t in section {
+            if t.iter().any(|&w| affected.contains(&vs.pid[w as usize])) {
+                for v in t {
+                    let l = &mut locks[local(v) as usize];
+                    changed |= !l.contains(SimplifyVertex::Lock);
+                    *l = SimplifyVertex::Lock;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Malformed/non-manifold input must retain its geometry instead of
+    // opening a crack between independently selected groups.
+    (section.to_vec(), n_locked, ids.len())
 }
 
 /// Floating pieces of one material section, reduced to about `want` triangles.
@@ -418,7 +721,7 @@ fn simplify_floating(
     section: &[[u32; 3]],
     want: usize,
     pinned: &[u32],
-    new_verts: &mut Vec<(V3, u32)>,
+    placed: &mut Placed,
 ) -> (Vec<[u32; 3]>, usize, bool) {
     // Connected pieces (by canonical position id).
     let mut pids: Vec<u32> = section
@@ -478,8 +781,7 @@ fn simplify_floating(
         verts += n;
         out.extend(t);
     }
-    let base0 = vs.len() as u32;
-    let merged = merge_cards(vs, &cards, want_cards, base0, new_verts);
+    let merged = merge_cards(vs, &cards, want_cards, placed);
     verts += merged.len() * 2;
     out.extend(merged);
     (out, verts, true)
@@ -610,8 +912,7 @@ fn merge_cards(
     vs: &VertexStore,
     pieces: &[Vec<[u32; 3]>],
     want_cards: usize,
-    base0: u32,
-    new_verts: &mut Vec<(V3, u32)>,
+    placed: &mut Placed,
 ) -> Vec<[u32; 3]> {
     let cards: Vec<Card> = pieces.iter().filter_map(|p| describe_card(vs, p)).collect();
     let mut cells: Vec<Vec<usize>> = Vec::new();
@@ -757,7 +1058,7 @@ fn merge_cards(
             add(add(centre, a), b),
             add(sub(centre, a), b),
         ];
-        let first = base0 + new_verts.len() as u32;
+        let first = placed.base0 + placed.verts.len() as u32;
         let signs = [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
         for (p, (sa, sb)) in corners.into_iter().zip(signs) {
             // Attribute bytes (normal, uv, ...) of all four corners come from ONE
@@ -775,7 +1076,13 @@ fn merge_cards(
                     best = (score, v);
                 }
             }
-            new_verts.push((p, vs.attr[best.1 as usize]));
+            placed.verts.push(NewVertex {
+                pos: p,
+                attr: NewAttr::Record(vs.attr[best.1 as usize]),
+                pid: NewPid::Wedge(placed.wedges),
+                floating: true,
+            });
+            placed.wedges += 1;
         }
         out.push([first, first + 1, first + 2]);
         out.push([first, first + 2, first + 3]);
@@ -842,35 +1149,4 @@ fn collapse_floating(
         return (section.to_vec(), ids.len());
     }
     (out, ids.len())
-}
-
-/// Number of edges used by more than two triangles.
-fn nonmanifold(vs: &VertexStore, tris: &[[u32; 3]]) -> usize {
-    let mut edges = BTreeMap::new();
-    for t in tris {
-        for e in 0..3 {
-            *edges
-                .entry(edge_key(
-                    vs.pid[t[e] as usize],
-                    vs.pid[t[(e + 1) % 3] as usize],
-                ))
-                .or_insert(0usize) += 1;
-        }
-    }
-    edges.values().filter(|&&n| n > 2).count()
-}
-
-/// Square root of the mean triangle area: the linear footprint of one output
-/// triangle (thin needles count as thin, not as long).
-fn mean_footprint(vs: &VertexStore, tris: &[[u32; 3]]) -> f32 {
-    let mut s = 0.0f64;
-    for t in tris {
-        let p = t.map(|v| vs.pos[v as usize]);
-        s += 0.5
-            * crate::math::length(crate::math::cross(
-                crate::math::sub(p[1], p[0]),
-                crate::math::sub(p[2], p[0]),
-            )) as f64;
-    }
-    (s / tris.len().max(1) as f64).sqrt() as f32
 }
