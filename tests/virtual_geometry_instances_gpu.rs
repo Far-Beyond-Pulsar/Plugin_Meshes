@@ -5,9 +5,11 @@
 // The plugin as a game links it: its root, with every registration.
 use meshes_plugin as _;
 
+use bytemuck::Zeroable;
 use helio_core::{
     BufferHandle, BufferKey, SceneBufferProjection, SceneDerivation, SceneDerivationContext,
 };
+use helio_mesh_api::{INSTANCE_FLAG_VIRTUAL_GEOMETRY, StaticObjectRow};
 use helio_vg_format::{
     GpuVgInstance, INST_CONE_CULL, INST_ENABLED, INST_FORCE_ROOT_ONLY, INST_LOD_SUPPRESS,
     INST_SHADOW_CASTER, INST_TIER_SHIFT, TierLock,
@@ -92,23 +94,19 @@ fn read<T: bytemuck::Pod>(
     out
 }
 
-/// A `static_objects` row (60 words): mesh slot, generation, and a model
-/// matrix with the given axis scales.
-fn object_row(slot: u32, mesh_generation: u32, scale: [f32; 3]) -> [u32; 60] {
-    let mut row = [0u32; 60];
-    row[0] = slot;
-    row[1] = mesh_generation;
-    let model = [
+/// A `static_objects` row: mesh slot, generation, a model matrix with the
+/// given axis scales, and the instance's virtual-geometry choice.
+fn object_row(slot: u32, mesh_generation: u32, scale: [f32; 3]) -> StaticObjectRow {
+    let mut row = StaticObjectRow::zeroed();
+    row.mesh_slot = slot;
+    row.mesh_generation = mesh_generation;
+    row.transform = [
         [scale[0], 0.0, 0.0, 0.0],
         [0.0, scale[1], 0.0, 0.0],
         [0.0, 0.0, scale[2], 0.0],
         [0.0, 0.0, 0.0, 1.0],
     ];
-    for (column, values) in model.iter().enumerate() {
-        for (component, value) in values.iter().enumerate() {
-            row[4 + column * 4 + component] = value.to_bits();
-        }
-    }
+    row.flags = INSTANCE_FLAG_VIRTUAL_GEOMETRY;
     row
 }
 
@@ -116,9 +114,10 @@ struct Scene {
     projection: SceneBufferProjection,
 }
 
-/// Eight mesh instances (rows 0..8 own objects 10..18), VG components at
-/// entity rows 20 (object 14, disabled) and 21 (object 11, SW tier, root only,
-/// error scale 2).
+/// Eight mesh instances (rows 0..8 own objects 10..18); instance 4 does not
+/// ask for virtual geometry. VG components at entity rows 20 (object 14,
+/// tuning only: it does not make instance 4 active) and 21 (object 11, SW
+/// tier, root only, error scale 2).
 fn scene(device: &wgpu::Device, queue: &wgpu::Queue, asset_generation: u64) -> Scene {
     let keys = VgInstanceKeys::standard();
     let owner = |object: u32| [object, 7u32, 1u32];
@@ -135,8 +134,9 @@ fn scene(device: &wgpu::Device, queue: &wgpu::Queue, asset_generation: u64) -> S
     let vertex_offsets = [100u32, 200, 300, 100, 100, 999, 100, 100];
     let vertex_handles: Vec<[u32; 2]> = vertex_offsets.iter().map(|&o| [o, 24]).collect();
 
-    let mut objects: Vec<[u32; 60]> = (0..8).map(|i| object_row(i, 8, [1.0; 3])).collect();
+    let mut objects: Vec<StaticObjectRow> = (0..8).map(|i| object_row(i, 8, [1.0; 3])).collect();
     objects[3] = object_row(3, 8, [-1.0, 1.0, 1.0]); // mirrored
+    objects[4].flags = 0; // virtual geometry off for this instance
     objects[6] = object_row(6, 8, [1.0, 2.0, 1.0]); // non-uniform
     objects[7] = object_row(7, 0, [1.0; 3]); // not placed by the join
 
@@ -148,10 +148,9 @@ fn scene(device: &wgpu::Device, queue: &wgpu::Queue, asset_generation: u64) -> S
             flags: 0,
             lod_error_scale: 1.0,
         },
+        // Component rows never carry `INST_ENABLED`; the derivation adds it.
         VgOverrideGpu {
-            flags: INST_ENABLED
-                | INST_FORCE_ROOT_ONLY
-                | ((TierLock::SwRaster as u32) << INST_TIER_SHIFT),
+            flags: INST_FORCE_ROOT_ONLY | ((TierLock::SwRaster as u32) << INST_TIER_SHIFT),
             lod_error_scale: 2.0,
         },
     ];
@@ -248,7 +247,7 @@ fn ready_placed_enabled_instances_become_active_with_derived_flags() {
     assert!(recorded);
 
     // Instances 0, 1, 3 and 6 are active, in instance order. 2: asset not
-    // ready, 4: component disabled, 5: asset unknown, 7: not placed.
+    // ready, 4: virtual geometry off, 5: asset unknown, 7: not placed.
     assert_eq!(rows.len(), 4, "{rows:?}");
 
     // Every instance has one section (`section_handles`), carried in the flags.

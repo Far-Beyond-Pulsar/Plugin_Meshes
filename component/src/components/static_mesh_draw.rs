@@ -85,13 +85,16 @@ impl StaticMeshDraw {
                 _pad: 0,
             })
             .collect();
+        let mut flags = 0;
+        if helio::Movability::from(mesh.movability).can_move() {
+            flags |= helio_mesh_api::INSTANCE_FLAG_MOVABLE;
+        }
+        if mesh.virtual_geometry {
+            flags |= helio_mesh_api::INSTANCE_FLAG_VIRTUAL_GEOMETRY;
+        }
         Self {
             bounds_local: mesh.bounds_local,
-            flags: if helio::Movability::from(mesh.movability).can_move() {
-                helio_mesh_api::INSTANCE_FLAG_MOVABLE
-            } else {
-                0
-            },
+            flags,
             sections,
         }
     }

@@ -220,6 +220,7 @@ mod tests {
                 indices: vec![0, 1, 2],
             })
             .unwrap(),
+            settings: Default::default(),
         };
         let dir = std::env::temp_dir().join(format!("mesh-thumb-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

@@ -205,6 +205,10 @@ fn the_draw_rows_match_the_rust() {
         ("INSTANCE_FLAG_MOVABLE", INSTANCE_FLAG_MOVABLE),
         ("INSTANCE_FLAG_SKINNED", INSTANCE_FLAG_SKINNED),
         (
+            "INSTANCE_FLAG_VIRTUAL_GEOMETRY",
+            INSTANCE_FLAG_VIRTUAL_GEOMETRY,
+        ),
+        (
             "INSTANCE_FLAG_CLASSIC_SUPPRESSED",
             INSTANCE_FLAG_CLASSIC_SUPPRESSED,
         ),

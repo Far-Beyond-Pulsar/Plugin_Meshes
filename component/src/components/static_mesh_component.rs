@@ -1134,6 +1134,19 @@ pub struct StaticMeshComponent {
     #[serde(default)]
     pub movability: helio_component::components::ObjectMovability,
 
+    /// Render this instance through virtual geometry (cluster LOD streaming)
+    /// instead of the classic mesh path. Taken from the mesh asset's own
+    /// setting when the component is placed for it or pointed at another
+    /// mesh, then edited per instance. It sets the instance's
+    /// `INSTANCE_FLAG_VIRTUAL_GEOMETRY` draw flag; the instance draws
+    /// classically until the mesh's cluster data is built and resident, and
+    /// whenever the project's virtual geometry mode is Off. Levels saved
+    /// before it load with it off. Tuning (tier, error scale) is the owner's
+    /// optional `VirtualGeometryComponent`.
+    #[property]
+    #[serde(default)]
+    pub virtual_geometry: bool,
+
     /// The mesh asset `mesh_asset` names, as the world resolves it
     /// (SceneDB#84): set from `mesh_asset` when a value is decoded or
     /// `mesh_asset` is written, never authored or saved. The world loads it
@@ -1256,14 +1269,38 @@ impl StaticMeshComponent {
     /// A component showing the mesh asset at the project-relative `path`, as
     /// decoding `{"mesh_asset": path}` would give. Its geometry is bound once
     /// it is in a world and the world has loaded the mesh.
+    /// Its asset-level settings (virtual geometry) are taken from the mesh
+    /// file now, as when the mesh is placed in a level.
     pub fn for_mesh_asset(path: &str) -> Self {
         let mut component = Self {
             mesh_asset: MeshAssetPath::new(path),
             ..Default::default()
         };
         attach_mesh_asset(&mut component);
+        seed_from_asset_settings(&mut component);
         component
     }
+}
+
+/// The asset-level defaults of the mesh `mesh_asset` names (a header and
+/// metadata read, never the geometry). Defaults for no mesh, a generated
+/// mesh, or no project.
+pub fn mesh_asset_settings(mesh_asset: &MeshAssetPath) -> crate::mesh_cache::MeshAssetSettings {
+    let path = mesh_asset.as_str().trim();
+    if path.is_empty() || mesh_asset.generated_content_id().is_some() {
+        return Default::default();
+    }
+    let Some(project_root) = engine_state::get_project_path() else {
+        return Default::default();
+    };
+    crate::mesh_cache::read_asset_settings(std::path::Path::new(&mesh_source(&project_root, path)))
+}
+
+/// Take the per-instance properties the mesh asset provides defaults for.
+/// Done when the component is placed for a mesh or pointed at another one,
+/// never when a saved component loads (its own values win).
+fn seed_from_asset_settings(component: &mut StaticMeshComponent) {
+    component.virtual_geometry = mesh_asset_settings(&component.mesh_asset).virtual_geometry;
 }
 
 /// `StaticMeshComponent`'s JSON boundary decoder (Pulsar-Native#561 Phase
@@ -1278,11 +1315,18 @@ fn decode_static_mesh_component(data: &serde_json::Value) -> Result<StaticMeshCo
 
 /// `property_written` hook: a reflected write that changed `mesh_asset`
 /// (the properties panel's mesh picker, a script) points the component at
-/// the newly named mesh asset; the world loads and binds it. Writes to any
-/// other property change nothing here.
+/// the newly named mesh asset, which the world loads and binds, and takes
+/// that asset's defaults (virtual geometry). A whole-value write (`None`)
+/// rebinds but keeps the value's own settings. Writes to any other property
+/// change nothing here.
 fn static_mesh_property_written(component: &mut StaticMeshComponent, property: Option<&str>) {
-    if matches!(property, None | Some("mesh_asset")) {
-        attach_mesh_asset(component);
+    match property {
+        None => attach_mesh_asset(component),
+        Some("mesh_asset") => {
+            attach_mesh_asset(component);
+            seed_from_asset_settings(component);
+        }
+        _ => {}
     }
 }
 
