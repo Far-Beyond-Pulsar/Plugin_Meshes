@@ -206,7 +206,6 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
     };
     let mut level = 0u32;
     while cur.len() > 1 {
-        let t_level = std::time::Instant::now();
         let groups = partition(&dag.vs, &cur, &dag.clusters, group_cap);
         // A group that covers everything left has no interior boundary to
         // protect.
@@ -309,7 +308,6 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
             break;
         }
 
-        let t_simplify = t_level.elapsed();
         // Serial: allocate the placed vertices (ids must not depend on thread
         // scheduling) and translate output corners to global ids.
         let base0 = dag.vs.len() as u32;
@@ -471,13 +469,6 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
             })
             .collect();
 
-        if std::env::var("VG_TIME").is_ok() {
-            eprintln!(
-                "T level {level} simplify {:?} total-before-assemble {:?}",
-                t_simplify,
-                t_level.elapsed()
-            );
-        }
         let mut next: Vec<u32> = Vec::with_capacity(cur.len());
         for ((((members, pieces), meas), cov), st) in groups
             .into_iter()

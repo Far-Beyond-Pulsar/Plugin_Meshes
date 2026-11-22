@@ -640,3 +640,60 @@ fn stored_error_bounds_dense_deviation_on_spikes_and_noise() {
         worst.0
     );
 }
+
+/// Records in the format's layout with area-weighted vertex normals (uvs
+/// zero), as a scanned mesh arrives at the builder.
+fn normal_records(pos: &[V3], idx: &[u32]) -> Vec<u8> {
+    let mut n = vec![[0.0f32; 3]; pos.len()];
+    for t in idx.chunks_exact(3) {
+        let [a, b, c] = [0, 1, 2].map(|k| pos[t[k] as usize]);
+        let (e1, e2) = (
+            [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+            [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+        );
+        let f = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+        for &v in t {
+            for k in 0..3 {
+                n[v as usize][k] += f[k];
+            }
+        }
+    }
+    n.iter()
+        .flat_map(|&normal| {
+            helio_vg_format::VertexAttr {
+                normal,
+                tangent: [1.0, 0.0, 0.0],
+                bitangent_sign: 1.0,
+                uv0: [0.0; 2],
+                uv1: [0.0; 2],
+            }
+            .encode()
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "measurement harness over a local GLB with vertex normals (VG_GLB)"]
+fn harness_glb_with_normals() {
+    let path = std::env::var("VG_GLB").expect("VG_GLB=<path to .glb>");
+    let (pos, idx) = load_glb(&path);
+    let attrs = normal_records(&pos, &idx);
+    let t = std::time::Instant::now();
+    let dag = build_dag(&MeshInput {
+        positions: &pos,
+        attributes: &attrs,
+        attribute_stride: helio_vg_format::ATTR_STRIDE as usize,
+        indices: &idx,
+        tri_material: &[],
+    })
+    .unwrap();
+    println!(
+        "dag build with normals {:?} ({} clusters)",
+        t.elapsed(),
+        dag.clusters.len()
+    );
+}

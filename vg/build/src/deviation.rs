@@ -362,10 +362,21 @@ pub struct Measured {
 /// ([`split_bound`]); and the corners' distances plus `t`'s covering radius.
 /// Any plane gives a valid bound; the one between the
 /// candidates' regions makes it tight where `t` straddles their shared edge.
-fn tri_bound(grid: &TriGrid, t: [V3; 3]) -> (f32, f32, [u32; 4]) {
+fn tri_bound(grid: &TriGrid, t: [V3; 3], enough: f32) -> (f32, f32, [u32; 4]) {
     let c = scale(add(add(t[0], t[1]), t[2]), 1.0 / 3.0);
     let q = [t[0], t[1], t[2], c].map(|p| grid.nearest(p));
     let lower = q.iter().fold(0.0f32, |m, x| m.max(x.0));
+    // Distance is 1-Lipschitz and every point of a triangle lies within
+    // longest edge / sqrt(3) of a corner, so the corners' distances bound it
+    // too. On a triangle small against the error this already suffices; it
+    // also closes small pieces around the other surface's vertices, where
+    // several candidates meet.
+    let longest = dist(t[0], t[1]).max(dist(t[1], t[2])).max(dist(t[2], t[0]));
+    let corners = q[..3].iter().fold(0.0f32, |m, x| m.max(x.0));
+    let lipschitz = (corners + longest * FRAC_1_SQRT_3).max(lower);
+    if lipschitz <= enough {
+        return (lower, lipschitz, q.map(|x| x.1));
+    }
     let mut cand: Vec<u32> = q.iter().map(|x| x.1).collect();
     cand.sort_unstable();
     cand.dedup();
@@ -382,8 +393,8 @@ fn tri_bound(grid: &TriGrid, t: [V3; 3]) -> (f32, f32, [u32; 4]) {
         }
     }
     // Fans around the candidates' vertices near `t`, while still loose.
-    let longest = dist(t[0], t[1]).max(dist(t[1], t[2])).max(dist(t[2], t[0]));
-    if upper.sqrt() > lower * (1.0 + REFINE_SLACK) {
+    let loose = |u: f32| u.sqrt() > (lower * (1.0 + REFINE_SLACK)).max(enough);
+    if loose(upper) {
         let mut tried: Vec<[u32; 3]> = Vec::new();
         for &a in &cand {
             for v in grid.tris[a as usize] {
@@ -399,15 +410,12 @@ fn tri_bound(grid: &TriGrid, t: [V3; 3]) -> (f32, f32, [u32; 4]) {
                 if let Some(b) = fan_bound(t, v, &fan) {
                     upper = upper.min(b);
                 }
+                if !loose(upper) {
+                    break;
+                }
             }
         }
     }
-    // Distance is 1-Lipschitz and every point of a triangle lies within
-    // longest edge / sqrt(3) of a corner, so the corners' distances bound it too;
-    // this is what closes small pieces around the other surface's vertices,
-    // where several candidates meet.
-    let corners = q[..3].iter().fold(0.0f32, |m, x| m.max(x.0));
-    let lipschitz = corners + longest * FRAC_1_SQRT_3;
     (
         lower,
         upper.sqrt().min(lipschitz).max(lower),
@@ -599,18 +607,26 @@ fn clip(poly: &[V3], o: V3, m: V3) -> Vec<V3> {
 }
 
 /// Tighten the bound of `t` by midpoint subdivision until it is below `goal`
-/// or the depth runs out; always an upper bound.
+/// or the depth runs out; always an upper bound. The goal rises to what `t`
+/// is already known to reach (its sampled distance, then each finished
+/// piece's bound): the maximum over `t` is at least that, so proving any
+/// piece tighter is wasted, and a triangle that genuinely exceeds the goal
+/// does not subdivide all the way down.
 fn refine(grid: &TriGrid, t: [V3; 3], depth: u32, goal: f32) -> f32 {
-    let (_, upper, _) = tri_bound(grid, t);
+    let (lower, upper, _) = tri_bound(grid, t, goal);
+    let mut goal = goal.max(lower * (1.0 + REFINE_SLACK));
     if upper <= goal || depth == 0 {
         return upper;
     }
     let m = |a: V3, b: V3| scale(add(a, b), 0.5);
     let (ab, bc, ca) = (m(t[0], t[1]), m(t[1], t[2]), m(t[2], t[0]));
-    [[t[0], ab, ca], [ab, t[1], bc], [ca, bc, t[2]], [ab, bc, ca]]
-        .into_iter()
-        .map(|c| refine(grid, c, depth - 1, goal))
-        .fold(0.0f32, f32::max)
+    let mut worst = 0.0f32;
+    for c in [[t[0], ab, ca], [ab, t[1], bc], [ca, bc, t[2]], [ab, bc, ca]] {
+        let r = refine(grid, c, depth - 1, goal);
+        worst = worst.max(r);
+        goal = goal.max(r);
+    }
+    worst
 }
 
 /// Two-sided distance bound: from the triangles `a` to the surface of
@@ -625,8 +641,16 @@ fn hausdorff(
     a_grid: &TriGrid,
 ) -> (f32, Vec<[u32; 4]>, Vec<[u32; 4]>) {
     use rayon::prelude::*;
-    let fwd: Vec<(f32, f32, [u32; 4])> = a.par_iter().map(|&t| tri_bound(b_grid, t)).collect();
-    let back: Vec<(f32, f32, [u32; 4])> = b.par_iter().map(|&t| tri_bound(a_grid, t)).collect();
+    // First the samples and the cheap (Lipschitz) bound of every triangle,
+    // which give the group's sampled maximum ...
+    let mut fwd: Vec<(f32, f32, [u32; 4])> = a
+        .par_iter()
+        .map(|&t| tri_bound(b_grid, t, f32::INFINITY))
+        .collect();
+    let mut back: Vec<(f32, f32, [u32; 4])> = b
+        .par_iter()
+        .map(|&t| tri_bound(a_grid, t, f32::INFINITY))
+        .collect();
     let lower = fwd.iter().chain(&back).fold(0.0f32, |m, x| m.max(x.0));
     // A bound tighter than a small fraction of the simplified triangles' own
     // size is never worth proving (see `REFINE_FLOOR`).
@@ -638,6 +662,19 @@ fn hausdorff(
         (sum / (3 * b.len().max(1)) as f64) as f32
     };
     let noise = REFINE_FLOOR * mean_edge;
+    // ... then the exact candidate bounds only where the cheap one does not
+    // already stay under it.
+    let goal0 = (lower * (1.0 + REFINE_SLACK)).max(noise);
+    for (tris, bounds, grid) in [(a, &mut fwd, b_grid), (b, &mut back, a_grid)] {
+        bounds
+            .par_iter_mut()
+            .zip(tris.par_iter())
+            .for_each(|(x, &t)| {
+                if x.1 > goal0 {
+                    *x = tri_bound(grid, t, goal0);
+                }
+            });
+    }
     // Branch and bound: refine the loosest triangles first. Whatever they
     // prove becomes the bound every later triangle only has to stay under, so
     // most never need refining. Triangles are refined in fixed batches, each
@@ -736,7 +773,6 @@ pub fn measure(
             piece_claimed,
         };
     }
-    let t0 = std::time::Instant::now();
     let tri_of = |i: u32| original[i as usize].map(|v| pos[v as usize]);
     let s_tris: Vec<[V3; 3]> = s_ids.iter().map(|t| t.map(|v| pos[v as usize])).collect();
     let o_tris: Vec<[V3; 3]> = region.owned.iter().map(|&i| tri_of(i)).collect();
@@ -744,9 +780,7 @@ pub fn measure(
     let s_grid = TriGrid::new(s_tris.clone());
     let sn_grid = TriGrid::new(s_tris.iter().chain(neighbours).copied().collect());
     let t_grid = TriGrid::new(targets.iter().map(|&i| tri_of(i)).collect());
-    let t1 = t0.elapsed();
     let (position, o_near, s_near) = hausdorff(&o_tris, &sn_grid, &s_tris, &t_grid);
-    let t2 = t0.elapsed();
     // Every owned original goes to the piece of the simplified triangle
     // nearest its centroid. Every simplified triangle also claims the
     // originals nearest its corners and centroid: a small simplified triangle
@@ -826,16 +860,6 @@ pub fn measure(
             }
             shading = shading.max(len);
         }
-    }
-    if std::env::var("VG_TIME").is_ok() {
-        eprintln!(
-            "M grids {t1:?} hausdorff {:?} total {:?} owned {} targets {} s {}",
-            t2 - t1,
-            t0.elapsed(),
-            region.owned.len(),
-            targets.len(),
-            s_tris.len()
-        );
     }
     Measured {
         position,
