@@ -332,7 +332,7 @@ fn run(s: &Setup, double_sided: bool, flip_front: bool, with_tables: bool) -> Ve
         VIEW[0] as u64 * VIEW[1] as u64 * 8,
     );
     let words: &[u32] = cast_slice(&raw);
-    words.chunks(2).map(|c| (c[0], c[1])).collect()
+    words.chunks(2).map(dense_key_words).collect()
 }
 
 fn judge(label: &str, keys: &[(u32, u32)], front_everywhere: bool, back_everywhere: bool) {
