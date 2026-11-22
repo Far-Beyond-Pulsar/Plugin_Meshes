@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 helio-vg-format = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 rayon = "1"
-meshopt = "=0.6.2"
+meshopt = "=0.7.0"
 
 [dev-dependencies]
 serde_json = { workspace = true }
