@@ -217,7 +217,6 @@ impl RenderHostPart for MeshesHostPart {
             self.ray_scene = match crate::ray_scene::WorldRayScene::new(
                 renderer.device().clone(),
                 renderer.queue().clone(),
-                Some(self.virtual_geometry.runtime().clone()),
             ) {
                 Some(rays) => RayScene::Ready(Box::new(rays)),
                 None => {
