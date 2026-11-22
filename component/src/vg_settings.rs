@@ -65,44 +65,6 @@ impl VirtualGeometryMode {
     }
 }
 
-/// Which debug visualisation the virtual-geometry passes show.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum VirtualGeometryDebugView {
-    #[default]
-    None,
-    Cluster,
-    Lod,
-    Tier,
-    OverlapHeatmap,
-    Overdraw,
-}
-
-impl VirtualGeometryDebugView {
-    pub const ALL: [Self; 6] = [
-        Self::None,
-        Self::Cluster,
-        Self::Lod,
-        Self::Tier,
-        Self::OverlapHeatmap,
-        Self::Overdraw,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Cluster => "cluster",
-            Self::Lod => "lod",
-            Self::Tier => "tier",
-            Self::OverlapHeatmap => "overlap_heatmap",
-            Self::Overdraw => "overdraw",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|view| view.as_str() == value)
-    }
-}
-
 /// Typed view of the `project.virtual_geometry` namespace.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VirtualGeometrySettings {
@@ -132,7 +94,6 @@ pub struct VirtualGeometrySettings {
     /// not pay there (see VG_STRESS.md, "Tier 3 measurements"). Enabled but idle
     /// it costs under 0.02 ms.
     pub tier3: bool,
-    pub debug_view: VirtualGeometryDebugView,
     /// Error bound of a mesh's fallback, as a fraction of its bounding
     /// radius: the classic stand-in an instance keeps on the GPU while its
     /// full classic geometry is released (drawn until its virtual geometry
@@ -153,7 +114,6 @@ impl Default for VirtualGeometrySettings {
             max_visible_clusters: 4_194_304,
             two_phase_occlusion: true,
             tier3: false,
-            debug_view: VirtualGeometryDebugView::None,
             fallback_relative_error: helio_vg_stream::ProxyOptions::DEFAULT_RELATIVE_ERROR,
         }
     }
@@ -210,9 +170,6 @@ impl VirtualGeometrySettings {
             tier3: get("tier3")
                 .and_then(|value| value.as_bool().ok())
                 .unwrap_or(defaults.tier3),
-            debug_view: text("debug_view")
-                .and_then(|value| VirtualGeometryDebugView::parse(&value))
-                .unwrap_or(defaults.debug_view),
             fallback_relative_error: get("fallback_relative_error")
                 .and_then(|value| value.as_float().ok())
                 .map_or(defaults.fallback_relative_error, |value| value as f32),
@@ -446,25 +403,6 @@ pub fn schema() -> NamespaceSchema {
             f64::from(fallback_max),
         )),
     )
-    .setting(
-        "debug_view",
-        SchemaEntry::new(
-            "Visualise virtual geometry internals",
-            defaults.debug_view.as_str(),
-        )
-        .label("Debug View")
-        .page("Rendering / Virtual Geometry")
-        .field_type(FieldType::Dropdown {
-            options: choices([
-                ("None", "none"),
-                ("Clusters", "cluster"),
-                ("Level of detail", "lod"),
-                ("Raster tier", "tier"),
-                ("Overlap heatmap", "overlap_heatmap"),
-                ("Overdraw", "overdraw"),
-            ]),
-        }),
-    )
 }
 
 pub fn register(cfg: &'static ConfigManager) {
@@ -498,14 +436,12 @@ mod tests {
             ("tau_pixels", ConfigValue::from(2.5_f64)),
             ("page_budget_mb", ConfigValue::from(1024_i64)),
             ("two_phase_occlusion", ConfigValue::from(false)),
-            ("debug_view", ConfigValue::from("tier")),
             ("max_visible_clusters", ConfigValue::from("many")),
         ]));
         assert_eq!(settings.mode, VirtualGeometryMode::ForceHwRaster);
         assert_eq!(settings.tau_pixels, 2.5);
         assert_eq!(settings.page_budget_mb, 1024);
         assert!(!settings.two_phase_occlusion);
-        assert_eq!(settings.debug_view, VirtualGeometryDebugView::Tier);
         assert_eq!(settings.max_visible_clusters, 4_194_304);
 
         let unknown = lookup(HashMap::from([("mode", ConfigValue::from("turbo"))]));
@@ -577,9 +513,6 @@ mod tests {
         for mode in VirtualGeometryMode::ALL {
             assert_eq!(VirtualGeometryMode::parse(mode.as_str()), Some(mode));
         }
-        for view in VirtualGeometryDebugView::ALL {
-            assert_eq!(VirtualGeometryDebugView::parse(view.as_str()), Some(view));
-        }
         assert!(!VirtualGeometryMode::Off.is_on());
     }
 
@@ -593,11 +526,9 @@ mod tests {
         );
         handle.set("mode", "off").expect("set mode");
         handle.set("tau_pixels", 2.0_f64).expect("set tau");
-        handle.set("debug_view", "overdraw").expect("set view");
         let settings = VirtualGeometrySettings::from_config(cfg);
         assert_eq!(settings.mode, VirtualGeometryMode::Off);
         assert_eq!(settings.tau_pixels, 2.0);
-        assert_eq!(settings.debug_view, VirtualGeometryDebugView::Overdraw);
     }
 
     #[test]
