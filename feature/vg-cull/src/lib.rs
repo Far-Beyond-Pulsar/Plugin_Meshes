@@ -132,7 +132,7 @@
 //! # Traversal
 //!
 //! Each phase runs `cs_traverse` once, with [`VgCullConfig::max_groups`]
-//! persistent workgroups (Nanite's persistent culling, with work stealing):
+//! persistent workgroups (persistent-thread culling, with work stealing):
 //!
 //! * A workgroup works depth-first: waves of up to 64 jobs from its own deque in
 //!   workgroup memory; children go back on the deque.

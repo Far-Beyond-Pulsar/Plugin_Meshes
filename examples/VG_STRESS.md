@@ -270,7 +270,7 @@ counters), read from the same asynchronous readback, so it adds no GPU stall.
 
 Selection is per cluster: a group is refined when its projected error exceeds
 `tau_px` (default 1 px), a stable setting with no per-frame screen-wide
-multiplier, so triangle density follows geometry (UE5 Nanite does the same).
+multiplier, so triangle density follows geometry (the published cluster-LOD approach).
 Three bounded mechanisms sit around that one rule, all in `VirtualGeometrySettings`
 (see `feature/vg-cull` crate docs, "The cut"):
 

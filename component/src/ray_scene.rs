@@ -84,7 +84,7 @@
 //! How others do it: Unreal's ray-tracing scene keeps one instance per
 //! primitive with a BLAS per mesh LOD whose segments are its sections (hit
 //! groups per segment), updated from primitive changes, BLAS builds
-//! budgeted and compacted, and Nanite meshes traced through fallback
+//! budgeted and compacted, and virtualized meshes traced through fallback
 //! meshes; Lumen's hit lighting uses a surface cache instead of the material.
 
 use std::collections::{HashMap, HashSet, VecDeque};

@@ -321,7 +321,7 @@ impl<'a> PartGeometry<'a> {
 }
 
 /// A tree variant's material parts as one VG asset with one section per part
-/// (Nanite's model: one mesh, materials per cluster). One instance, one
+/// (the cluster-LOD model: one mesh, materials per cluster). One instance, one
 /// hierarchy walk and one set of roots per placed tree instead of one per
 /// material. Only when every part has the same node transform (the glTF
 /// primitives of one mesh do); otherwise `None` and the parts stay separate.
