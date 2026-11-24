@@ -128,12 +128,26 @@ fn production_pipelines_accept_coverage_and_legacy_templates() {
                 let mut pass = TransparentPass::new(&device, wgpu::TextureFormat::Rgba16Float);
                 pass.reactive_mask = coverage;
                 if legacy {
-                    // A program without coverage support has one color
-                    // output and must remain usable with either graph.
-                    let source = pass.program
+                    // A program without coverage support writes the
+                    // accumulation and the revealage only (no location 2)
+                    // and must remain usable with either graph.
+                    let source = pass
+                        .program
                         .replace("HELIO_TRANSPARENT_REACTIVITY", "LEGACY_TEMPLATE")
-                        .replace("-> TransparentOutput", "-> @location(0) vec4<f32>")
-                        .replace("return TransparentOutput(surface, vec4<f32>(clamp(surface.a, 0.0, 1.0)));", "return surface;");
+                        .lines()
+                        .filter(|line| {
+                            let line = line.trim();
+                            line != "@location(2) reactivity: vec4<f32>,"
+                                && line != "vec4<f32>(alpha),"
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(
+                        !source.contains("reactivity: vec4<f32>")
+                            && !source.contains("vec4<f32>(alpha),"),
+                        "the legacy program still writes coverage: the transparent \
+                         program's output changed, update this test's edit"
+                    );
                     pass.program = Box::leak(source.into_boxed_str());
                 }
                 pass.get_or_create_pipeline(
