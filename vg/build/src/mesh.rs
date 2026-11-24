@@ -90,13 +90,21 @@ pub struct Tri {
     pub mat: u32,
 }
 
-/// Growing vertex table. Simplification appends moved vertices; ids of
-/// existing vertices never change, so child clusters keep referring to the
+/// Growing vertex table. Simplification appends the vertices it places; ids
+/// of existing vertices never change, so child clusters keep referring to the
 /// geometry they were built from.
 pub struct VertexStore {
     pub pos: Vec<V3>,
-    /// Index of the *source* vertex whose attribute bytes this vertex uses.
+    /// Attribute record of this vertex: below [`Self::source_records`] the
+    /// index of a source vertex (its bytes in [`MeshInput::attributes`]),
+    /// from there on a record the builder wrote (see [`Self::add_record`]).
     pub attr: Vec<u32>,
+    /// Number of source vertices (records in the input attribute array).
+    pub source_records: u32,
+    /// Records written by the builder for vertices whose attributes
+    /// simplification updated, `stride` bytes each.
+    built: Vec<u8>,
+    stride: usize,
     /// Canonical id of the (bit-exact) position.
     pub pid: Vec<u32>,
     /// True if another vertex shares this position (attribute seam).
@@ -109,10 +117,13 @@ pub struct VertexStore {
 }
 
 impl VertexStore {
-    fn new() -> Self {
+    fn new(source_records: u32, stride: usize) -> Self {
         Self {
             pos: Vec::new(),
             attr: Vec::new(),
+            source_records,
+            built: Vec::new(),
+            stride,
             pid: Vec::new(),
             seam: Vec::new(),
             floating: Vec::new(),
@@ -128,11 +139,57 @@ impl VertexStore {
         self.pos.is_empty()
     }
 
-    /// Free the position->pid lookup once welding is done (the DAG never adds
-    /// vertices, and the map is the largest transient of a 14M-vertex mesh).
-    /// `push` must not be used afterwards for positions that already exist.
+    /// Free the position->pid lookup once welding is done (the map is the
+    /// largest transient of a 14M-vertex mesh). The DAG adds vertices only
+    /// through [`Self::push_placed`] afterwards, with its own position ids.
     pub fn release_lookup(&mut self) {
         self.pid_map = HashMap::new();
+    }
+
+    /// Attribute bytes of vertex `v` (`source` is the input's attribute array).
+    pub fn record<'a>(&'a self, v: u32, source: &'a [u8]) -> &'a [u8] {
+        let r = self.attr[v as usize];
+        if r < self.source_records {
+            let at = r as usize * self.stride;
+            &source[at..at + self.stride]
+        } else {
+            let at = (r - self.source_records) as usize * self.stride;
+            &self.built[at..at + self.stride]
+        }
+    }
+
+    /// Store a builder-written attribute record (`stride` bytes); returns its
+    /// index for [`Self::attr`].
+    pub fn add_record(&mut self, bytes: &[u8]) -> u32 {
+        debug_assert_eq!(bytes.len(), self.stride);
+        let id = self.source_records + (self.built.len() / self.stride.max(1)) as u32;
+        self.built.extend_from_slice(bytes);
+        id
+    }
+
+    /// A fresh position id, for the wedges (vertices at one position with
+    /// different attributes) of one vertex the builder placed.
+    pub fn new_pid(&mut self) -> u32 {
+        let pid = self.pid_first.len() as u32;
+        self.pid_first.push(self.pos.len() as u32);
+        pid
+    }
+
+    /// Append a vertex the builder placed, at position id `pid` (from
+    /// [`Self::new_pid`]); `seam` when the position has several wedges.
+    pub fn push_placed(&mut self, pos: V3, attr: u32, pid: u32, seam: bool, floating: bool) -> u32 {
+        let id = self.pos.len() as u32;
+        self.pos.push(pos);
+        self.attr.push(attr);
+        self.pid.push(pid);
+        self.seam.push(seam);
+        self.floating.push(floating);
+        id
+    }
+
+    /// Number of position ids handed out so far.
+    pub fn pid_count(&self) -> u32 {
+        self.pid_first.len() as u32
     }
 
     pub fn push(&mut self, pos: V3, attr: u32) -> u32 {
@@ -193,7 +250,7 @@ pub fn weld(mesh: &MeshInput) -> (VertexStore, Vec<Tri>) {
         rep[i as usize] = order[run_start];
     }
     // Unified ids in ascending representative order (keeps source locality).
-    let mut store = VertexStore::new();
+    let mut store = VertexStore::new(n as u32, stride);
     let mut unified = vec![u32::MAX; n];
     for i in 0..n {
         if rep[i] as usize == i {

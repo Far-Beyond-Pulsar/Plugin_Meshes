@@ -1,8 +1,9 @@
 //! The meshes' per-renderer state (a `RenderHostPartRegistration` the root
 //! submits): the
 //! virtual-geometry host (builds, caches and streams the cluster assets of
-//! meshes whose owner has a `VirtualGeometryComponent`; its runtime feeds
-//! the VG passes), the authored LOD selection, the skin cache
+//! static meshes with `virtual_geometry` set, and swaps their error-bounded
+//! fallbacks in for their full classic geometry; its runtime feeds the VG
+//! passes), the authored LOD selection, the skin cache
 //! ([`crate::skin_cache`]: every drawer's and the ray-traced scene's skinned
 //! vertices) and the ray-traced scene ([`crate::ray_scene`]).
 //!
@@ -188,20 +189,31 @@ impl RenderHostPart for MeshesHostPart {
     }
 
     /// Build and stream the virtual-geometry assets the scene asks for,
-    /// with the project's settings (or the override).
+    /// with the project's settings (or the override), and swap the meshes'
+    /// fallbacks in or their full geometry back (a write, only on frames
+    /// with a swap to make).
     fn prepare_frame(&mut self, scene: &SharedScene) {
-        let settings = self.settings_override.unwrap_or_else(|| {
-            VirtualGeometrySettings::from_config(engine_state::settings::global_config())
-        });
-        let scene = scene.read();
-        let Some(mirror) = scene.world.gpu_mirror() else {
-            return;
-        };
-        self.virtual_geometry.sync(
-            &scene.world,
-            mirror,
-            virtual_geometry_runtime_settings(settings),
-        );
+        let settings = self
+            .settings_override
+            .unwrap_or_else(|| {
+                VirtualGeometrySettings::from_config(engine_state::settings::global_config())
+            })
+            .sanitized();
+        {
+            let scene = scene.read();
+            let Some(mirror) = scene.world.gpu_mirror() else {
+                return;
+            };
+            self.virtual_geometry.sync(
+                &scene.world,
+                mirror,
+                virtual_geometry_runtime_settings(settings),
+                settings.fallback_relative_error,
+            );
+        }
+        if self.virtual_geometry.has_swaps() {
+            self.virtual_geometry.apply(&mut scene.write().world);
+        }
     }
 
     /// The skin cache's pass for the posed skinned meshes, then the meshes'
@@ -217,7 +229,6 @@ impl RenderHostPart for MeshesHostPart {
             self.ray_scene = match crate::ray_scene::WorldRayScene::new(
                 renderer.device().clone(),
                 renderer.queue().clone(),
-                Some(self.virtual_geometry.runtime().clone()),
             ) {
                 Some(rays) => RayScene::Ready(Box::new(rays)),
                 None => {
@@ -252,6 +263,9 @@ impl RenderHostPart for MeshesHostPart {
         let skin_frame = skins.update(&scene.world, view.as_ref(), &queue, &mut encoder);
         let stats = renderer.frame_stats().clone();
         skins.report(&stats);
+        let geometry = self.virtual_geometry.geometry_bytes();
+        stats.add_named(helio_mesh_api::stats::VG_FALLBACK_BYTES, geometry.fallback);
+        stats.add_named(helio_mesh_api::stats::VG_CLASSIC_BYTES, geometry.classic);
         if let RayScene::Ready(rays) = &mut self.ray_scene {
             rays.prepare(
                 &scene.world,

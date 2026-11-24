@@ -62,6 +62,13 @@ pub const INSTANCE_FLAG_CLASSIC_SUPPRESSED: u32 = 1 << 4;
 /// not the mesh pool. Set by the skinned mesh's draw rows.
 pub const INSTANCE_FLAG_SKINNED: u32 = 1 << 5;
 
+/// The instance asks to render through virtual geometry (the static mesh
+/// component's `virtual_geometry` property, written by its draw rows). The
+/// virtual-geometry instance derivation makes it VG-active only once the mesh's
+/// cluster data is resident; until then, and whenever the flag is clear, the
+/// instance draws classically. Nothing else reads it.
+pub const INSTANCE_FLAG_VIRTUAL_GEOMETRY: u32 = 1 << 6;
+
 /// Bit offset of the coordinate-space id within [`GpuInstanceData::flags`].
 ///
 /// # Coordinate spaces

@@ -14,10 +14,21 @@
 //!   traced sections are the segments of its BLAS (each with its own
 //!   opacity), shared by every instance of the mesh; a hit's surface row is
 //!   its instance's custom data (the mesh's first row) plus the hit's
-//!   `geometry_index`. Virtual-geometry meshes are traced through their
-//!   assets' coarse proxies ([`helio_mesh_host::ray_proxies`]), a segment for
-//!   each of the proxy's material sections, drawn with the mesh's section
-//!   of that slot.
+//!   `geometry_index`. A mesh with `virtual_geometry` on is traced like any
+//!   other, from the classic geometry its component holds: once its
+//!   virtual geometry is drawn that is its fallback, an error-bounded cut of
+//!   its cluster DAG (`crate::virtual_geometry_host`; the mesh asset's or the
+//!   project's error bound), so rays see at most that error, and its BLAS
+//!   reads the fallback's vertices already on the GPU (the full geometry is
+//!   no longer there). Until then, and where virtual geometry is not drawn,
+//!   it is the full geometry, exact.
+//! - **Deforming meshes.** A static mesh whose movability is `Dynamic` may
+//!   change its vertices in place (with no content key, in a private GPU
+//!   range, or under a new one). It gets a BLAS of its own, built for
+//!   refits; each change of the mesh (its journal) hashes its vertices and
+//!   indices, as the standalone projection does: new positions refit the
+//!   BLAS, new topology rebuilds it, and until that is recorded it is traced
+//!   as it was. A rigid mesh's BLAS is shared and never re-read.
 //! - **Incremental.** The world's change journals say what changed: a mesh,
 //!   its materials or its enabled state re-evaluates that mesh; a transform
 //!   or parent change re-places the meshes below that entity (an index of
@@ -73,7 +84,7 @@
 //! How others do it: Unreal's ray-tracing scene keeps one instance per
 //! primitive with a BLAS per mesh LOD whose segments are its sections (hit
 //! groups per segment), updated from primitive changes, BLAS builds
-//! budgeted and compacted, and Nanite meshes traced through fallback
+//! budgeted and compacted, and virtualized meshes traced through fallback
 //! meshes; Lumen's hit lighting uses a surface cache instead of the material.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -83,10 +94,9 @@ use glam::{DMat4, DVec3};
 use helio_core::{BlasGeometry, BlasManager, BlasSegment, TlasInstanceInput, TlasManager};
 use helio_mats::instance::{MaterialInstanceComponent, row_of};
 use helio_mesh_api::{
-    RAY_INSTANCE_MASKED, RAY_INSTANCE_PROXY, RAY_INSTANCE_SKINNED, RAY_INSTANCE_TWO_SIDED,
-    RAY_SPACE_GROUP, RAY_SPACE_SLOTS, RayInstance, RayProgram, RayPrograms, RayTransform,
+    RAY_INSTANCE_MASKED, RAY_INSTANCE_SKINNED, RAY_INSTANCE_TWO_SIDED, RAY_SPACE_GROUP,
+    RAY_SPACE_SLOTS, RayInstance, RayProgram, RayPrograms, RayTransform,
 };
-use helio_mesh_host::ray_proxies::{Lookup, ProxyRange, VgRayProxies};
 use helio_pass_mesh_rays::RayTracingSettings;
 use pulsar_scene_model::attachments::ComponentOwner;
 use pulsar_scene_model::{Parent, SpaceSlot, Transform, Visibility};
@@ -120,12 +130,6 @@ enum BlasKey {
         geometry: u128,
         sections: Vec<(u32, u32, bool)>,
     },
-    /// A virtual-geometry asset's proxy: its traced material sections, first
-    /// index (relative to the proxy's), index count and opacity each.
-    Proxy {
-        key: u64,
-        sections: Vec<(u32, u32, bool)>,
-    },
     /// A skinned instance's own deforming BLAS (its entity's bits), its
     /// mesh and traced sections as a mesh's.
     Skinned {
@@ -133,17 +137,26 @@ enum BlasKey {
         geometry: u128,
         sections: Vec<(u32, u32, bool)>,
     },
+    /// A deforming static mesh's own BLAS (its entity's bits; `Dynamic`
+    /// movability): its vertices may change in place, so it is shared with
+    /// no other instance, and its traced sections as a mesh's.
+    Deforming {
+        entity: u64,
+        sections: Vec<(u32, u32, bool)>,
+    },
 }
 
 /// Where a BLAS's triangles are, for its build.
 #[derive(Clone, Copy, Debug)]
 enum Source {
-    /// A mesh's ranges of the mirror's vertex and index pools.
+    /// A mesh's ranges of the mirror's vertex and index pools, and (for a
+    /// deforming mesh) the content hashes of its vertices and indices: a
+    /// new positions hash refits its BLAS, a new topology hash rebuilds it.
     Mesh {
         vertices: VarLenHandle,
         first_index: u32,
+        revisions: (u64, u64),
     },
-    Proxy(ProxyRange),
     /// A skinned instance's vertices in the skin cache (by its entity), its
     /// indices in the mesh pool from `first_index`.
     Skinned {
@@ -162,6 +175,9 @@ struct Blas {
     /// the frames its refit has waited.
     revision: u64,
     waited: u32,
+    /// A deforming mesh's BLAS whose vertices changed since it was built: it
+    /// stays traced as it was until its refit (or rebuild) is recorded.
+    refit_due: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -190,7 +206,6 @@ enum Skip {
     Unloaded,
     Unmirrored,
     NoMaterials,
-    ProxyPending,
     Disabled,
     Hidden,
     Glass,
@@ -200,7 +215,7 @@ impl Skip {
     fn retried(self) -> bool {
         matches!(
             self,
-            Self::Unloaded | Self::Unmirrored | Self::NoMaterials | Self::ProxyPending
+            Self::Unloaded | Self::Unmirrored | Self::NoMaterials
         )
     }
 
@@ -209,7 +224,6 @@ impl Skip {
             Self::Unloaded => "not loaded",
             Self::Unmirrored => "not on the GPU yet",
             Self::NoMaterials => "without materials",
-            Self::ProxyPending => "proxy building",
             Self::Disabled => "disabled",
             Self::Hidden => "hidden",
             Self::Glass => "only glass",
@@ -227,7 +241,6 @@ struct Traced {
     movable: bool,
     /// The coordinate space slot its owner is authored in.
     space: u32,
-    proxy: Option<u64>,
     /// Its TLAS instance, once its BLAS is built.
     slot: Option<usize>,
     /// Its BLAS's triangles and their count, for the build.
@@ -336,7 +349,6 @@ pub struct WorldRayScene {
     /// The material rows' and keys' flush sequences the surfaces were last
     /// read at ([`Self::refresh_surfaces`]).
     materials_seen: (u64, u64),
-    vg: Option<VgRayProxies>,
     tlas_ok: bool,
     logged: Option<Stats>,
     warned: bool,
@@ -352,13 +364,8 @@ pub struct WorldRayScene {
 }
 
 impl WorldRayScene {
-    /// `None` without hardware ray queries on `device`. `virtual_geometry`:
-    /// the runtime whose assets are traced through proxies.
-    pub fn new(
-        device: Arc<wgpu::Device>,
-        queue: Arc<wgpu::Queue>,
-        virtual_geometry: Option<helio_vg_stream::VgRuntime>,
-    ) -> Option<Self> {
+    /// `None` without hardware ray queries on `device`.
+    pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Option<Self> {
         let tlas = TlasManager::new(device.clone(), 1);
         if !tlas.is_rt_available() {
             return None;
@@ -393,7 +400,6 @@ impl WorldRayScene {
             programs: Arc::new(RayPrograms::default()),
             pending: HashSet::new(),
             materials_seen: (0, 0),
-            vg: virtual_geometry.map(VgRayProxies::new),
             tlas_ok: false,
             logged: None,
             warned: false,
@@ -431,14 +437,6 @@ impl WorldRayScene {
         let store = mirror.store();
         // Compact the BLASes built in earlier frames (a few a frame).
         self.blas.maintain(&self.queue);
-        // Proxies that came or went: re-evaluate everything.
-        if self
-            .vg
-            .as_mut()
-            .is_some_and(|vg| vg.poll(&self.device, &self.queue))
-        {
-            self.cursors = None;
-        }
         // A new criterion re-tests every traced instance.
         if settings != self.settings {
             self.settings = settings;
@@ -573,11 +571,6 @@ impl WorldRayScene {
         if let Some(groups) = &self.space_groups_buffer {
             rays = rays.with(helio_mesh_api::RAY_SPACE_GROUPS, groups.clone());
         }
-        if let Some((vertices, indices)) = self.vg.as_ref().and_then(VgRayProxies::buffers) {
-            rays = rays
-                .with(helio_mesh_api::RAY_PROXY_VERTICES, vertices.clone())
-                .with(helio_mesh_api::RAY_PROXY_INDICES, indices.clone());
-        }
         if let Some(skinned) = self
             .skinned_vertices
             .as_ref()
@@ -699,10 +692,30 @@ impl WorldRayScene {
         skins: &SkinCache,
         entity: Entity,
     ) {
-        if let Some(old) = self.entries.remove(&entity) {
+        let old = self.entries.remove(&entity);
+        let entry = self.entry(world, mirror, store, skins, entity);
+        // A deforming mesh traced again under the same key keeps its BLAS
+        // (its new vertices refit it): it is held across the forget.
+        let kept = match (&old, &entry) {
+            (
+                Some(Entry {
+                    state: Ok(before), ..
+                }),
+                Some(Entry {
+                    state: Ok(after), ..
+                }),
+            ) if before.key == after.key && matches!(after.key, BlasKey::Deforming { .. }) => {
+                Some(after.key.clone())
+            }
+            _ => None,
+        };
+        if let Some(blas) = kept.as_ref().and_then(|key| self.blases.get_mut(key)) {
+            blas.users += 1;
+        }
+        if let Some(old) = old {
             self.forget(entity, old);
         }
-        let Some(mut entry) = self.entry(world, mirror, store, skins, entity) else {
+        let Some(mut entry) = entry else {
             return;
         };
         if let Ok(traced) = &mut entry.state {
@@ -725,23 +738,58 @@ impl WorldRayScene {
             Ok(traced) => {
                 let source = traced.source_hint;
                 let skinned = traced.skinned;
-                let blas = self.blases.entry(traced.key.clone()).or_insert_with(|| {
-                    let id = self.next_id;
-                    self.next_id += 1;
-                    // Skinned BLASes are built by the refit budget.
-                    if !skinned {
-                        self.build_queue.push_back(traced.key.clone());
+                let blas = match self.blases.entry(traced.key.clone()) {
+                    std::collections::hash_map::Entry::Occupied(blas) => {
+                        let blas = blas.into_mut();
+                        if kept.is_some() {
+                            // The hold above becomes this trace's use.
+                            blas.users -= 1;
+                            // Its vertices or indices changed in place: the
+                            // next build refits (or rebuilds) it, and until
+                            // then it is traced as it was.
+                            let changed = match (blas.source, source.0) {
+                                (
+                                    Source::Mesh { revisions: was, .. },
+                                    Source::Mesh { revisions: now, .. },
+                                ) => was != now,
+                                _ => false,
+                            };
+                            blas.source = source.0;
+                            blas.triangles = source.1;
+                            match blas.state {
+                                BlasState::Built if changed && !blas.refit_due => {
+                                    blas.refit_due = true;
+                                    self.build_queue.push_back(traced.key.clone());
+                                }
+                                // A failed build is tried again on new data.
+                                BlasState::Failed if changed => {
+                                    blas.state = BlasState::Queued;
+                                    self.build_queue.push_back(traced.key.clone());
+                                }
+                                _ => {}
+                            }
+                        }
+                        blas
                     }
-                    Blas {
-                        id,
-                        users: 0,
-                        state: BlasState::Queued,
-                        source: source.0,
-                        triangles: source.1,
-                        revision: 0,
-                        waited: 0,
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        // Skinned BLASes are built by the refit budget.
+                        if !skinned {
+                            self.build_queue.push_back(traced.key.clone());
+                        }
+                        slot.insert(Blas {
+                            id,
+                            users: 0,
+                            state: BlasState::Queued,
+                            source: source.0,
+                            triangles: source.1,
+                            revision: 0,
+                            waited: 0,
+                            refit_due: false,
+                        })
                     }
-                });
+                };
                 blas.users += 1;
                 if !traced.culled {
                     self.awaiting_blas.insert(entity);
@@ -956,7 +1004,6 @@ impl WorldRayScene {
             world: world_matrix,
             movable: true,
             space: 0,
-            proxy: None,
             slot: None,
             source_hint: (
                 Source::Skinned {
@@ -984,7 +1031,14 @@ impl WorldRayScene {
         owner: Entity,
     ) -> Result<Traced, Skip> {
         let world_matrix = Self::placed(world, link, owner)?;
-        if mesh.geometry_key == MeshGeometryKey::NONE || mesh.indices.is_empty() {
+        let movability = helio::Movability::from(mesh.movability);
+        // A deforming mesh may hold geometry with no content key (written in
+        // place, a private GPU range); any other needs its loaded geometry.
+        let deforming = movability.can_deform();
+        if (mesh.geometry_key == MeshGeometryKey::NONE && !deforming)
+            || mesh.vertices.is_empty()
+            || mesh.indices.is_empty()
+        {
             return Err(Skip::Unloaded);
         }
         let (Some(vertices), Some(indices)) = (
@@ -1001,10 +1055,9 @@ impl WorldRayScene {
         let Some(instances) = world.get::<MeshMaterials>(entity) else {
             return Err(Skip::NoMaterials);
         };
-        // The traced sections: each with its ordinal (a virtual-geometry
-        // asset's material slot), material instance and surface.
+        // The traced sections: each with its material instance and surface.
         let mut sections = Vec::new();
-        for (ordinal, section) in StaticMeshDraw::of(mesh).sections.into_iter().enumerate() {
+        for section in StaticMeshDraw::of(mesh).sections {
             if section.index_count == 0
                 || section.first_index as u64 + section.index_count as u64 > indices.count as u64
             {
@@ -1018,7 +1071,7 @@ impl WorldRayScene {
                 .surface(world, mirror, material)
                 .ok_or(Skip::NoMaterials)?;
             if !surface.blended {
-                sections.push((ordinal as u32, section, material, surface));
+                sections.push((section, material, surface));
             }
         }
         if sections.is_empty() {
@@ -1036,112 +1089,71 @@ impl WorldRayScene {
                 program: surface.program,
                 _pad: [0; 2],
             };
-        let lookup = match self.vg.as_mut() {
-            Some(vg) => vg.lookup((vertices.offset, vertices.count)),
-            None => Lookup::Classic,
-        };
-        let movable = helio::Movability::from(mesh.movability).can_move();
-        let (key, rows, materials, proxy, source_hint) = match lookup {
-            Lookup::Pending => return Err(Skip::ProxyPending),
-            Lookup::Proxy(key, range) => {
-                // A segment a material section of the proxy, drawn with the
-                // mesh's section of that ordinal (the asset's material slot).
-                let parts: Vec<_> = self
-                    .vg
-                    .as_ref()
-                    .map(|vg| vg.sections(key).to_vec())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|part| {
-                        sections
-                            .iter()
-                            .find(|(ordinal, ..)| *ordinal == part.material)
-                            .map(|(_, _, material, surface)| (part, *material, *surface))
-                    })
-                    .collect();
-                if parts.is_empty() {
-                    return Err(Skip::Glass);
-                }
+        let movable = movability.can_move();
+        let traced_sections = sections
+            .iter()
+            .map(|(s, _, surface)| {
                 (
-                    BlasKey::Proxy {
-                        key,
-                        sections: parts
-                            .iter()
-                            .map(|(part, _, surface)| {
-                                (
-                                    part.first_index,
-                                    part.index_count,
-                                    surface.flags & RAY_INSTANCE_MASKED == 0,
-                                )
-                            })
-                            .collect(),
-                    },
-                    parts
-                        .iter()
-                        .map(|(part, material, surface)| {
-                            row(
-                                range.first_index + part.first_index,
-                                range.first_vertex,
-                                RAY_INSTANCE_PROXY,
-                                *material,
-                                surface,
-                            )
-                        })
-                        .collect(),
-                    parts.iter().map(|(_, material, _)| *material).collect(),
-                    Some(key),
-                    (
-                        Source::Proxy(range),
-                        parts
-                            .iter()
-                            .map(|(p, ..)| u64::from(p.index_count / 3))
-                            .sum(),
-                    ),
+                    s.first_index,
+                    s.index_count,
+                    surface.flags & RAY_INSTANCE_MASKED == 0,
                 )
-            }
-            Lookup::Classic => (
+            })
+            .collect();
+        // A deforming mesh: its own BLAS, and its geometry's content hashes
+        // (positions, topology), taken when it changes, decide whether it is
+        // refit or rebuilt, as the standalone projection does. A rigid mesh
+        // shares its loaded geometry's BLAS, built once.
+        let (key, revisions) = if deforming {
+            let hash = |bytes: &[u8]| {
+                use std::hash::Hasher;
+                let mut hash = twox_hash::XxHash3_64::default();
+                hash.write(bytes);
+                hash.finish()
+            };
+            (
+                BlasKey::Deforming {
+                    entity: entity_bits(entity),
+                    sections: traced_sections,
+                },
+                (
+                    hash(bytemuck::cast_slice(&mesh.vertices)),
+                    hash(bytemuck::cast_slice(&mesh.indices)),
+                ),
+            )
+        } else {
+            (
                 BlasKey::Mesh {
                     geometry: mesh.geometry_key.0,
-                    sections: sections
-                        .iter()
-                        .map(|(_, s, _, surface)| {
-                            (
-                                s.first_index,
-                                s.index_count,
-                                surface.flags & RAY_INSTANCE_MASKED == 0,
-                            )
-                        })
-                        .collect(),
+                    sections: traced_sections,
                 },
-                sections
-                    .iter()
-                    .map(|(_, s, material, surface)| {
-                        row(
-                            indices.offset + s.first_index,
-                            vertices.offset,
-                            0,
-                            *material,
-                            surface,
-                        )
-                    })
-                    .collect(),
-                sections
-                    .iter()
-                    .map(|(_, _, material, _)| *material)
-                    .collect(),
-                None,
-                (
-                    Source::Mesh {
-                        vertices,
-                        first_index: indices.offset,
-                    },
-                    sections
-                        .iter()
-                        .map(|(_, s, _, _)| u64::from(s.index_count / 3))
-                        .sum(),
-                ),
-            ),
+                (0, 0),
+            )
         };
+        let rows = sections
+            .iter()
+            .map(|(s, material, surface)| {
+                row(
+                    indices.offset + s.first_index,
+                    vertices.offset,
+                    0,
+                    *material,
+                    surface,
+                )
+            })
+            .collect();
+        let materials = sections.iter().map(|(_, material, _)| *material).collect();
+        let source_hint = (
+            Source::Mesh {
+                vertices,
+                first_index: indices.offset,
+                revisions,
+            },
+            sections
+                .iter()
+                .map(|(s, _, _)| u64::from(s.index_count / 3))
+                .sum(),
+        );
         let (center, radius) = world_sphere(world_matrix, mesh.bounds_local);
         Ok(Traced {
             key,
@@ -1150,7 +1162,6 @@ impl WorldRayScene {
             world: world_matrix,
             movable,
             space: 0,
-            proxy,
             slot: None,
             source_hint,
             center,
@@ -1188,7 +1199,6 @@ impl WorldRayScene {
     fn build_blases(&mut self, store: &SceneGpuStore, encoder: &mut wgpu::CommandEncoder) {
         let vertex_pool = store.resolve_buffer_handle(helio_mesh_api::MESH_VERTICES.key());
         let index_pool = store.resolve_buffer_handle(helio_mesh_api::MESH_INDICES.key());
-        let proxies = self.vg.as_ref().and_then(VgRayProxies::buffers);
         let mut budget = BUILD_TRIANGLES_PER_FRAME;
         let mut built_any = false;
         while let Some(key) = self.build_queue.front() {
@@ -1196,7 +1206,7 @@ impl WorldRayScene {
                 self.build_queue.pop_front();
                 continue;
             };
-            if blas.state != BlasState::Queued {
+            if blas.state != BlasState::Queued && !blas.refit_due {
                 self.build_queue.pop_front();
                 continue;
             }
@@ -1205,12 +1215,20 @@ impl WorldRayScene {
             }
             let key = self.build_queue.pop_front().expect("front");
             let blas = self.blases.get_mut(&key).expect("present");
+            let refit = blas.refit_due;
+            blas.refit_due = false;
+            let (sections, movability) = match &key {
+                BlasKey::Mesh { sections, .. } => (sections, helio_core::Movability::Static),
+                BlasKey::Deforming { sections, .. } => (sections, helio_core::Movability::Dynamic),
+                BlasKey::Skinned { sections, .. } => (sections, helio_core::Movability::Dynamic),
+            };
             let result = match (&key, blas.source) {
                 (
-                    BlasKey::Mesh { sections, .. },
+                    BlasKey::Mesh { .. } | BlasKey::Deforming { .. },
                     Source::Mesh {
                         vertices,
                         first_index,
+                        revisions: (positions_revision, topology_revision),
                     },
                 ) => match (&vertex_pool, &index_pool) {
                     (Some(vertex_pool), Some(index_pool)) => {
@@ -1219,8 +1237,8 @@ impl WorldRayScene {
                                 .iter()
                                 .map(|&(first, count, opaque)| BlasSegment {
                                     geometry: BlasGeometry {
-                                        positions_revision: 0,
-                                        topology_revision: 0,
+                                        positions_revision,
+                                        topology_revision,
                                         vertices: &vertex_pool.buffer,
                                         first_vertex: vertices.offset,
                                         vertex_count: vertices.count,
@@ -1236,41 +1254,14 @@ impl WorldRayScene {
                                 })
                                 .collect();
                         self.blas
-                            .build(blas.id, encoder, segments, helio_core::Movability::Static)
+                            .build(blas.id, encoder, segments, movability)
                             .map_err(|e| e.to_string())
                     }
                     _ => Err("the mesh pools are not registered".into()),
                 },
-                (BlasKey::Proxy { sections, .. }, Source::Proxy(range)) => match proxies {
-                    Some((vertices, indices)) => self
-                        .blas
-                        .build(
-                            blas.id,
-                            encoder,
-                            sections
-                                .iter()
-                                .map(|&(first, count, opaque)| BlasSegment {
-                                    geometry: BlasGeometry {
-                                        positions_revision: 0,
-                                        topology_revision: 0,
-                                        vertices,
-                                        first_vertex: range.first_vertex,
-                                        vertex_count: range.vertex_count,
-                                        vertex_stride: helio_mesh_api::RAY_PROXY_VERTEX_BYTES,
-                                        indices: Some(indices),
-                                        first_index: range.first_index + first,
-                                        index_count: count,
-                                    },
-                                    opaque,
-                                })
-                                .collect(),
-                            helio_core::Movability::Static,
-                        )
-                        .map_err(|e| e.to_string()),
-                    None => Err("the proxy pool is missing".into()),
-                },
                 _ => Err("source does not match its key".into()),
             };
+            let triangles = blas.triangles;
             match result {
                 Ok(_) => blas.state = BlasState::Built,
                 Err(error) => {
@@ -1278,9 +1269,35 @@ impl WorldRayScene {
                     tracing::warn!(
                         "Meshes: a ray-tracing BLAS could not be built ({error}); its meshes are not traced"
                     );
+                    // A deforming mesh traced from its previous build: it
+                    // leaves the TLAS (the failed build removed its BLAS).
+                    if refit {
+                        let traced: Vec<usize> = self
+                            .slots
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, entity)| {
+                                matches!(
+                                    self.entries.get(entity).map(|e| &e.state),
+                                    Some(Ok(traced)) if traced.key == key
+                                )
+                            })
+                            .map(|(slot, _)| slot)
+                            .collect();
+                        for slot in traced.into_iter().rev() {
+                            let entity = self.slots[slot];
+                            if let Some(Ok(traced)) =
+                                self.entries.get_mut(&entity).map(|e| &mut e.state)
+                            {
+                                traced.slot = None;
+                            }
+                            self.leave_slot(slot);
+                            self.awaiting_blas.insert(entity);
+                        }
+                    }
                 }
             }
-            budget = budget.saturating_sub(blas.triangles);
+            budget = budget.saturating_sub(triangles);
             built_any = true;
         }
     }
@@ -1412,8 +1429,7 @@ impl WorldRayScene {
 
     /// Lay the traced meshes' rows out in TLAS order (each instance's custom
     /// data its first row, each row its instance), give the spaces their
-    /// mask groups and each instance its mask, and upload them; keep the
-    /// proxies they use.
+    /// mask groups and each instance its mask, and upload them.
     fn write_rows(&mut self) {
         self.rows_dirty = false;
         self.all_moved = true;
@@ -1427,7 +1443,6 @@ impl WorldRayScene {
             })
             .collect();
         let groups = helio_mesh_api::ray_space_groups(traced_spaces);
-        let mut proxies = HashSet::new();
         for (slot, entity) in self.slots.iter().enumerate() {
             let Some(Ok(traced)) = self.entries.get(entity).map(|e| &e.state) else {
                 continue;
@@ -1441,7 +1456,6 @@ impl WorldRayScene {
                 instance: slot as u32,
                 ..*row
             }));
-            proxies.extend(traced.proxy);
         }
         if groups != self.space_groups || self.space_groups_buffer.is_none() {
             self.space_groups = groups;
@@ -1455,14 +1469,6 @@ impl WorldRayScene {
             });
             self.queue
                 .write_buffer(buffer, 0, bytemuck::cast_slice(&self.space_groups));
-        }
-        for entity in &self.awaiting_blas {
-            if let Some(Ok(traced)) = self.entries.get(entity).map(|e| &e.state) {
-                proxies.extend(traced.proxy);
-            }
-        }
-        if let Some(vg) = self.vg.as_mut() {
-            vg.retain(&proxies);
         }
         let size = (self.rows.len().max(1) * std::mem::size_of::<RayInstance>()) as u64;
         if self

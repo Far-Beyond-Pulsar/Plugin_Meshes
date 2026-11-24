@@ -1,11 +1,27 @@
 //! Cluster DAG construction (plan section 2.1).
 //!
 //! Level 0 = clusters of the full-resolution mesh (per material section).
-//! Each round partitions the current level into groups, simplifies each group
-//! to 60% of its triangles
-//! with its boundary locked, and splits the result into new clusters; this
-//! repeats until a single (or, if simplification stalls, a handful of)
-//! cluster(s) remain.
+//! Each round partitions the current level into groups (`partition`),
+//! simplifies each group toward half its triangles with its boundary locked
+//! and an error limit (`simplify`), measures the result against the original
+//! surface (`deviation`) and splits it into new clusters; this repeats until a
+//! single cluster remains or nothing simplifies any more.
+//!
+//! Error limit. Halving a group's triangles lengthens its edges by `sqrt(2)`;
+//! on a smooth surface the deviation of a chord grows with the square of its
+//! length (sagitta `e^2 / 8R`), so a level is expected to double the error:
+//! [`GROWTH`] `= 1 / RATIO`. A group may therefore move its surface by at most
+//! `GROWTH` times its reference error: the largest error of its children, and
+//! never less than half the mean input edge (features narrower than the
+//! sampling interval of the input are not represented by it anyway; this is
+//! the only reference level-0 groups have). A group that cannot reach
+//! [`ACCEPT`] of its triangles within its limit keeps them: its clusters pass
+//! to the next level unchanged and are regrouped there with neighbours whose
+//! errors (and so the limit) have grown, under a new partition with different
+//! locked borders. When no group of a level makes progress, the level's limits
+//! double (as if a level had elapsed) until a group does, or until every
+//! limit exceeds its group's diameter, past which no error limit constrains
+//! anything and the remaining clusters become roots.
 //!
 //! Terminology used across the crate:
 //! * *producer group*: the group whose simplification created a cluster.
@@ -20,32 +36,32 @@ use rayon::prelude::*;
 use helio_vg_format::{VertexAttr, PAGE_BYTES};
 
 use crate::cluster::cluster_tris;
-use crate::deviation::{measure, Measured, RefPoint, Shading, Surface};
+use crate::deviation::{measure, Measured, Region, Surface};
 use crate::math::*;
 use crate::mesh::{mark_floating, weld, BuildError, MeshInput, Tri, VertexStore};
 use crate::partition::partition;
 use crate::simplify::{
-    simplify_group, GlobalEdges, SimplifyResult, COVERAGE_FACTOR, COVERAGE_FOOTPRINT,
+    simplify_group, GlobalEdges, NewAttr, NewPid, SimplifyResult, COVERAGE_FACTOR,
+    COVERAGE_FOOTPRINT,
 };
 
 pub const NONE: u32 = u32::MAX;
-/// Safety factor on the measured deviation (covers the interior of original
-/// triangles, which reference points sample only at their vertices).
-const ERROR_MARGIN: f32 = 1.4;
-/// Per-group deviation budget handed to the simplifier: at least this multiple
-/// of the group's children's error ...
-const ERR_GROWTH: f32 = 2.0;
-/// ... or this multiple of the level's median child error ...
-const ERR_GROWTH_TYPICAL: f32 = 3.0;
-/// ... or this fraction of the group's mean edge length (level 1, where
-/// children have no error yet).
-const BUDGET_EDGE_FRACTION: f32 = 0.5;
-/// Fraction of triangles kept per level (a gentler ladder than halving keeps
-/// locked-boundary distortion, and so error growth, down).
-/// A level is abandoned only when it keeps more than this percentage of the
-/// triangles (it makes essentially no progress).
-const STALL_PERCENT: usize = 97;
-const LEVEL_KEEP: (usize, usize) = (3, 5);
+/// A triangle with its material section.
+type MatTri = ([u32; 3], u32);
+/// One produced cluster's triangles with its material section.
+type Piece = (Vec<[u32; 3]>, u32);
+/// Triangles a group is simplified toward, as a fraction of its input.
+const RATIO: (usize, usize) = (1, 2);
+/// Expected error growth of one level (see the module docs): `1 / RATIO`.
+const GROWTH: f32 = 2.0;
+/// A group's result counts as progress when it keeps at most this fraction of
+/// its triangles: half of the intended reduction. Accepting less would at
+/// least double the levels (and the per-level selection and streaming cost)
+/// needed to reach the root.
+const ACCEPT: (usize, usize) = (3, 4);
+/// Fraction of the mean input edge below which a level-0 group's reference
+/// error never falls (half the sampling interval, see the module docs).
+const SAMPLING_FRACTION: f32 = 0.5;
 /// Roots are chunked into hierarchy leaves of at most this many clusters.
 const ROOT_CHUNK: usize = 8;
 /// Upper bound on clusters per simplification group (also bounded by the page).
@@ -67,10 +83,14 @@ pub struct ClusterNode {
     pub producer: u32,
     /// Group that consumed this cluster (root groups for the final level).
     pub consumer: u32,
-    /// Build-time only: original-surface reference points this cluster
-    /// stands in for (empty at level 0, where the triangles are the surface,
-    /// and again once the consuming group has measured them).
-    pub(crate) refs: Vec<RefPoint>,
+    /// Build-time only: the original (level-0) triangles this cluster stands
+    /// for, as indices into the build's original triangle list. Every
+    /// original triangle belongs to exactly one cluster of the current level;
+    /// emptied once the consuming group has measured them.
+    pub(crate) refs: Vec<u32>,
+    /// Build-time only: further original triangles near this cluster's
+    /// surface (see `deviation::Region::claimed`).
+    pub(crate) claimed: Vec<u32>,
 }
 
 /// A set of clusters sharing one parent: either the inputs of one
@@ -95,7 +115,7 @@ pub struct Dag {
     pub source_tris: usize,
 }
 
-fn split_into_clusters(vs: &VertexStore, tris: &[([u32; 3], u32)]) -> Vec<(Vec<[u32; 3]>, u32)> {
+fn split_into_clusters(vs: &VertexStore, tris: &[MatTri]) -> Vec<Piece> {
     let mut by_mat: BTreeMap<u32, Vec<[u32; 3]>> = BTreeMap::new();
     for (t, m) in tris {
         by_mat.entry(*m).or_default().push(*t);
@@ -124,15 +144,15 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
         source_tris: tris.len(),
     };
 
-    // Vertex attribute records in the format's layout can be measured (normal,
-    // uv); any other stride is opaque and only positions are.
+    // Vertex attribute records in the format's layout can be measured and
+    // simplified with (normal, uv); any other stride is opaque and only
+    // positions are.
     let stride = mesh.attribute_stride;
+    let format_layout = stride == helio_vg_format::ATTR_STRIDE as usize;
     let attr_of = |vs: &VertexStore, v: u32| -> Option<VertexAttr> {
-        if stride != helio_vg_format::ATTR_STRIDE as usize {
-            return None;
-        }
-        let at = vs.attr[v as usize] as usize * stride;
-        VertexAttr::decode(mesh.attributes.get(at..at + stride)?)
+        format_layout
+            .then(|| VertexAttr::decode(vs.record(v, mesh.attributes)))
+            .flatten()
     };
 
     // ── level 0 ────────────────────────────────────────────────────────────
@@ -148,6 +168,8 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
             (mat, ts, parts)
         })
         .collect();
+    // The original surface every level is measured against.
+    let mut original: Vec<[u32; 3]> = Vec::new();
     let mut cur: Vec<u32> = Vec::new();
     for (mat, ts, parts) in per_mat {
         for cl in parts {
@@ -156,8 +178,12 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
                 tris.iter()
                     .flat_map(|t| t.iter().map(|&v| dag.vs.pos[v as usize])),
             );
+            let first = original.len() as u32;
+            original.extend_from_slice(&tris);
             cur.push(dag.clusters.len() as u32);
             dag.clusters.push(ClusterNode {
+                refs: (first..original.len() as u32).collect(),
+                claimed: Vec::new(),
                 tris,
                 mat,
                 sphere,
@@ -167,7 +193,6 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
                 level: 0,
                 producer: NONE,
                 consumer: NONE,
-                refs: Vec::new(),
             });
         }
     }
@@ -183,204 +208,278 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
     while cur.len() > 1 {
         let groups = partition(&dag.vs, &cur, &dag.clusters, group_cap);
         // A group that covers everything left has no interior boundary to
-        // protect, so it can halve like a monolithic simplification.
-        let keep = if groups.len() == 1 {
-            (1, 2)
-        } else {
-            LEVEL_KEEP
-        };
+        // protect.
         let whole = groups.len() == 1;
-        let base0 = dag.vs.len() as u32;
-        // Error budget per group: a group that would raise the error far above
-        // what its level typically needs keeps more triangles instead (see
-        // `simplify_group`), so one hard region cannot pin every ancestor.
-        let child_max: Vec<f32> = groups
-            .iter()
-            .map(|g| {
-                g.iter()
-                    .map(|&c| dag.clusters[c as usize].self_error)
-                    .fold(0.0f32, f32::max)
-            })
-            .collect();
-        let typical = {
-            let mut v: Vec<f32> = child_max.iter().copied().filter(|&e| e > 0.0).collect();
-            v.sort_by(f32::total_cmp);
-            v.get(v.len() / 2).copied().unwrap_or(0.0)
-        };
-        let global = (groups.len() > 1).then(|| {
+        let global = (!whole).then(|| {
             GlobalEdges::build(
                 &dag.vs,
                 cur.iter()
                     .flat_map(|&c| dag.clusters[c as usize].tris.iter()),
             )
         });
-        let results: Vec<SimplifyResult> = groups
-            .par_iter()
-            .zip(child_max.par_iter())
-            .map(|(g, &child)| {
-                let tris: Vec<Tri> = g
-                    .iter()
+        let inputs: Vec<Vec<Tri>> = groups
+            .iter()
+            .map(|g| {
+                g.iter()
                     .flat_map(|&c| {
                         let cn = &dag.clusters[c as usize];
                         cn.tris.iter().map(move |t| Tri { v: *t, mat: cn.mat })
                     })
-                    .collect();
-                let mean_edge = {
-                    let mut sum = 0.0f64;
-                    for t in &tris {
-                        let p = t.v.map(|v| dag.vs.pos[v as usize]);
-                        sum += (dist(p[0], p[1]) + dist(p[1], p[2]) + dist(p[2], p[0])) as f64;
-                    }
-                    (sum / (3 * tris.len().max(1)) as f64) as f32
-                };
-                // A single group covers the whole remaining mesh: no neighbour to
-                // protect and nothing to compare against, so no budget feedback.
-                let budget = if whole {
-                    f32::INFINITY
-                } else {
-                    (child * ERR_GROWTH)
-                        .max(typical * ERR_GROWTH_TYPICAL)
-                        .max(BUDGET_EDGE_FRACTION * mean_edge)
-                };
-                simplify_group(
-                    &dag.vs,
-                    &tris,
-                    tris.len() * keep.0 / keep.1,
-                    budget,
-                    whole,
-                    global.as_ref(),
-                )
+                    .collect()
             })
             .collect();
-
-        // Serial: allocate the moved vertices (ids must not depend on thread
-        // scheduling) and translate output corners to global ids.
-        struct Staged {
-            tris: Vec<([u32; 3], u32)>,
-            coverage: Option<(usize, f32)>,
-        }
-        let results_lock = results.iter().fold((0usize, 0usize, 0usize), |a, r| {
-            (a.0 + r.locked, a.1 + r.verts, a.2 + r.floating)
-        });
-        let mut staged: Vec<Staged> = Vec::with_capacity(results.len());
-        for res in results {
-            let coverage = res.coverage_tris;
-            let ids: Vec<u32> = res
-                .new_verts
-                .iter()
-                .map(|&(p, a)| {
-                    // Only merged foliage cards create vertices: they are floating
-                    // pieces at the next level too.
-                    let id = dag.vs.push(p, a);
-                    dag.vs.floating[id as usize] = true;
-                    id
-                })
-                .collect();
-            let tris = res
-                .tris
-                .iter()
-                .map(|&(c, m)| {
-                    let f = |x: u32| {
-                        if x >= base0 {
-                            ids[(x - base0) as usize]
-                        } else {
-                            x
-                        }
-                    };
-                    ([f(c[0]), f(c[1]), f(c[2])], m)
-                })
-                .collect();
-            staged.push(Staged { tris, coverage });
-        }
-        let parts: Vec<Vec<(Vec<[u32; 3]>, u32)>> = staged
+        // Reference error and diameter of each group (see the module docs).
+        let reference: Vec<(f32, f32)> = groups
             .par_iter()
-            .map(|s| split_into_clusters(&dag.vs, &s.tris))
+            .zip(inputs.par_iter())
+            .map(|(g, tris)| {
+                let child = g
+                    .iter()
+                    .map(|&c| dag.clusters[c as usize].self_error)
+                    .fold(0.0f32, f32::max);
+                let mut sum = 0.0f64;
+                for t in tris {
+                    let p = t.v.map(|v| dag.vs.pos[v as usize]);
+                    sum += f64::from(dist(p[0], p[1]) + dist(p[1], p[2]) + dist(p[2], p[0]));
+                }
+                let mean_edge = (sum / (3 * tris.len().max(1)) as f64) as f32;
+                let sphere = g.iter().fold(dag.clusters[g[0] as usize].sphere, |s, &c| {
+                    sphere_union(s, dag.clusters[c as usize].sphere)
+                });
+                (child.max(SAMPLING_FRACTION * mean_edge), 2.0 * sphere[3])
+            })
             .collect();
-        let new_total: usize = parts.iter().map(|p| p.len()).sum();
-        let old_tris: usize = cur
-            .iter()
-            .map(|&c| dag.clusters[c as usize].tris.len())
-            .sum();
-        let new_tris: usize = staged.iter().map(|s| s.tris.len()).sum();
+        let mut relax = 1.0f32;
+        let (results, accepted) = loop {
+            let attr = |v: u32| attr_of(&dag.vs, v);
+            let attr_dyn: Option<&(dyn Fn(u32) -> Option<VertexAttr> + Sync)> =
+                format_layout.then_some(&attr as _);
+            let results: Vec<SimplifyResult> = inputs
+                .par_iter()
+                .zip(reference.par_iter())
+                .map(|(tris, &(r, _))| {
+                    simplify_group(
+                        &dag.vs,
+                        tris,
+                        tris.len() * RATIO.0 / RATIO.1,
+                        GROWTH * r * relax,
+                        whole,
+                        global.as_ref(),
+                        attr_dyn,
+                    )
+                })
+                .collect();
+            let accepted: Vec<bool> = results
+                .iter()
+                .zip(&inputs)
+                .map(|(r, i)| r.tris.len() * ACCEPT.1 <= i.len() * ACCEPT.0)
+                .collect();
+            let exhausted = reference
+                .iter()
+                .all(|&(r, diameter)| GROWTH * r * relax >= diameter);
+            if accepted.iter().any(|&a| a) || exhausted {
+                break (results, accepted);
+            }
+            relax *= 2.0;
+        };
         if std::env::var("VG_DBG").is_ok() {
-            let (l, v, fl) = results_lock;
-            eprintln!("DBG level {level} clusters {} groups {} old {old_tris} new {new_tris} locked {:.1}% floating {:.1}%", cur.len(), groups.len(), 100.0 * l as f64 / v.max(1) as f64, 100.0 * fl as f64 / old_tris.max(1) as f64);
+            let (l, v, fl) = results.iter().fold((0usize, 0usize, 0usize), |a, r| {
+                (a.0 + r.locked, a.1 + r.verts, a.2 + r.floating)
+            });
+            let old: usize = inputs.iter().map(Vec::len).sum();
+            let new: usize = results
+                .iter()
+                .zip(&accepted)
+                .zip(&inputs)
+                .map(|((r, &a), i)| if a { r.tris.len() } else { i.len() })
+                .sum();
+            eprintln!(
+                "DBG level {level} clusters {} groups {} accepted {} relax {relax} old {old} new {new} locked {:.1}% floating {:.1}%",
+                cur.len(),
+                groups.len(),
+                accepted.iter().filter(|&&a| a).count(),
+                100.0 * l as f64 / v.max(1) as f64,
+                100.0 * fl as f64 / old.max(1) as f64
+            );
         }
-        if new_tris * 100 > old_tris * STALL_PERCENT || new_total == 0 {
-            // Stop once a level removes less than 20% of the triangles. Cluster
-            // counts can stay unchanged while triangles fall substantially
-            // (material boundaries), so triangles, not clusters, decide. A
-            // stalled level (locked group boundaries on a tiny remainder) is
-            // never worth building: it adds depth and error but no detail
-            // reduction, so the previous level becomes the root.
+        if !accepted.iter().any(|&a| a) {
+            // Nothing simplifies at any error: the current clusters are the
+            // roots.
             break;
         }
 
-        // Measure the true deviation of every group from the original surface.
-        let measured: Vec<Measured> = groups
+        // Serial: allocate the placed vertices (ids must not depend on thread
+        // scheduling) and translate output corners to global ids.
+        let base0 = dag.vs.len() as u32;
+        let mut staged: Vec<Option<Vec<MatTri>>> = Vec::with_capacity(results.len());
+        let mut coverage: Vec<Option<(usize, f32)>> = Vec::with_capacity(results.len());
+        for (res, &ok) in results.iter().zip(&accepted) {
+            coverage.push(res.coverage_tris);
+            if !ok {
+                staged.push(None);
+                continue;
+            }
+            let wedge_pids: Vec<u32> = (0..res.wedges).map(|_| dag.vs.new_pid()).collect();
+            let mut per_pid: BTreeMap<u32, u32> = BTreeMap::new();
+            let pids: Vec<u32> = res
+                .new_verts
+                .iter()
+                .map(|nv| match nv.pid {
+                    NewPid::Existing(p) => p,
+                    NewPid::Wedge(w) => wedge_pids[w as usize],
+                })
+                .collect();
+            for (nv, &p) in res.new_verts.iter().zip(&pids) {
+                // A position shared with an existing vertex is a seam either way.
+                *per_pid.entry(p).or_default() += if matches!(nv.pid, NewPid::Existing(_)) {
+                    2
+                } else {
+                    1
+                };
+            }
+            let ids: Vec<u32> = res
+                .new_verts
+                .iter()
+                .zip(&pids)
+                .map(|(nv, &pid)| {
+                    let record = match nv.attr {
+                        NewAttr::Record(r) => r,
+                        NewAttr::Bytes(b) => dag.vs.add_record(&b),
+                    };
+                    dag.vs
+                        .push_placed(nv.pos, record, pid, per_pid[&pid] > 1, nv.floating)
+                })
+                .collect();
+            staged.push(Some(
+                res.tris
+                    .iter()
+                    .map(|&(c, m)| {
+                        let f = |x: u32| {
+                            if x >= base0 {
+                                ids[(x - base0) as usize]
+                            } else {
+                                x
+                            }
+                        };
+                        ([f(c[0]), f(c[1]), f(c[2])], m)
+                    })
+                    .collect(),
+            ));
+        }
+        drop(results);
+        let parts: Vec<Option<Vec<Piece>>> = staged
+            .par_iter()
+            .map(|s| s.as_ref().map(|t| split_into_clusters(&dag.vs, t)))
+            .collect();
+
+        // Measure the deviation of every simplified group from the original
+        // surface it stands for (both directions, see `deviation`).
+        let attr = |v: u32| attr_of(&dag.vs, v);
+        let surface = Surface {
+            pos: &dag.vs.pos,
+            attr: &attr,
+            seam: &dag.vs.seam,
+        };
+        // Level triangles by position id, to find each group's neighbours.
+        let by_pid: Vec<(u32, u32, u32)> =
+            {
+                let mut v: Vec<(u32, u32, u32)> =
+                    cur.iter()
+                        .flat_map(|&c| {
+                            let vs = &dag.vs;
+                            dag.clusters[c as usize].tris.iter().enumerate().flat_map(
+                                move |(ti, t)| t.map(|x| (vs.pid[x as usize], c, ti as u32)),
+                            )
+                        })
+                        .collect();
+                v.par_sort_unstable();
+                v.dedup();
+                v
+            };
+        let measured: Vec<Option<Measured>> = groups
             .par_iter()
             .zip(parts.par_iter())
-            .map(|(members, pieces)| {
-                let mut refs: Vec<RefPoint> = Vec::new();
-                for &c in members {
-                    let cn = &dag.clusters[c as usize];
-                    if cn.level == 0 {
-                        let mut ids: Vec<u32> = cn.tris.iter().flatten().copied().collect();
-                        ids.sort_unstable();
-                        ids.dedup();
-                        // Vertices on an attribute seam carry no attributes: see
-                        // `deviation`. Elsewhere the original record is the truth.
-                        refs.extend(ids.iter().map(|&v| {
-                            RefPoint {
-                                p: dag.vs.pos[v as usize],
-                                shading: (!dag.vs.seam[v as usize])
-                                    .then(|| attr_of(&dag.vs, v).and_then(|a| Shading::of(&a)))
-                                    .flatten(),
-                            }
-                        }));
-                        // Triangle centroids too: vertices alone under-sample the
-                        // surface between them (high-frequency scan noise).
-                        for t in &cn.tris {
-                            let p = t.map(|v| dag.vs.pos[v as usize]);
-                            let corners =
-                                t.map(|v| attr_of(&dag.vs, v).and_then(|a| Shading::of(&a)));
-                            let shading = match (corners[0], corners[1], corners[2]) {
-                                (Some(a), Some(b), Some(c)) => {
-                                    Shading::blend([&a, &b, &c], [1.0 / 3.0; 3])
-                                }
-                                _ => None,
-                            };
-                            refs.push(RefPoint {
-                                p: scale(add(add(p[0], p[1]), p[2]), 1.0 / 3.0),
-                                shading,
-                            });
+            .zip(inputs.par_iter())
+            .map(|((members, pieces), input)| {
+                let pieces = pieces.as_ref()?;
+                let mut owned: Vec<u32> = members
+                    .iter()
+                    .flat_map(|&c| dag.clusters[c as usize].refs.iter().copied())
+                    .collect();
+                owned.sort_unstable();
+                let mut claimed: Vec<u32> = members
+                    .iter()
+                    .flat_map(|&c| dag.clusters[c as usize].claimed.iter().copied())
+                    .collect();
+                claimed.sort_unstable();
+                claimed.dedup();
+                claimed.retain(|i| owned.binary_search(i).is_err());
+                // Triangles of other clusters sharing a position with the group.
+                let mut sorted_members = members.clone();
+                sorted_members.sort_unstable();
+                let mut pids: Vec<u32> = input
+                    .iter()
+                    .flat_map(|t| t.v.map(|v| dag.vs.pid[v as usize]))
+                    .collect();
+                pids.sort_unstable();
+                pids.dedup();
+                let mut near: Vec<(u32, u32)> = Vec::new();
+                for p in pids {
+                    let lo = by_pid.partition_point(|e| e.0 < p);
+                    for &(q, c, t) in &by_pid[lo..] {
+                        if q != p {
+                            break;
                         }
-                    } else {
-                        refs.extend_from_slice(&cn.refs);
+                        if sorted_members.binary_search(&c).is_err() {
+                            near.push((c, t));
+                        }
                     }
                 }
-                let piece_tris: Vec<&[[u32; 3]]> = pieces.iter().map(|p| p.0.as_slice()).collect();
-                let input: Vec<[u32; 3]> = members
+                near.sort_unstable();
+                near.dedup();
+                // Originals across the border belong to the bordering clusters: the
+                // result near the border is measured against them too.
+                let mut bordering: Vec<u32> = near.iter().map(|&(c, _)| c).collect();
+                bordering.dedup();
+                for c in bordering {
+                    claimed.extend_from_slice(&dag.clusters[c as usize].refs);
+                }
+                claimed.sort_unstable();
+                claimed.dedup();
+                claimed.retain(|i| owned.binary_search(i).is_err());
+                let neighbours: Vec<[V3; 3]> = near
                     .iter()
-                    .flat_map(|&c| dag.clusters[c as usize].tris.iter().copied())
+                    .map(|&(c, t)| {
+                        dag.clusters[c as usize].tris[t as usize].map(|v| dag.vs.pos[v as usize])
+                    })
                     .collect();
-                let attr = |v: u32| attr_of(&dag.vs, v);
-                measure(
-                    &refs,
-                    &input,
-                    &piece_tris,
-                    &Surface {
-                        pos: &dag.vs.pos,
-                        attr: &attr,
+                let piece_tris: Vec<&[[u32; 3]]> = pieces.iter().map(|p| p.0.as_slice()).collect();
+                Some(measure(
+                    &original,
+                    Region {
+                        owned: &owned,
+                        claimed: &claimed,
                     },
-                )
+                    &piece_tris,
+                    &neighbours,
+                    &surface,
+                ))
             })
             .collect();
 
-        let mut next: Vec<u32> = Vec::with_capacity(new_total);
-        for (((members, st), pieces), meas) in
-            groups.into_iter().zip(staged).zip(parts).zip(measured)
+        let mut next: Vec<u32> = Vec::with_capacity(cur.len());
+        for ((((members, pieces), meas), cov), st) in groups
+            .into_iter()
+            .zip(parts)
+            .zip(measured)
+            .zip(coverage)
+            .zip(staged)
         {
+            let (Some(pieces), Some(meas), Some(st)) = (pieces, meas, st) else {
+                // Kept its triangles: the clusters wait for the next level.
+                next.extend_from_slice(&members);
+                continue;
+            };
             // Group sphere contains every child sphere (so containment is
             // monotone up the DAG) and every vertex the simplifier produced.
             let mut sphere = dag.clusters[members[0] as usize].sphere;
@@ -389,20 +488,14 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
                 sphere = sphere_union(sphere, dag.clusters[c as usize].sphere);
                 child_err = child_err.max(dag.clusters[c as usize].self_error);
             }
-            for (t, _) in &st.tris {
+            for (t, _) in &st {
                 for &v in t {
                     let p = dag.vs.pos[v as usize];
                     sphere = sphere_union(sphere, [p[0], p[1], p[2], 0.0]);
                 }
             }
-            // `meas.error` is the measured distance of original-surface points
-            // to this group's simplified surface (`meas.shading` the equivalent
-            // length of their normal / uv change), so it already includes all
-            // deviation accumulated by earlier levels: take the max with the
-            // children (monotone), never a sum. `st.error` (the simplifier's
-            // own estimate) is deliberately not used.
             let floor = 1e-5 * sphere[3].max(1e-6);
-            let mut error = match st.coverage {
+            let mut error = match cov {
                 Some((n, foot)) => {
                     let spacing = sphere[3] * (4.18879 / n.max(1) as f32).cbrt();
                     child_err
@@ -410,14 +503,14 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
                         .max(COVERAGE_FACTOR * spacing)
                         .max(floor)
                 }
-                None => {
-                    // The measured deviation is the stored error: a true bound
-                    // on what swapping this group in changes (position, normal
-                    // and uv), with nothing relaxed for density. The runtime
-                    // controls overdraw per tile instead.
-                    let geo = meas.error.max(meas.shading).max(meas.forward) * ERROR_MARGIN;
-                    child_err.max(geo).max(floor)
-                }
+                // The measured two-sided deviation from the original surface
+                // (position, and normal/uv in the same unit) is the stored
+                // error: a bound on what swapping this group in changes, with
+                // nothing relaxed for density (the runtime controls overdraw
+                // per tile instead). It already contains everything earlier
+                // levels changed, so it is combined with the children's error
+                // by max, only to keep the DAG monotone.
+                None => child_err.max(meas.position).max(meas.shading).max(floor),
             };
             if error <= child_err {
                 error = f32::from_bits(child_err.to_bits() + 1);
@@ -430,9 +523,14 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
                 cn.parent_sphere = sphere;
                 cn.consumer = gid;
                 cn.refs = Vec::new();
+                cn.claimed = Vec::new();
             }
             let mut produced = Vec::new();
-            for ((tris, mat), refs) in pieces.into_iter().zip(meas.piece_refs) {
+            for (((tris, mat), refs), claimed) in pieces
+                .into_iter()
+                .zip(meas.piece_refs)
+                .zip(meas.piece_claimed)
+            {
                 produced.push(dag.clusters.len() as u32);
                 next.push(dag.clusters.len() as u32);
                 dag.clusters.push(ClusterNode {
@@ -446,6 +544,7 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
                     producer: gid,
                     consumer: NONE,
                     refs,
+                    claimed,
                 });
             }
             dag.groups.push(Group {
@@ -457,11 +556,16 @@ pub fn build_dag(mesh: &MeshInput) -> Result<Dag, BuildError> {
                 produced,
             });
         }
+        next.sort_unstable();
         cur = next;
         level += 1;
     }
 
     // ── roots ──────────────────────────────────────────────────────────────
+    for c in &cur {
+        dag.clusters[*c as usize].refs = Vec::new();
+        dag.clusters[*c as usize].claimed = Vec::new();
+    }
     for chunk in cur.chunks(ROOT_CHUNK) {
         let gid = dag.groups.len() as u32;
         let mut sphere = dag.clusters[chunk[0] as usize].sphere;

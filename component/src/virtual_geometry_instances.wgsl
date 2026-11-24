@@ -1,5 +1,7 @@
 // Virtual-geometry instance derivation (see `virtual_geometry_instances.rs`).
-// `helio_vg_format::WGSL` is prepended: VgInstance and the VG_INST_* flags.
+// Prepended: `helio_vg_format::WGSL` (VgInstance and the VG_INST_* flags),
+// the meshes' `StaticObjectRow` and `INSTANCE_FLAG_*` (helio-mesh-api), and
+// the scene join's rows (Owner, Handle).
 //
 // Three kernels, run in order on a change of any input:
 //   cs_scatter_overrides  per VG component row: by_owner[owner] = its override row
@@ -14,12 +16,14 @@ struct Override {
     lod_error_scale: f32,
 }
 
-/// `meshes_component::virtual_geometry_instances::VgAssetReadyRow`.
+/// `helio_vg_format::VgAssetReadyRow` (32 bytes).
 struct AssetReady {
-    vertex_offset: u32,
-    vertex_count: u32,
+    // The asset's content id, low word first.
+    content: vec4<u32>,
     asset_slot: u32,
     flags: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 struct Uniforms {
@@ -31,10 +35,6 @@ struct Uniforms {
 }
 
 const F32_MAX: f32 = 3.4028235e38;
-// `static_objects` rows are 240 bytes = 60 words:
-// word 0 mesh_slot, word 1 mesh_generation, words 4..20 the model matrix
-// (column-major, four columns of four).
-const OBJECT_WORDS: u32 = 60u;
 const NO_ASSET: u32 = 0xffffffffu;
 const ASSET_READY_BIT: u32 = 1u;
 const OVERRIDE_PRESENT: u32 = 0x80000000u;
@@ -48,8 +48,10 @@ const UNIFORM_SCALE_TOLERANCE: f32 = 1.0e-3;
 @group(0) @binding(3) var<storage, read> override_handles: array<Handle>;
 @group(0) @binding(4) var<storage, read> override_pool: array<Override>;
 @group(0) @binding(5) var<storage, read> section_handles: array<Handle>;
-@group(0) @binding(6) var<storage, read> vertex_handles: array<Handle>;
-@group(0) @binding(7) var<storage, read> objects: array<u32>;
+// Per static-mesh instance: the content id of its full geometry (its
+// virtual-geometry asset), `StaticMeshDraw::vg_asset`.
+@group(0) @binding(6) var<storage, read> vg_assets: array<vec4<u32>>;
+@group(0) @binding(7) var<storage, read> objects: array<StaticObjectRow>;
 @group(0) @binding(8) var<storage, read> asset_ready: array<AssetReady>;
 // Per object entity: (override flags | OVERRIDE_PRESENT, bitcast scale), or
 // zero when the object has no VirtualGeometryComponent. Copying the row here
@@ -62,27 +64,35 @@ const UNIFORM_SCALE_TOLERANCE: f32 = 1.0e-3;
 // Per static_objects row: set for every section row of a VG-active instance.
 @group(0) @binding(14) var<storage, read_write> classic_suppressed: array<atomic<u32>>;
 
-fn object_f32(word: u32) -> f32 {
-    return bitcast<f32>(objects[word]);
+/// Whether content id `a` sorts before `b`, both read as a `u128` whose
+/// word 3 is the most significant (`VgAssetReadyRow::sort_key`).
+fn content_less(a: vec4<u32>, b: vec4<u32>) -> bool {
+    if a.w != b.w { return a.w < b.w; }
+    if a.z != b.z { return a.z < b.z; }
+    if a.y != b.y { return a.y < b.y; }
+    return a.x < b.x;
 }
 
-/// Rows of `asset_ready` are sorted ascending by `vertex_offset`; padding rows
-/// carry `vertex_offset == 0xffffffff` and sort last.
-fn find_asset(vertex_offset: u32) -> u32 {
+/// Rows of `asset_ready` are sorted ascending by content id; padding rows
+/// carry an all-ones content, sort last and are never ready. A zero content
+/// (no geometry) names no asset.
+fn find_asset(content: vec4<u32>) -> u32 {
+    if all(content == vec4<u32>(0u)) {
+        return NO_ASSET;
+    }
     let n = arrayLength(&asset_ready);
     var low = 0u;
     var high = n;
     loop {
         if low >= high { break; }
         let mid = low + (high - low) / 2u;
-        if asset_ready[mid].vertex_offset < vertex_offset {
+        if content_less(asset_ready[mid].content, content) {
             low = mid + 1u;
         } else {
             high = mid;
         }
     }
-    if low < n && asset_ready[low].vertex_offset == vertex_offset
-        && asset_ready[low].vertex_count != 0u {
+    if low < n && all(asset_ready[low].content == content) {
         return low;
     }
     return NO_ASSET;
@@ -91,10 +101,11 @@ fn find_asset(vertex_offset: u32) -> u32 {
 /// Cone (backface) culling in asset space is valid only when the instance
 /// transform preserves angles and orientation: finite non-zero uniform scale
 /// and no mirroring.
-fn cone_cull_allowed(base: u32) -> bool {
-    let c0 = vec3<f32>(object_f32(base + 4u), object_f32(base + 5u), object_f32(base + 6u));
-    let c1 = vec3<f32>(object_f32(base + 8u), object_f32(base + 9u), object_f32(base + 10u));
-    let c2 = vec3<f32>(object_f32(base + 12u), object_f32(base + 13u), object_f32(base + 14u));
+fn cone_cull_allowed(object: u32) -> bool {
+    let m = objects[object].transform;
+    let c0 = vec3<f32>(m[0][0], m[0][1], m[0][2]);
+    let c1 = vec3<f32>(m[1][0], m[1][1], m[1][2]);
+    let c2 = vec3<f32>(m[2][0], m[2][1], m[2][2]);
     let l0 = length(c0);
     let l1 = length(c1);
     let l2 = length(c2);
@@ -141,7 +152,7 @@ fn cs_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (u.flags & 1u) == 0u {
         return;
     }
-    if row >= arrayLength(&section_handles) || row >= arrayLength(&vertex_handles)
+    if row >= arrayLength(&section_handles) || row >= arrayLength(&vg_assets)
         || row >= arrayLength(&owners) {
         return;
     }
@@ -151,38 +162,37 @@ fn cs_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     if draws.count == 0u {
         return;
     }
-    let base = draws.offset * OBJECT_WORDS;
-    if base + OBJECT_WORDS > arrayLength(&objects) {
+    let first = draws.offset;
+    if first >= arrayLength(&objects) {
         return;
     }
-    if objects[base] != row || objects[base + 1u] == 0u {
+    let object = objects[first];
+    if object.mesh_slot != row || object.mesh_generation == 0u {
         return;
     }
-    // Asset readiness (root pages resident), found by the instance's interned
-    // vertex range.
-    let vertices = vertex_handles[row];
-    if vertices.count == 0u {
+    // The instance's own choice (the static mesh's `virtual_geometry`).
+    if (object.flags & INSTANCE_FLAG_VIRTUAL_GEOMETRY) == 0u {
         return;
     }
-    let asset = find_asset(vertices.offset);
+    // Asset readiness (root pages resident), found by the content id of the
+    // instance's full geometry: whether it shows that geometry or its
+    // fallback, the asset is the same.
+    let asset = find_asset(vg_assets[row]);
     if asset == NO_ASSET || (asset_ready[asset].flags & ASSET_READY_BIT) == 0u {
         return;
     }
 
-    // Authored overrides of the owner object; none means global defaults.
+    // Tuning authored on the owner object; none means the defaults.
     var flags = VG_INST_ENABLED | VG_INST_SHADOW_CASTER;
     var scale = 1.0;
     let owner = owners[row].owner_index;
     if owner < arrayLength(&by_owner) {
         let authored = by_owner[owner];
         if (authored.x & OVERRIDE_PRESENT) != 0u {
-            if (authored.x & VG_INST_ENABLED) == 0u {
-                return;
-            }
             // Only authored bits; derived ones are set below.
-            flags = authored.x
+            flags = VG_INST_ENABLED | (authored.x
                 & ~(OVERRIDE_PRESENT | VG_INST_LOD_SUPPRESS | VG_INST_CONE_CULL
-                    | (VG_INST_SECTION_MASK << VG_INST_SECTION_SHIFT));
+                    | (VG_INST_SECTION_MASK << VG_INST_SECTION_SHIFT)));
             scale = bitcast<f32>(authored.y);
         }
     }
@@ -191,7 +201,7 @@ fn cs_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     flags = flags | VG_INST_LOD_SUPPRESS
         | (min(draws.count, VG_INST_SECTION_MASK) << VG_INST_SECTION_SHIFT);
-    if cone_cull_allowed(base) {
+    if cone_cull_allowed(first) {
         flags = flags | VG_INST_CONE_CULL;
     }
     candidates[row] = VgInstance(asset_ready[asset].asset_slot, flags, scale, draws.offset);

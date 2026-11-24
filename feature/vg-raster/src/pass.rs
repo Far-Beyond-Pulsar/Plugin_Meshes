@@ -458,7 +458,9 @@ pub struct VgRaster {
     bgl0_compute: wgpu::BindGroupLayout,
     sw64: Option<Sw64>,
     tile: Option<TileFallback>,
-    classify: wgpu::ComputePipeline,
+    /// Tiles dense last frame first, then the others (they share the slots).
+    classify_kept: wgpu::ComputePipeline,
+    classify_new: wgpu::ComputePipeline,
     classify_args: wgpu::ComputePipeline,
     classify_bgl: wgpu::BindGroupLayout,
     binding: helio_mats::MaterialBindingConfig,
@@ -638,7 +640,20 @@ impl VgRaster {
             ],
         );
         let cpl = pipeline_layout(device, "VG Classify PL", &[&classify_bgl]);
-        let classify = compute(device, "VG Tile Classify", &cpl, &cm, "classify_main");
+        let classify_kept = compute(
+            device,
+            "VG Tile Classify Kept",
+            &cpl,
+            &cm,
+            "classify_kept_main",
+        );
+        let classify_new = compute(
+            device,
+            "VG Tile Classify New",
+            &cpl,
+            &cm,
+            "classify_new_main",
+        );
         let classify_args = compute(device, "VG Dense Args", &cpl, &cm, "dense_args_main");
         Self {
             config,
@@ -647,7 +662,8 @@ impl VgRaster {
             bgl0_compute,
             sw64,
             tile,
-            classify,
+            classify_kept,
+            classify_new,
             classify_args,
             classify_bgl,
             binding: helio_mats::MaterialBindingConfig::for_device(device),
@@ -1092,9 +1108,11 @@ impl VgRaster {
             label: Some("VG Tile Classify"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(&self.classify);
         cpass.set_bind_group(0, &gc, &[]);
-        cpass.dispatch_workgroups((t.tiles_x * t.tiles_y).div_ceil(64), 1, 1);
+        for pipeline in [&self.classify_kept, &self.classify_new] {
+            cpass.set_pipeline(pipeline);
+            cpass.dispatch_workgroups((t.tiles_x * t.tiles_y).div_ceil(64), 1, 1);
+        }
         cpass.set_pipeline(&self.classify_args);
         cpass.dispatch_workgroups(1, 1, 1);
         drop(cpass);

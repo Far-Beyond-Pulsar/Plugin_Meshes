@@ -328,15 +328,9 @@ fn rasterize_preview(
                             } else {
                                 ia.3 * wa + ib.3 * wb + ic.3 * wc
                             };
-                            let scaled = Vec2::new(
-                                uv.x * reference.transform.scale[0],
-                                uv.y * reference.transform.scale[1],
-                            );
-                            let (sin, cos) = reference.transform.rotation_radians.sin_cos();
-                            let transformed_uv = Vec2::new(
-                                cos * scaled.x - sin * scaled.y + reference.transform.offset[0],
-                                sin * scaled.x + cos * scaled.y + reference.transform.offset[1],
-                            );
+                            // The slot's UV transform, as every material shader applies it.
+                            let transformed_uv =
+                                Vec2::from_array(reference.transform.apply(uv.to_array()));
                             sample_texture_rgba(texture, transformed_uv)
                         });
                         let lit = shade;

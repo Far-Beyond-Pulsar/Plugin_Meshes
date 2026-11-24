@@ -46,6 +46,7 @@ const INSTANCE_FLAG_ALWAYS_VISIBLE: u32 = 4u;
 const INSTANCE_FLAG_MOVABLE: u32 = 8u;
 const INSTANCE_FLAG_CLASSIC_SUPPRESSED: u32 = 16u;
 const INSTANCE_FLAG_SKINNED: u32 = 32u;
+const INSTANCE_FLAG_VIRTUAL_GEOMETRY: u32 = 64u;
 // `helio_mesh_api::INSTANCE_COORDINATE_SPACE_SHIFT`.
 const INSTANCE_COORDINATE_SPACE_SHIFT: u32 = 8u;
 
@@ -53,4 +54,14 @@ const INSTANCE_COORDINATE_SPACE_SHIFT: u32 = 8u;
 // its row in the frame's `coordinate_spaces`, 0 the frame's own.
 fn instance_coordinate_space(flags: u32) -> u32 {
     return (flags >> INSTANCE_COORDINATE_SPACE_SHIFT) & 0xFFu;
+}
+
+// Whether the instance's transform mirrors (a negative determinant): its
+// triangles wind the other way, so `front_facing` is reversed for it. Batched
+// draws get this from their segment's front face
+// (`helio_mesh_api::RASTER_FLAG_REVERSED_WINDING`); a pass that draws every
+// instance with one pipeline tests it itself.
+fn instance_mirrors(inst: GpuInstanceData) -> bool {
+    let t = inst.transform;
+    return dot(cross(t[0].xyz, t[1].xyz), t[2].xyz) < 0.0;
 }

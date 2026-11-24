@@ -6,16 +6,18 @@
 //! dependencies; the output is a deterministic function of the input and the
 //! [`BuildOptions`].
 //!
-//! Error metric: every group's error is the *measured* object-space distance
-//! from original-surface reference points (carried up the DAG) to the group's
-//! simplified surface, times a small margin; parent error is
-//! `max(children, measured)`, never a sum (module `deviation`). The simplifier's
-//! own estimate is not used, and input vertices it leaves further than a
-//! per-group budget from the result are locked and the group re-simplified.
-//!
 //! Pipeline: [`mesh::weld`] -> per-material [`cluster`] -> repeat
-//! { [`partition`] 4..=8 clusters, [`simplify`] with locked group boundary,
-//! split } -> [`pack::write_vgeo`].
+//! { [`partition`] (`meshopt_partitionClusters`), [`simplify`] toward half
+//! the triangles with the group border locked, attribute-aware quadrics,
+//! optimal vertex placement and an error limit (see [`dag`]), split,
+//! [`deviation`] } -> [`pack::write_vgeo`].
+//!
+//! Error metric: every group's error is a rigorous two-sided Hausdorff bound
+//! between its simplified surface and the original (level-0) surface it
+//! stands for, with the normal / uv change converted to the same unit
+//! (module `deviation`); parent error is `max(children, measured)`, never a
+//! sum and never a safety factor. The simplifier's own estimate only steers
+//! the collapses.
 
 mod cluster;
 mod dag;
@@ -49,7 +51,10 @@ pub use reader::{PageView, ParseError, VgeoReader};
 /// Revision 7 restores revision 5 foliage simplification and coverage error.
 /// Revision 6 produced distorted foliage and excessive refinement; recook it.
 /// Revision 12 stores the true deviation (position, normal and uv, no baked density relaxation).
-pub const COOK_REVISION: u32 = 12;
+/// Revision 13 simplifies with attribute-aware quadrics and optimal vertex
+/// placement under an error limit, partitions with meshoptimizer and stores a
+/// rigorous two-sided deviation from the original surface.
+pub const COOK_REVISION: u32 = 13;
 
 pub fn is_current_cook(header: &helio_vg_format::VgeoHeader) -> bool {
     header.asset.flags >> 16 == COOK_REVISION

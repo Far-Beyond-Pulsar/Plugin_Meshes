@@ -246,7 +246,6 @@ pollster = { version = "0.4" }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 salva3d = { version = "0.9", features = ["dim3", "parry", "rapier"] }
-half = "2"
 rayon = "1"
 serde = { workspace = true }
 ureq = { version = "2.12", optional = true, default-features = false, features = ["tls"] }

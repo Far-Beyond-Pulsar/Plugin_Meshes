@@ -566,13 +566,93 @@ fn estimate_buffer(
     base_words: u32,
     hot: impl Fn(u32) -> bool,
 ) -> wgpu::Buffer {
-    use helio_pass_vg_cull::{TILE_FIXED, TILE_WORDS};
+    use helio_pass_vg_cull::{tile_word, TILE_FIXED, TILE_WORDS};
     let mut words = vec![0xdead_beefu32; base_words as usize];
     for t in 0..tiles[0] * tiles[1] {
         let tris = if hot(t) { 500.0 } else { 1.0 };
-        words.extend_from_slice(&[(tris * TILE_FIXED) as u32, 0, 0][..TILE_WORDS as usize]);
+        let mut tile = [0u32; TILE_WORDS as usize];
+        tile[tile_word::TRIANGLES as usize] = (tris * TILE_FIXED) as u32;
+        words.extend_from_slice(&tile);
     }
     buffer_init(g, "estimate", &words, wgpu::BufferUsages::STORAGE)
+}
+
+/// More tiles qualify than `dense_max_tiles`: the tiles already dense keep their
+/// slots and only the free ones go to newcomers, so a still scene keeps one mask
+/// (#1642). With one dispatch the slots went to whichever tiles reached the
+/// counter first: the mask changed from frame to frame, and the cull's overdraw
+/// valve (relaxing dense tiles, coarsening the others) flapped with it on the
+/// forest shots.
+#[test]
+fn dense_tiles_keep_their_slots_when_more_qualify_than_fit() {
+    use helio_pass_vg_cull::VgTileEstimate;
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(g) = gpu() else { return };
+    const MAX: u32 = 40;
+    let raster = VgRaster::new(
+        &g.device,
+        VgRasterConfig {
+            force_tile_fallback: true,
+            dense_tri_threshold: 64,
+            dense_hit_threshold: u32::MAX,
+            dense_max_tiles: MAX,
+            ..Default::default()
+        },
+    );
+    let mut targets = VgTargets::new(&g.device, 256, 256, &raster);
+    let grid = [targets.tiles_x, targets.tiles_y];
+    let n = grid[0] * grid[1];
+    let mut classify = |est: &wgpu::Buffer| -> Vec<u32> {
+        let mut enc = g.device.create_command_encoder(&Default::default());
+        // The frame's first raster phase clears the dense count.
+        enc.clear_buffer(&targets.dense_args, 0, None);
+        {
+            let mut rec = helio_core::CommandRecorder::from_encoder(&mut enc);
+            raster.encode_classify(
+                &g.device,
+                &g.queue,
+                &mut rec,
+                &mut targets,
+                Some(VgTileEstimate {
+                    buffer: est,
+                    base_words: 0,
+                    tiles: grid,
+                }),
+            );
+        }
+        g.queue.submit([enc.finish()]);
+        bytemuck::cast_slice(&read_buffer(
+            &g,
+            targets.dense_mask_last_frame(),
+            u64::from(n) * 4,
+        ))
+        .to_vec()
+    };
+    // Frame 1: the last 30 tiles (the ones a dispatch reaches last) qualify, all fit.
+    let first = classify(&estimate_buffer(&g, grid, 0, |t| t >= n - 30));
+    assert_eq!(first.iter().sum::<u32>(), 30);
+    // Then every tile qualifies, more than fit: the 30 keep their slots, the 10
+    // free ones are taken, and the mask holds while nothing changes.
+    let all = estimate_buffer(&g, grid, 0, |_| true);
+    let second = classify(&all);
+    assert_eq!(
+        second.iter().sum::<u32>(),
+        MAX,
+        "the slots are not all used"
+    );
+    for t in 0..n as usize {
+        assert!(
+            first[t] == 0 || second[t] == 1,
+            "tile {t} was dense and lost its slot to a newcomer"
+        );
+    }
+    for frame in 3..10 {
+        assert_eq!(
+            classify(&all),
+            second,
+            "frame {frame}: the dense mask changed on a still scene"
+        );
+    }
 }
 
 /// Resizing the viewport: the cull's tile grid and the raster's are rebuilt at

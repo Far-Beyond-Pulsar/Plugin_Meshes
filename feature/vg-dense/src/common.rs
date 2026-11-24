@@ -102,6 +102,16 @@ impl DenseStats {
     }
 }
 
+/// One `dense_key` entry read back as its two words: `(depth bits, vis id)`
+/// through `helio_vg_format::raster_key_depth` / `raster_key_id`.
+pub fn dense_key_words(words: &[u32]) -> (u32, u32) {
+    let key = (u64::from(words[1]) << 32) | u64::from(words[0]);
+    (
+        helio_vg_format::raster_key_depth(key).to_bits(),
+        helio_vg_format::raster_key_id(key),
+    )
+}
+
 /// Buffers owned by a Tier-3 backend, sized for one viewport.
 pub struct DenseBuffers {
     pub viewport: [u32; 2],
@@ -118,7 +128,8 @@ pub struct DenseBuffers {
     pub slot_lists: wgpu::Buffer,
     /// Indirect args: `[peel x,y,z, bin x,y,z]`.
     pub args: wgpu::Buffer,
-    /// Output: `vec2<u32>(depth bits, vis id)` per pixel. Only dense-tile
+    /// Output: `vg_raster_key(depth, vis id)` per pixel, i.e. the words
+    /// `[id, depth bits]` of `helio_vg_format::raster_key`. Only dense-tile
     /// pixels are written; consumers read it through the dense tile mask.
     pub dense_key: wgpu::Buffer,
     pub stats_staging: wgpu::Buffer,

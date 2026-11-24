@@ -521,12 +521,14 @@ fn defer_job(job: vec2<u32>) -> bool {
 
 // ── Per-tile density: the overdraw valve and the dense-tile estimate ───────
 //
-// `state` carries, after the marks, three words per 16x16 tile: the triangles
-// and the covered area the clusters emitted last frame estimate into the tile
-// (fixed point), and the valve's coarsening scale `g >= 1` (f32 bits; 0 reads
-// as 1). `cs_tiles` turns the estimate into the scale and clears it; the
-// traversal reads the scales from the `hist_ro` copy taken after `cs_tiles`;
-// `emit_cluster` adds to the estimate; the dense-tile classifier reads the
+// `state` carries, after the marks, `VGC_TILE_WORDS` words per 16x16 tile
+// (`VGC_TW_*` offsets): the triangles and the covered area the clusters emitted
+// last frame estimate into the tile (fixed point), the valve's coarsening scale
+// `g >= 1` (f32 bits; 0 reads as 1), and the valve's own state (the density a
+// parked tile holds at, the last step; see `cs_tiles`). `cs_tiles` turns the estimate into
+// the scale and clears it; the traversal reads the scales from the `hist_ro`
+// copy taken after `cs_tiles`; `emit_cluster` adds to the estimate; the
+// dense-tile classifier reads the
 // triangle word (so hardware-class clusters count towards "this tile is dense"
 // without the software raster having run).
 
@@ -570,7 +572,7 @@ fn tile_word(t: u32, w: u32) -> u32 { return params.tile_base + t * VGC_TILE_WOR
 
 // This frame's valve scale of tile `t`, from the read-only copy.
 fn tile_scale_of(t: u32) -> f32 {
-    return bitcast<f32>(hist_ro[params.ro_tile_base + t * VGC_TILE_WORDS + 2u]);
+    return bitcast<f32>(hist_ro[params.ro_tile_base + t * VGC_TILE_WORDS + VGC_TW_SCALE]);
 }
 
 // The valve's coarsening scale for a sphere: the largest scale of the tiles it
@@ -646,8 +648,8 @@ fn tile_add(t: u32, tris_fx: u32, area_fx: u32) {
             return;
         }
     }
-    atomicAdd(&state[tile_word(t, 0u)], tris_fx);
-    atomicAdd(&state[tile_word(t, 1u)], area_fx);
+    atomicAdd(&state[tile_word(t, VGC_TW_TRIANGLES)], tris_fx);
+    atomicAdd(&state[tile_word(t, VGC_TW_AREA)], area_fx);
 }
 
 // One slot of the tile table to `state`, emptied for the next wave. Called by
@@ -657,8 +659,8 @@ fn tile_flush(s: u32) {
     if t == TILE_EMPTY { return; }
     let a = atomicExchange(&wg_tile_tris[s], 0u);
     let b = atomicExchange(&wg_tile_area[s], 0u);
-    if a != 0u { atomicAdd(&state[tile_word(t, 0u)], a); }
-    if b != 0u { atomicAdd(&state[tile_word(t, 1u)], b); }
+    if a != 0u { atomicAdd(&state[tile_word(t, VGC_TW_TRIANGLES)], a); }
+    if b != 0u { atomicAdd(&state[tile_word(t, VGC_TW_AREA)], b); }
     atomicStore(&wg_tile_key[s], TILE_EMPTY);
 }
 
@@ -1112,41 +1114,57 @@ fn process_job(job: vec2<u32>) {
 // One thread per 16x16 tile, before traversal: turns last frame's emitted-triangle
 // estimate into the overdraw valve's scale for this frame and clears the estimate.
 //
-// The valve is a slow integrator with a dead band, so it cannot oscillate: a
-// tile over `tile_limit * (1 + VGC_TILE_BAND)` triangles per covered pixel
-// coarsens by `VGC_TILE_STEP_UP` per frame (up to `VGC_TILE_SCALE_MAX`), a tile
-// under `tile_limit / (1 + VGC_TILE_BAND)` relaxes by `VGC_TILE_STEP_DOWN`, and
-// in between it holds. A tile the dense-tile mask marks dense is exempt: its
-// scale only relaxes (dense is an outcome of the cut, not a failure of it).
+// The valve is a slow integrator with a dead band: a tile over
+// `tile_limit * (1 + VGC_TILE_BAND)` triangles per covered pixel coarsens by
+// `VGC_TILE_STEP_UP` per frame (up to `VGC_TILE_SCALE_MAX`), a tile under
+// `tile_limit / (1 + VGC_TILE_BAND)` relaxes by `VGC_TILE_STEP_DOWN`, and in
+// between it holds. Tiles in the dense-tile mask get the same law: the limit
+// bounds what the cull emits (its bins, the traversal, every raster tier), and
+// no tier makes that free.
+//
+// The cut is discrete: one group swapping can move a tile's density across the
+// whole band (a cliff), and then no scale puts the tile inside it, so the law
+// alone cycles (coarsen, fall under the band, relax, climb over it). A
+// coarsening step cannot cross the band on a continuous density (see
+// `TILE_STEP_UP`), so a tile that falls under the band right after one has
+// found a cliff: it parks at that scale (`VGC_TW_PARK` = the density it parked
+// at) and holds while its density stays within the band's ratio of that. A
+// content change (camera, streaming, edits) beyond it releases the park.
 @compute @workgroup_size(64)
 fn cs_tiles(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = gid.x;
     if t >= params.tiles_x * params.tiles_y { return; }
-    let tris = f32(atomicExchange(&state[tile_word(t, 0u)], 0u)) / VGC_TILE_FIXED;
-    let area = f32(atomicExchange(&state[tile_word(t, 1u)], 0u)) / VGC_TILE_FIXED;
-    var g = max(bitcast<f32>(atomicLoad(&state[tile_word(t, 2u)])), 1.0);
+    let tris = f32(atomicExchange(&state[tile_word(t, VGC_TW_TRIANGLES)], 0u)) / VGC_TILE_FIXED;
+    let area = f32(atomicExchange(&state[tile_word(t, VGC_TW_AREA)], 0u)) / VGC_TILE_FIXED;
+    var g = max(bitcast<f32>(atomicLoad(&state[tile_word(t, VGC_TW_SCALE)])), 1.0);
+    var park = bitcast<f32>(atomicLoad(&state[tile_word(t, VGC_TW_PARK)]));
+    let last = atomicLoad(&state[tile_word(t, VGC_TW_STEP)]);
+    var step = VGC_TILE_STEP_HOLD;
     if params.tile_limit > 0.0 {
         let d = tris / max(min(area, f32(VGC_TILE * VGC_TILE)), 1.0);
-        // The mask has the raster's grid (`dense_tiles_*`), which is not this
-        // grid for the frame after a resize: read it by tile coordinate.
-        var dense = false;
-        if (params.flags & VGC_FLAG_DENSE_MASK) != 0u {
-            let x = t % params.tiles_x;
-            let y = t / params.tiles_x;
-            let m = y * params.dense_tiles_x + x;
-            if x < params.dense_tiles_x && y < params.dense_tiles_y && m < arrayLength(&dense_mask) {
-                dense = dense_mask[m] != 0u;
-            }
+        let hi = params.tile_limit * (1.0 + VGC_TILE_BAND);
+        let lo = params.tile_limit / (1.0 + VGC_TILE_BAND);
+        if park > 0.0 && (d > hi || d > park * (1.0 + VGC_TILE_BAND) || d < park / (1.0 + VGC_TILE_BAND)) {
+            park = 0.0;
         }
-        if dense || d < params.tile_limit / (1.0 + VGC_TILE_BAND) {
-            g = max(g * VGC_TILE_STEP_DOWN, 1.0);
-        } else if d > params.tile_limit * (1.0 + VGC_TILE_BAND) {
+        if park > 0.0 {
+            // Parked: hold.
+        } else if d > hi {
             g = min(g * VGC_TILE_STEP_UP, VGC_TILE_SCALE_MAX);
+            step = VGC_TILE_STEP_COARSEN;
+        } else if d < lo && last == VGC_TILE_STEP_COARSEN {
+            park = max(d, 1.0e-6);
+        } else if d < lo {
+            g = max(g * VGC_TILE_STEP_DOWN, 1.0);
+            step = VGC_TILE_STEP_RELAX;
         }
     } else {
         g = 1.0;
+        park = 0.0;
     }
-    atomicStore(&state[tile_word(t, 2u)], bitcast<u32>(g));
+    atomicStore(&state[tile_word(t, VGC_TW_SCALE)], bitcast<u32>(g));
+    atomicStore(&state[tile_word(t, VGC_TW_PARK)], bitcast<u32>(park));
+    atomicStore(&state[tile_word(t, VGC_TW_STEP)], step);
 }
 
 // One thread, frame start: seed the traversal with the GCBVH root.

@@ -6,15 +6,18 @@
 //! renderer. The host
 //!
 //! * pushes the global settings ([`VgRuntime::set_settings`]),
-//! * registers each static mesh whose `.vgeo` is built, together with the
-//!   interned classic vertex range that identifies the mesh on the GPU
-//!   ([`VgRuntime::request_asset`]),
+//! * registers each mesh whose `.vgeo` is built by its content id, the one
+//!   identity a mesh instance carries on the GPU for its virtual geometry
+//!   ([`VgRuntime::request_asset`]; `vg_asset_ready` rows are keyed by it),
 //!
 //! and the renderer side (the `vg_asset_ready` scene derivation and the graph
 //! passes) service it: the store is created lazily on the first
 //! [`VgRuntime::service`] call with the renderer's device, pending assets are
 //! registered, and [`VgRuntime::update`] runs the streaming step once per
-//! frame before the passes record.
+//! frame before the passes record. The graph says whether the renderer it
+//! builds for can draw virtual geometry at all
+//! ([`VgRuntime::set_renderer_support`]): a host keeps classic geometry
+//! where it cannot.
 //!
 //! Everything is behind one mutex; every call is short and none blocks on the
 //! GPU.
@@ -23,7 +26,7 @@ use crate::core::{VgStreamConfig, VgStreamError};
 use crate::source::VgeoSource;
 use crate::store::{VgAssetHandle, VgAssetStore};
 use helio_vg_format::{VgAssetReadyRow, VgMode};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Settings the passes read every frame (from `VirtualGeometrySettings`).
@@ -38,8 +41,8 @@ pub struct VgRuntimeSettings {
     pub prefetch_factor: f32,
     /// Overdraw valve: triangles per covered pixel one 16x16 screen tile may hold
     /// before the groups covering it are coarsened (0 = off). Per tile, bounded
-    /// (4x), and a tile resolved as dense is exempt; it only engages on
-    /// pathological overdraw.
+    /// (by at most `helio_pass_vg_cull::TILE_SCALE_MAX`), dense tiles included;
+    /// it only engages on pathological overdraw.
     pub tile_density_limit: f32,
     /// Divides the dense-tile classifier's thresholds (64 triangles or 64 pixel
     /// hits per 16x16 tile): higher classifies a tile dense sooner.
@@ -61,7 +64,7 @@ impl Default for VgRuntimeSettings {
             mode: VgMode::Auto,
             tau_px: 1.0,
             prefetch_factor: 2.0,
-            tile_density_limit: 16.0,
+            tile_density_limit: helio_vg_format::DEFAULT_TILE_DENSITY_LIMIT,
             dense_sensitivity: 1.0,
             page_budget_mb: 512,
             max_visible_clusters: 4_194_304,
@@ -73,8 +76,6 @@ impl Default for VgRuntimeSettings {
 
 struct AssetEntry {
     content: [u64; 2],
-    vertex_offset: u32,
-    vertex_count: u32,
     source: Option<Arc<dyn VgeoSource>>,
     handle: Option<VgAssetHandle>,
     failed: bool,
@@ -84,17 +85,44 @@ struct AssetEntry {
 #[derive(Clone)]
 pub struct VgAssetInfo {
     pub content: [u64; 2],
-    /// The mesh's interned classic vertex range (its identity on the GPU).
-    pub vertex_offset: u32,
-    pub vertex_count: u32,
     pub source: Arc<dyn VgeoSource>,
+}
+
+/// What a host reports of one of its assets for [`VgRuntime::asset_memory`]:
+/// a name to show, and the bytes of the asset's classic geometry the host
+/// keeps on the GPU beside its pages.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VgAssetReport {
+    pub name: String,
+    /// The full classic geometry (vertices and indices), while any instance
+    /// draws it.
+    pub classic_bytes: u64,
+    /// The error-bounded classic stand-in instances draw while their virtual
+    /// geometry is not drawn, and that shadows and rays use.
+    pub fallback_bytes: u64,
+}
+
+/// Where one asset's memory is ([`VgRuntime::asset_memory`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VgAssetMemory {
+    pub content: [u64; 2],
+    pub report: VgAssetReport,
+    /// Its resident pages' share of the page pool.
+    pub page_bytes: u64,
 }
 
 #[derive(Default)]
 struct State {
     store: Option<VgAssetStore>,
     assets: Vec<AssetEntry>,
+    reports: HashMap<[u64; 2], VgAssetReport>,
 }
+
+/// Whether the renderer a runtime's passes are built for draws virtual
+/// geometry ([`VgRuntime::set_renderer_support`]).
+const SUPPORT_UNKNOWN: u8 = 0;
+const SUPPORT_YES: u8 = 1;
+const SUPPORT_NO: u8 = 2;
 
 struct Inner {
     settings: Mutex<VgRuntimeSettings>,
@@ -103,6 +131,7 @@ struct Inner {
     host_version: AtomicU64,
     /// Bumped whenever [`VgRuntime::assets`] may change.
     assets_version: AtomicU64,
+    support: AtomicU8,
     tier3: Mutex<VgTier3Stats>,
 }
 
@@ -132,8 +161,27 @@ impl VgRuntime {
             state: Mutex::new(State::default()),
             host_version: AtomicU64::new(1),
             assets_version: AtomicU64::new(1),
+            support: AtomicU8::new(SUPPORT_UNKNOWN),
             tier3: Mutex::new(VgTier3Stats::default()),
         }))
+    }
+
+    /// Set by the graph builder: whether the renderer it builds the passes
+    /// for can draw virtual geometry (its device has what the passes need).
+    pub fn set_renderer_support(&self, supported: bool) {
+        self.0.support.store(
+            if supported { SUPPORT_YES } else { SUPPORT_NO },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Whether virtual geometry is drawn: the mode is not `Off` and the
+    /// renderer's passes were built on a device that supports them. False
+    /// until a graph was built for the runtime: until then, and wherever it
+    /// stays false, instances draw classic geometry only.
+    pub fn draws_virtual_geometry(&self) -> bool {
+        self.settings().mode != VgMode::Off
+            && self.0.support.load(Ordering::Relaxed) == SUPPORT_YES
     }
 
     pub fn settings(&self) -> VgRuntimeSettings {
@@ -148,37 +196,57 @@ impl VgRuntime {
         }
     }
 
-    /// Ask for `content_id`'s `.vgeo` to be streamed. `vertex_offset` /
-    /// `vertex_count` are the mesh's interned classic vertex range, the one
-    /// identity a static-mesh instance carries on the GPU. Idempotent; a
-    /// changed range replaces the old one.
-    pub fn request_asset(
-        &self,
-        content_id: u128,
-        vertex_offset: u32,
-        vertex_count: u32,
-        source: Arc<dyn VgeoSource>,
-    ) {
+    /// Ask for `content_id`'s `.vgeo` to be streamed. The content id is the
+    /// asset's identity on the GPU: an instance names it, and the
+    /// `vg_asset_ready` rows map it to the asset's slot. Idempotent.
+    pub fn request_asset(&self, content_id: u128, source: Arc<dyn VgeoSource>) {
         let content = content_words(content_id);
         let mut state = lock(&self.0.state);
-        if let Some(entry) = state.assets.iter_mut().find(|e| e.content == content) {
-            if entry.vertex_offset == vertex_offset && entry.vertex_count == vertex_count {
-                return;
-            }
-            entry.vertex_offset = vertex_offset;
-            entry.vertex_count = vertex_count;
-        } else {
-            state.assets.push(AssetEntry {
-                content,
-                vertex_offset,
-                vertex_count,
-                source: Some(source),
-                handle: None,
-                failed: false,
-            });
+        if state.assets.iter().any(|e| e.content == content) {
+            return;
         }
+        state.assets.push(AssetEntry {
+            content,
+            source: Some(source),
+            handle: None,
+            failed: false,
+        });
         self.0.host_version.fetch_add(1, Ordering::Relaxed);
         self.0.assets_version.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The host's report of `content_id` ([`VgAssetReport`]), shown by
+    /// [`Self::asset_memory`]. Cheap; an unchanged report changes nothing.
+    pub fn report_asset(&self, content_id: u128, report: VgAssetReport) {
+        let content = content_words(content_id);
+        let mut state = lock(&self.0.state);
+        if state.reports.get(&content) != Some(&report) {
+            state.reports.insert(content, report);
+        }
+    }
+
+    /// Every requested asset's memory: what its host reported and its
+    /// resident pages, largest first. For tools (the Memory Explorer); it
+    /// walks each asset's page range, so call it at a tool's pace, not per
+    /// frame.
+    pub fn asset_memory(&self) -> Vec<VgAssetMemory> {
+        let state = lock(&self.0.state);
+        let mut rows: Vec<VgAssetMemory> = state
+            .assets
+            .iter()
+            .map(|e| VgAssetMemory {
+                content: e.content,
+                report: state.reports.get(&e.content).cloned().unwrap_or_default(),
+                page_bytes: match (e.handle, state.store.as_ref()) {
+                    (Some(handle), Some(store)) => store.resident_page_bytes(handle),
+                    _ => 0,
+                },
+            })
+            .collect();
+        rows.sort_by_key(|row| {
+            std::cmp::Reverse(row.page_bytes + row.report.classic_bytes + row.report.fallback_bytes)
+        });
+        rows
     }
 
     /// Whether `content_id` was requested (registered or pending).
@@ -191,8 +259,8 @@ impl VgRuntime {
     }
 
     /// Every requested asset that was not rejected, registered or pending:
-    /// its content id, interned vertex range and bytes. For consumers that
-    /// read assets on the CPU, such as the scene TLAS's proxies.
+    /// its content id and bytes. For consumers that read assets on the CPU,
+    /// such as a scene TLAS's proxies.
     pub fn assets(&self) -> Vec<VgAssetInfo> {
         let state = lock(&self.0.state);
         state
@@ -209,16 +277,14 @@ impl VgRuntime {
                 };
                 Some(VgAssetInfo {
                     content: e.content,
-                    vertex_offset: e.vertex_offset,
-                    vertex_count: e.vertex_count,
                     source,
                 })
             })
             .collect()
     }
 
-    /// Changes whenever [`Self::assets`] may have (assets requested,
-    /// re-ranged or released).
+    /// Changes whenever [`Self::assets`] may have (assets requested or
+    /// released).
     pub fn assets_version(&self) -> u64 {
         self.0.assets_version.load(Ordering::Relaxed)
     }
@@ -231,6 +297,7 @@ impl VgRuntime {
             return;
         };
         let entry = state.assets.remove(index);
+        state.reports.remove(&content);
         if let (Some(handle), Some(store)) = (entry.handle, state.store.as_mut()) {
             store.release(handle);
         }
@@ -250,7 +317,7 @@ impl VgRuntime {
             };
             state.store = Some(VgAssetStore::new(device, queue, cfg));
         }
-        let State { store, assets } = &mut *state;
+        let State { store, assets, .. } = &mut *state;
         let store = store.as_mut().expect("store created above");
         for entry in assets
             .iter_mut()
@@ -305,14 +372,14 @@ impl VgRuntime {
         let Some(store) = state.store.as_ref() else {
             return (vec![VgAssetReadyRow::PADDING; min_rows.max(1)], host);
         };
-        let mapping: Vec<([u64; 2], u32, u32)> = state
+        let contents: Vec<[u64; 2]> = state
             .assets
             .iter()
             .filter(|e| e.handle.is_some())
-            .map(|e| (e.content, e.vertex_offset, e.vertex_count))
+            .map(|e| e.content)
             .collect();
         (
-            store.asset_ready_rows(&mapping, min_rows),
+            store.asset_ready_rows(&contents, min_rows),
             host.wrapping_mul(0x9e37_79b9)
                 .wrapping_add(store.content_version()),
         )
@@ -357,6 +424,19 @@ impl VgRuntime {
     /// is still alive.
     pub fn from_handle_id(id: u64) -> Option<Self> {
         lock(table()).get(&id).and_then(Weak::upgrade).map(Self)
+    }
+
+    /// Every live runtime that has a [`Self::handle_id`] (the ones a
+    /// renderer was configured with), for tools that report across
+    /// renderers.
+    pub fn live() -> Vec<Self> {
+        let mut table = lock(table());
+        table.retain(|_, weak| weak.strong_count() > 0);
+        let mut ids: Vec<u64> = table.keys().copied().collect();
+        ids.sort_unstable();
+        ids.iter()
+            .filter_map(|id| table.get(id).and_then(Weak::upgrade).map(Self))
+            .collect()
     }
 
     /// Whether any registered asset has its root pages resident.

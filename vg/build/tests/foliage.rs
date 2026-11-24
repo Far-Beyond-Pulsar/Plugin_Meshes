@@ -512,3 +512,66 @@ fn recook_non_reducing_caches() {
         }
     }
 }
+
+/// Small multi-triangle floating pieces (curved 3x3 leaf grids, 18
+/// triangles each): what floating simplification sees beyond single cards.
+fn twigs(pieces: usize, radius: f32, size: f32, seed: u64) -> TestMesh {
+    let mut r = Rng(seed);
+    let (mut p, mut idx) = (Vec::new(), Vec::new());
+    for _ in 0..pieces {
+        let c = loop {
+            let c = [r.f() * 2.0 - 1.0, r.f() * 2.0 - 1.0, r.f() * 2.0 - 1.0];
+            if c[0] * c[0] + c[1] * c[1] + c[2] * c[2] <= 1.0 {
+                break c.map(|x| x * radius);
+            }
+        };
+        let u = [r.f() - 0.5, r.f() - 0.5, r.f() - 0.5];
+        let w = [r.f() - 0.5, r.f() - 0.5, r.f() - 0.5];
+        let n = [
+            u[1] * w[2] - u[2] * w[1],
+            u[2] * w[0] - u[0] * w[2],
+            u[0] * w[1] - u[1] * w[0],
+        ];
+        let b = p.len() as u32;
+        for j in 0..4 {
+            for i in 0..4 {
+                let (s, t) = (i as f32 / 1.5 - 1.0, j as f32 / 1.5 - 1.0);
+                let bend = 0.6 * (s * s + t * t);
+                p.push(std::array::from_fn(|k| {
+                    c[k] + size * (s * u[k] + t * w[k] + bend * n[k])
+                }));
+            }
+        }
+        for j in 0..3u32 {
+            for i in 0..3u32 {
+                let a = b + j * 4 + i;
+                idx.extend([a, a + 1, a + 5, a, a + 5, a + 4]);
+            }
+        }
+    }
+    let n = idx.len() / 3;
+    let attributes = attrs(&p);
+    TestMesh {
+        positions: p,
+        attributes,
+        stride: 12,
+        indices: idx,
+        mats: vec![0; n],
+    }
+}
+
+#[test]
+fn floating_twigs_collapse_with_distance() {
+    let mesh = twigs(6_000, 3.0, 0.06, 11);
+    let bytes = build_vgeo(&mesh.input(), &BuildOptions::default()).unwrap();
+    let r = VgeoReader::parse(&bytes).unwrap();
+    let s: Vec<usize> = [30.0, 240.0, 960.0, 3840.0, 15360.0]
+        .iter()
+        .map(|&d| selected(&r, d, 3.0))
+        .collect();
+    println!("selected {s:?} of {}", mesh.tri_count());
+    for w in s.windows(2) {
+        assert!(w[1] <= w[0], "{s:?}");
+    }
+    assert!(s[2] * 20 < s[0], "twigs must coarsen with distance: {s:?}");
+}

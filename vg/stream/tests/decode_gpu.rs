@@ -390,20 +390,16 @@ fn store_uploads_asset_quant_and_publishes_asset_ready_rows() {
         .register(Arc::new(VgeoBytes::new(bytes.clone()).unwrap()))
         .unwrap();
     let content = r.header.content_id;
-    let mapping = [
-        ([99u64, 99], 5000u32, 10u32),
-        (content, 300, 8100),
-        ([1, 2], 40, 3),
-    ];
-    let rows = store.asset_ready_rows(&mapping, 4);
+    let contents = [[99u64, 99], content, [1, 2]];
+    let rows = store.asset_ready_rows(&contents, 4);
     assert_eq!(rows.len(), 4);
     assert_eq!(
         rows[0],
         VgAssetReadyRow {
-            vertex_offset: 300,
-            vertex_count: 8100,
+            content: VgAssetReadyRow::content_words(content),
             asset_slot: h.slot(),
-            flags: 0
+            flags: 0,
+            _pad: [0; 2],
         },
         "registered but not ready"
     );
@@ -416,19 +412,23 @@ fn store_uploads_asset_quant_and_publishes_asset_ready_rows() {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert!(store.is_ready(h));
-    let rows = store.asset_ready_rows(&mapping, 1);
+    assert!(store.resident_page_bytes(h) >= u64::from(helio_vg_format::PAGE_BYTES));
+    let rows = store.asset_ready_rows(&contents, 1);
     assert_eq!(rows[0].flags, VG_ASSET_READY_FLAG_READY);
     assert_eq!(rows.len(), 1);
-    // Sorted by vertex_offset even when the mapping is not.
+    // Sorted by content id (read as a u128) whatever the order asked in;
+    // padding sorts last.
     let h2 = store
         .register(Arc::new(helio_vg_stream::testing::FakeSource::new(5, 4, 1)))
         .unwrap();
-    let rows = store.asset_ready_rows(&[(content, 900, 1), ([5, 0], 100, 1)], 0);
-    assert_eq!(
-        rows.iter().map(|x| x.vertex_offset).collect::<Vec<_>>(),
-        vec![100, 900]
-    );
-    assert_eq!(rows[0].asset_slot, h2.slot());
+    let rows = store.asset_ready_rows(&[content, [5, 0]], 3);
+    let keys: Vec<u128> = rows.iter().map(VgAssetReadyRow::sort_key).collect();
+    assert!(keys.windows(2).all(|w| w[0] <= w[1]), "{keys:?}");
+    assert_eq!(rows[2], VgAssetReadyRow::PADDING);
+    let small = rows
+        .iter()
+        .find(|row| row.content == VgAssetReadyRow::content_words([5, 0]));
+    assert_eq!(small.map(|row| row.asset_slot), Some(h2.slot()));
 
     // The quant table row on the GPU equals the file's meta block.
     let got: Vec<f32> = bytemuck::pod_collect_to_vec(&read_buffer(

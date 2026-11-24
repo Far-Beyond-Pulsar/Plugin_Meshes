@@ -18,6 +18,26 @@
 //! disappear or outgrow their region, so the recorded commands stay the same
 //! frame to frame.
 
+/// Raster flag (in [`DrawSegment::raster_flags`]) of a segment whose
+/// instances have a negative-determinant (mirroring) transform: their
+/// triangles wind the other way, so a pass draws them with the opposite front
+/// face ([`front_face`]). That keeps back-face culling and `front_facing`
+/// (a double-sided material's back side) right. The object batch sets it
+/// (`SEGMENT_RASTER_REVERSED_WINDING` in the `mesh_object_row` snippet).
+/// Above the material flags, which fill the rest of the raster bits.
+pub const RASTER_FLAG_REVERSED_WINDING: u32 = 1 << 15;
+
+/// The front face a pass draws a segment with: its view's
+/// (`helio_core::ViewDescription::front_face`, a mirrored view flips it),
+/// flipped again for a segment of mirrored instances.
+pub fn front_face(view: wgpu::FrontFace, raster_flags: u32) -> wgpu::FrontFace {
+    match (view, raster_flags & RASTER_FLAG_REVERSED_WINDING != 0) {
+        (face, false) => face,
+        (wgpu::FrontFace::Ccw, true) => wgpu::FrontFace::Cw,
+        (wgpu::FrontFace::Cw, true) => wgpu::FrontFace::Ccw,
+    }
+}
+
 /// Which passes draw a segment, from the material's shading flags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u32)]

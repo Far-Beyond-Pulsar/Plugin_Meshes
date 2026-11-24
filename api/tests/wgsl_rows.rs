@@ -178,6 +178,24 @@ fn the_object_row_matches_the_rust() {
         struct_size(&m, "StaticObjectRow"),
         std::mem::size_of::<StaticObjectRow>()
     );
+    // A segment's material class carries its raster flags in the upper 16 bits.
+    assert_eq!(
+        constant(&m, "SEGMENT_RASTER_REVERSED_WINDING"),
+        RASTER_FLAG_REVERSED_WINDING << 16
+    );
+}
+
+#[test]
+fn a_mirrored_segment_draws_with_the_opposite_front_face() {
+    use wgpu::FrontFace::{Ccw, Cw};
+    assert_eq!(front_face(Ccw, 0), Ccw);
+    assert_eq!(front_face(Cw, 0), Cw, "a mirrored view keeps its own");
+    assert_eq!(front_face(Ccw, RASTER_FLAG_REVERSED_WINDING), Cw);
+    assert_eq!(
+        front_face(Cw, RASTER_FLAG_REVERSED_WINDING),
+        Ccw,
+        "a mirrored instance in a mirrored view winds the usual way"
+    );
 }
 
 #[test]
@@ -204,6 +222,10 @@ fn the_draw_rows_match_the_rust() {
         ("INSTANCE_FLAG_ALWAYS_VISIBLE", INSTANCE_FLAG_ALWAYS_VISIBLE),
         ("INSTANCE_FLAG_MOVABLE", INSTANCE_FLAG_MOVABLE),
         ("INSTANCE_FLAG_SKINNED", INSTANCE_FLAG_SKINNED),
+        (
+            "INSTANCE_FLAG_VIRTUAL_GEOMETRY",
+            INSTANCE_FLAG_VIRTUAL_GEOMETRY,
+        ),
         (
             "INSTANCE_FLAG_CLASSIC_SUPPRESSED",
             INSTANCE_FLAG_CLASSIC_SUPPRESSED,

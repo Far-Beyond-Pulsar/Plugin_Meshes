@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use asset_import::db::ImportOutput;
 use asset_import::options::OptionsSchema;
 use asset_import::{Imported, ImportedPart, Importer, OptionValues, Previous};
-use plugin_editor_api::{SourceImage, SourceImageRole, SourceSurface};
+use plugin_editor_api::{SourceImage, SourceImageRole, SourceSurface, SourceUvTransform};
 use serde_json::Value;
 
 use crate::mesh_cache;
@@ -172,7 +172,8 @@ fn role_of(semantic: helio_asset_compat::TextureSemantic) -> Option<SourceImageR
 
 /// The source's materials as neutral surfaces: the images their texture
 /// slots name, plus images next to the model named after the material for
-/// roles the file leaves empty. Slot `i` is the native mesh's slot `i`.
+/// roles the file leaves empty. Each named image keeps its slot's UV set and
+/// UV transform. Slot `i` is the native mesh's slot `i`.
 fn surfaces_of(scene: &helio_asset_compat::ConvertedScene, source: &Path) -> Vec<SourceSurface> {
     let nearby = asset_import::companion::nearby_images(source);
     let model_stem = source
@@ -195,6 +196,14 @@ fn surfaces_of(scene: &helio_asset_compat::ConvertedScene, source: &Path) -> Vec
                         Some(SourceImage {
                             role: role_of(image.semantic)?,
                             path: image.path.clone(),
+                            uv_set: image.uv_channel,
+                            // The slot's `KHR_texture_transform`, in the
+                            // convention the import contract shares.
+                            transform: SourceUvTransform {
+                                offset: image.transform.offset,
+                                scale: image.transform.scale,
+                                rotation: image.transform.rotation_radians,
+                            },
                         })
                     })
                     .collect(),

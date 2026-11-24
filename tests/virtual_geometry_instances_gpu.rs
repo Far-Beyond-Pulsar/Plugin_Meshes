@@ -5,9 +5,11 @@
 // The plugin as a game links it: its root, with every registration.
 use meshes_plugin as _;
 
+use bytemuck::Zeroable;
 use helio_core::{
     BufferHandle, BufferKey, SceneBufferProjection, SceneDerivation, SceneDerivationContext,
 };
+use helio_mesh_api::{INSTANCE_FLAG_VIRTUAL_GEOMETRY, StaticObjectRow};
 use helio_vg_format::{
     GpuVgInstance, INST_CONE_CULL, INST_ENABLED, INST_FORCE_ROOT_ONLY, INST_LOD_SUPPRESS,
     INST_SHADOW_CASTER, INST_TIER_SHIFT, TierLock,
@@ -92,33 +94,45 @@ fn read<T: bytemuck::Pod>(
     out
 }
 
-/// A `static_objects` row (60 words): mesh slot, generation, and a model
-/// matrix with the given axis scales.
-fn object_row(slot: u32, mesh_generation: u32, scale: [f32; 3]) -> [u32; 60] {
-    let mut row = [0u32; 60];
-    row[0] = slot;
-    row[1] = mesh_generation;
-    let model = [
+/// A `static_objects` row: mesh slot, generation, a model matrix with the
+/// given axis scales, and the instance's virtual-geometry choice.
+fn object_row(slot: u32, mesh_generation: u32, scale: [f32; 3]) -> StaticObjectRow {
+    let mut row = StaticObjectRow::zeroed();
+    row.mesh_slot = slot;
+    row.mesh_generation = mesh_generation;
+    row.transform = [
         [scale[0], 0.0, 0.0, 0.0],
         [0.0, scale[1], 0.0, 0.0],
         [0.0, 0.0, scale[2], 0.0],
         [0.0, 0.0, 0.0, 1.0],
     ];
-    for (column, values) in model.iter().enumerate() {
-        for (component, value) in values.iter().enumerate() {
-            row[4 + column * 4 + component] = value.to_bits();
-        }
-    }
+    row.flags = INSTANCE_FLAG_VIRTUAL_GEOMETRY;
     row
+}
+
+/// Asset content ids, as four `u32` words (low first).
+const A: [u32; 4] = [100, 0, 0, 1];
+const B: [u32; 4] = [200, 0, 0, 1];
+const C: [u32; 4] = [5, 0, 0, 2];
+const D: [u32; 4] = [999, 0, 0, 1];
+
+fn ready_row(content: [u32; 4], asset_slot: u32, flags: u32) -> VgAssetReadyRow {
+    VgAssetReadyRow {
+        content,
+        asset_slot,
+        flags,
+        _pad: [0; 2],
+    }
 }
 
 struct Scene {
     projection: SceneBufferProjection,
 }
 
-/// Eight mesh instances (rows 0..8 own objects 10..18), VG components at
-/// entity rows 20 (object 14, disabled) and 21 (object 11, SW tier, root only,
-/// error scale 2).
+/// Eight mesh instances (rows 0..8 own objects 10..18); instance 4 does not
+/// ask for virtual geometry. VG components at entity rows 20 (object 14,
+/// tuning only: it does not make instance 4 active) and 21 (object 11, SW
+/// tier, root only, error scale 2).
 fn scene(device: &wgpu::Device, queue: &wgpu::Queue, asset_generation: u64) -> Scene {
     let keys = VgInstanceKeys::standard();
     let owner = |object: u32| [object, 7u32, 1u32];
@@ -130,13 +144,15 @@ fn scene(device: &wgpu::Device, queue: &wgpu::Queue, asset_generation: u64) -> S
     owners[21] = owner(11);
 
     let section_handles: Vec<[u32; 2]> = (0..8).map(|i| [i, 1]).collect();
-    // Instance vertex ranges: 100 and 200 are ready assets, 300 is known but
-    // not ready, 999 is unknown.
-    let vertex_offsets = [100u32, 200, 300, 100, 100, 999, 100, 100];
-    let vertex_handles: Vec<[u32; 2]> = vertex_offsets.iter().map(|&o| [o, 24]).collect();
+    // Instance asset identities (content ids, `StaticMeshDraw::vg_asset`): A
+    // and B are ready assets, C is known but not ready, D is unknown. C's
+    // high word sorts it after B whatever its low word, so the GPU search
+    // compares all four words.
+    let vg_assets: Vec<[u32; 4]> = [A, B, C, A, A, D, A, A].to_vec();
 
-    let mut objects: Vec<[u32; 60]> = (0..8).map(|i| object_row(i, 8, [1.0; 3])).collect();
+    let mut objects: Vec<StaticObjectRow> = (0..8).map(|i| object_row(i, 8, [1.0; 3])).collect();
     objects[3] = object_row(3, 8, [-1.0, 1.0, 1.0]); // mirrored
+    objects[4].flags = 0; // virtual geometry off for this instance
     objects[6] = object_row(6, 8, [1.0, 2.0, 1.0]); // non-uniform
     objects[7] = object_row(7, 0, [1.0; 3]); // not placed by the join
 
@@ -148,32 +164,16 @@ fn scene(device: &wgpu::Device, queue: &wgpu::Queue, asset_generation: u64) -> S
             flags: 0,
             lod_error_scale: 1.0,
         },
+        // Component rows never carry `INST_ENABLED`; the derivation adds it.
         VgOverrideGpu {
-            flags: INST_ENABLED
-                | INST_FORCE_ROOT_ONLY
-                | ((TierLock::SwRaster as u32) << INST_TIER_SHIFT),
+            flags: INST_FORCE_ROOT_ONLY | ((TierLock::SwRaster as u32) << INST_TIER_SHIFT),
             lod_error_scale: 2.0,
         },
     ];
     let ready = [
-        VgAssetReadyRow {
-            vertex_offset: 100,
-            vertex_count: 24,
-            asset_slot: 5,
-            flags: VG_ASSET_READY_FLAG_READY,
-        },
-        VgAssetReadyRow {
-            vertex_offset: 200,
-            vertex_count: 24,
-            asset_slot: 6,
-            flags: VG_ASSET_READY_FLAG_READY,
-        },
-        VgAssetReadyRow {
-            vertex_offset: 300,
-            vertex_count: 24,
-            asset_slot: 7,
-            flags: 0,
-        },
+        ready_row(A, 5, VG_ASSET_READY_FLAG_READY),
+        ready_row(B, 6, VG_ASSET_READY_FLAG_READY),
+        ready_row(C, 7, 0),
         VgAssetReadyRow::PADDING,
     ];
 
@@ -189,10 +189,7 @@ fn scene(device: &wgpu::Device, queue: &wgpu::Queue, asset_generation: u64) -> S
             keys.section_handles,
             upload(device, queue, &section_handles, 1),
         ),
-        (
-            keys.vertex_handles,
-            upload(device, queue, &vertex_handles, 1),
-        ),
+        (keys.vg_assets, upload(device, queue, &vg_assets, 1)),
         (
             BufferKey::of("static_objects"),
             upload(device, queue, &objects, 1),
@@ -248,7 +245,7 @@ fn ready_placed_enabled_instances_become_active_with_derived_flags() {
     assert!(recorded);
 
     // Instances 0, 1, 3 and 6 are active, in instance order. 2: asset not
-    // ready, 4: component disabled, 5: asset unknown, 7: not placed.
+    // ready, 4: virtual geometry off, 5: asset unknown, 7: not placed.
     assert_eq!(rows.len(), 4, "{rows:?}");
 
     // Every instance has one section (`section_handles`), carried in the flags.
@@ -311,26 +308,11 @@ fn the_derivation_follows_readiness_and_the_global_switch() {
     let (_, _, recorded) = derive(&device, &queue, &mut derivation, &scene.projection);
     assert!(!recorded);
 
-    // The streamer finishing asset 300 makes instance 2 active.
+    // The streamer finishing asset C makes instance 2 active.
     let ready = [
-        VgAssetReadyRow {
-            vertex_offset: 100,
-            vertex_count: 24,
-            asset_slot: 5,
-            flags: 1,
-        },
-        VgAssetReadyRow {
-            vertex_offset: 200,
-            vertex_count: 24,
-            asset_slot: 6,
-            flags: 1,
-        },
-        VgAssetReadyRow {
-            vertex_offset: 300,
-            vertex_count: 24,
-            asset_slot: 7,
-            flags: 1,
-        },
+        ready_row(A, 5, 1),
+        ready_row(B, 6, 1),
+        ready_row(C, 7, 1),
         VgAssetReadyRow::PADDING,
     ];
     scene

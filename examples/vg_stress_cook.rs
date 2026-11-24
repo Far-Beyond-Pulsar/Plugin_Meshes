@@ -416,22 +416,18 @@ pub fn stable_content_id(vertices: &[PackedVertex], indices: &[u32]) -> u128 {
 }
 
 pub fn pack_vgeo_attributes(vertices: &[PackedVertex]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(vertices.len() * helio_vg_format::ATTR_STRIDE as usize);
-    for vertex in vertices {
-        let tangent = (vertex.tangent & 0x00ff_ffff)
-            | ((if vertex.bitangent_sign < 0.0 {
-                0x81u32
-            } else {
-                0x7fu32
-            }) << 24);
-        bytes.extend_from_slice(&vertex.normal.to_le_bytes());
-        bytes.extend_from_slice(&tangent.to_le_bytes());
-        for uv in [vertex.tex_coords0, vertex.tex_coords1] {
-            bytes.extend_from_slice(&half::f16::from_f32(uv[0]).to_bits().to_le_bytes());
-            bytes.extend_from_slice(&half::f16::from_f32(uv[1]).to_bits().to_le_bytes());
-        }
-    }
-    bytes
+    vertices
+        .iter()
+        .flat_map(|v| {
+            helio_vg_format::attr_record(
+                v.normal,
+                v.tangent,
+                v.bitangent_sign,
+                v.tex_coords0,
+                v.tex_coords1,
+            )
+        })
+        .collect()
 }
 
 /// The valid cache file for `content`, or a fresh cook written atomically.

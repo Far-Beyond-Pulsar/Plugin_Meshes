@@ -195,36 +195,43 @@ impl StoreCore {
         self.by_content.get(&content).copied()
     }
 
-    /// Rows of the `vg_asset_ready` buffer for the scene derivation
-    /// (`helio-component`), from the caller's mapping `content id ->
-    /// (interned vertex_offset, vertex_count)`. Sorted ascending by
-    /// `vertex_offset`, padded with [`VgAssetReadyRow::PADDING`] to at least
-    /// `min_rows` (and one) rows. Unregistered contents are skipped; an asset
-    /// is flagged ready once its root pages are resident.
-    pub fn asset_ready_rows(
-        &self,
-        mapping: &[([u64; 2], u32, u32)],
-        min_rows: usize,
-    ) -> Vec<VgAssetReadyRow> {
-        let mut rows: Vec<VgAssetReadyRow> = mapping
+    /// Rows of the `vg_asset_ready` buffer for the scene derivation, one per
+    /// registered content of `contents`: sorted ascending by content id
+    /// ([`VgAssetReadyRow::sort_key`]), padded with
+    /// [`VgAssetReadyRow::PADDING`] to at least `min_rows` (and one) rows.
+    /// Unregistered contents are skipped; an asset is flagged ready once its
+    /// root pages are resident.
+    pub fn asset_ready_rows(&self, contents: &[[u64; 2]], min_rows: usize) -> Vec<VgAssetReadyRow> {
+        let mut rows: Vec<VgAssetReadyRow> = contents
             .iter()
-            .filter_map(|&(content, vertex_offset, vertex_count)| {
+            .filter_map(|&content| {
                 let slot = self.slot_of_content(content)?;
                 Some(VgAssetReadyRow {
-                    vertex_offset,
-                    vertex_count,
+                    content: VgAssetReadyRow::content_words(content),
                     asset_slot: slot,
                     flags: if self.is_ready(slot) {
                         VG_ASSET_READY_FLAG_READY
                     } else {
                         0
                     },
+                    _pad: [0; 2],
                 })
             })
             .collect();
-        rows.sort_by_key(|r| r.vertex_offset);
+        rows.sort_by_key(VgAssetReadyRow::sort_key);
+        rows.dedup_by_key(|row| row.sort_key());
         rows.resize(rows.len().max(min_rows).max(1), VgAssetReadyRow::PADDING);
         rows
+    }
+
+    /// Pages of the asset in `slot` resident in the pool (root pages
+    /// included): its share of the page pool is this times [`PAGE_BYTES`].
+    pub fn resident_pages(&self, slot: u32) -> u32 {
+        self.asset(slot).map_or(0, |a| {
+            (a.pages.start..a.pages.start + a.pages.len)
+                .filter(|&page| self.sched.is_resident(page))
+                .count() as u32
+        })
     }
 
     pub fn is_ready(&self, slot: u32) -> bool {

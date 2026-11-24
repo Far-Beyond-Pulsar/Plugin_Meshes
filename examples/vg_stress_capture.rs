@@ -944,6 +944,9 @@ pub struct Capture {
     derive_baseline: (u64, u64),
     /// Bound CPU lead without draining the GPU after every measured frame.
     in_flight: VecDeque<wgpu::SubmissionIndex>,
+    /// The overdraw valve over the current shot's last settle frames
+    /// (`vg_stress_valve::summarize`), `None` for shots it does not cover.
+    valve: Option<serde_json::Value>,
 }
 
 impl Capture {
@@ -990,6 +993,7 @@ impl Capture {
             bvh_modes: [0; 3],
             derive_baseline: (0, 0),
             in_flight: VecDeque::new(),
+            valve: None,
         }
     }
 
@@ -1331,10 +1335,15 @@ impl Capture {
         let Phase::Shot(run) = &mut self.phase else {
             return false;
         };
-        let (frame_now, settle_now) = (run.frame, run.settle);
+        let (frame_now, settle_now, frames_now) = (run.frame, run.settle, run.frames);
         let pose = shot.camera.pose(frame_now);
         let pose = self.lensed(s, &shot, pose, size);
         let total_settle = if frame_now == 0 { settle_now } else { 2 };
+        // The overdraw valve over the last settle frames of a single-image shot
+        // (read back asynchronously; the frames stay pipelined).
+        let valve_from = (frames_now == 1 && total_settle >= super::vg_stress_valve::WINDOW)
+            .then(|| total_settle - super::vg_stress_valve::WINDOW);
+        self.valve = None;
         // Settle frames (the first frame of a sequence only; later frames follow the path).
         let mut gpu_window: BTreeMap<&'static str, (f64, u32)> = BTreeMap::new();
         let mut last_generation = match &self.phase {
@@ -1342,6 +1351,14 @@ impl Capture {
             _ => 0,
         };
         for i in 0..total_settle.max(1) {
+            if valve_from == Some(i) {
+                if let Some(cull) = s
+                    .renderer
+                    .find_pass::<helio_pass_vg_cull::VgCullEarlyPass>()
+                {
+                    cull.watch_tile_valve(super::vg_stress_valve::WINDOW);
+                }
+            }
             self.render(s, pose, size);
             if i + 30 >= total_settle {
                 let snap = s.renderer.timing_snapshot();
@@ -1360,6 +1377,19 @@ impl Capture {
                         e.1 += 1;
                     }
                 }
+            }
+        }
+        if valve_from.is_some() {
+            if let Some(cull) = s
+                .renderer
+                .find_pass::<helio_pass_vg_cull::VgCullEarlyPass>()
+            {
+                let samples = cull.tile_valve_samples_blocking(&s.device);
+                self.valve = Some(super::vg_stress_valve::summarize(
+                    &samples,
+                    s.runtime.settings().tile_density_limit,
+                    !self.moving,
+                ));
             }
         }
         let Phase::Shot(run) = &mut self.phase else {
@@ -1514,6 +1544,7 @@ impl Capture {
                 },
             },
             "tile_density": tile_density,
+            "valve": self.valve,
             "bench": self.bench_json(s),
             "gpu_ms": gpu,
             "gpu_ms_note": "mean of distinct asynchronous timestamp samples in the last 30 settle iterations; up to 3 frames in flight",
@@ -2146,4 +2177,128 @@ fn tile_density_json(s: &AppState) -> serde_json::Value {
         "tiles_with_tris_ge": ladder.iter().map(|&t| serde_json::json!({"threshold": t, "tiles": over(&tris, t)})).collect::<Vec<_>>(),
         "tiles_with_hits_ge": ladder.iter().map(|&t| serde_json::json!({"threshold": t, "tiles": over(&hits, t)})).collect::<Vec<_>>(),
     })
+}
+
+// ── comparing two captures ───────────────────────────────────────────────────
+
+/// `--capture-diff <before> <after>`: the two capture directories to compare.
+pub fn diff_requested(args: &[String]) -> Option<(PathBuf, PathBuf)> {
+    let at = args.iter().position(|a| a == "--capture-diff")?;
+    Some((
+        PathBuf::from(args.get(at + 1)?),
+        PathBuf::from(args.get(at + 2)?),
+    ))
+}
+
+/// The per-shot stats JSONs of a capture directory, by shot name.
+pub fn read_stats(dir: &Path) -> Result<BTreeMap<String, serde_json::Value>, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut out = BTreeMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json")
+            || path.file_stem().is_some_and(|s| s == "index")
+        {
+            continue;
+        }
+        let Some(stats) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        else {
+            continue;
+        };
+        if let Some(name) = stats["name"].as_str() {
+            out.insert(name.to_string(), stats);
+        }
+    }
+    Ok(out)
+}
+
+/// The numbers a VG change is judged by, as (label, JSON pointer).
+const DIFF_METRICS: &[(&str, &str)] = &[
+    ("selected tris", "/vg/selected_triangles"),
+    ("HW clusters", "/vg/tier_clusters/hw"),
+    ("SW clusters", "/vg/tier_clusters/sw"),
+    ("dense clusters", "/vg/tier_clusters/dense"),
+    ("dense tiles", "/vg/tier3/dense_tiles"),
+    ("resident MB", "/vg/pool/resident_bytes"),
+    ("GPU ms", "/gpu_ms/TOTAL"),
+];
+
+/// A table of every metric of every shot present in either capture, with the
+/// change in percent; shots in only one capture are listed as such.
+pub fn diff_stats(
+    before: &BTreeMap<String, serde_json::Value>,
+    after: &BTreeMap<String, serde_json::Value>,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<28} {:<15} {:>14} {:>14} {:>9}",
+        "shot", "metric", "before", "after", "change"
+    );
+    let names: std::collections::BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    for name in names {
+        let (Some(b), Some(a)) = (before.get(name), after.get(name)) else {
+            let side = if before.contains_key(name) { "before" } else { "after" };
+            let _ = writeln!(out, "{name:<28} only in the {side} capture");
+            continue;
+        };
+        for (label, pointer) in DIFF_METRICS {
+            let scale = if label.ends_with("MB") { 1e-6 } else { 1.0 };
+            let value = |s: &serde_json::Value| s.pointer(pointer).and_then(|v| v.as_f64()).map(|v| v * scale);
+            let (vb, va) = (value(b), value(a));
+            if vb.is_none() && va.is_none() {
+                continue;
+            }
+            let show = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.3}"));
+            let change = match (vb, va) {
+                (Some(b), Some(a)) if b != 0.0 => format!("{:+.1}%", (a - b) / b * 100.0),
+                (Some(b), Some(a)) if a == b => "0.0%".to_string(),
+                _ => "-".to_string(),
+            };
+            let _ = writeln!(
+                out,
+                "{name:<28} {label:<15} {:>14} {:>14} {change:>9}",
+                show(vb),
+                show(va)
+            );
+        }
+    }
+    out
+}
+
+/// Print the comparison of two capture directories.
+pub fn diff(before: &Path, after: &Path) -> Result<String, String> {
+    Ok(diff_stats(&read_stats(before)?, &read_stats(after)?))
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    #[test]
+    fn diff_lists_every_metric_with_its_change_and_unmatched_shots() {
+        let shot = |tris: u64, ms: f64| {
+            serde_json::json!({"vg": {"selected_triangles": tris, "tier_clusters": {"hw": 10, "sw": 0, "dense": 0}}, "gpu_ms": {"TOTAL": ms}})
+        };
+        let before = BTreeMap::from([
+            ("hero".to_string(), shot(200, 4.0)),
+            ("gone".to_string(), shot(1, 1.0)),
+        ]);
+        let after = BTreeMap::from([("hero".to_string(), shot(100, 5.0))]);
+        let table = diff_stats(&before, &after);
+        assert!(table.contains("hero") && table.contains("-50.0%"), "{table}");
+        assert!(table.contains("+25.0%"), "{table}");
+        assert!(table.contains("gone") && table.contains("only in the before capture"), "{table}");
+        assert!(!table.contains("dense tiles"), "absent metrics are skipped: {table}");
+    }
+
+    #[test]
+    fn diff_arguments_name_two_directories() {
+        let args = ["--capture-diff", "a", "b"].map(String::from);
+        assert_eq!(diff_requested(&args), Some((PathBuf::from("a"), PathBuf::from("b"))));
+        assert_eq!(diff_requested(&args[..2]), None);
+    }
 }

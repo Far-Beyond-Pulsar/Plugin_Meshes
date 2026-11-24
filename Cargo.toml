@@ -1,6 +1,6 @@
 [package]
 name = "meshes_plugin"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 publish = false
 description = "Meshes (`pulsar.meshes`): the plugin's root crate, the one place it registers everything it contributes (runtime registrations always, the editor's with `editor`)"
@@ -8,6 +8,9 @@ description = "Meshes (`pulsar.meshes`): the plugin's root crate, the one place 
 autoexamples = false
 
 [features]
+# The plugin as a library of its own, loaded by the editor from plugins/editor:
+# cargo build -p <this package> --release --features dll
+dll = ["editor", "plugin_editor_api/editor", "plugin_editor_api/shared-dylibs"]
 # The editor's registrations (the hierarchy icon, the Create menu's meshes,
 # the asset browser's thumbnails) and the crates they need. A game links the
 # root without it, so it takes no editor dependency.
@@ -73,3 +76,7 @@ pulsar_scenedb = { workspace = true }
 
 [lints]
 workspace = true
+
+# Also the plugin as a library of its own (feature `dll`, loaded by the editor).
+[lib]
+crate-type = ["cdylib", "rlib"]

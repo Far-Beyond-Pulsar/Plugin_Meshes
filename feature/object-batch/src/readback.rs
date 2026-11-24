@@ -177,7 +177,8 @@ pub struct RangeReadback {
     shadow_transmissive: u32,
     shadow_membership_fingerprint: (u32, u32),
     instance_count: u32,
-    /// Bumped whenever a freshly-harvested generation's static caster
+    /// Bumped whenever a freshly-harvested generation's static caster (its
+    /// row and the geometry it draws, `shadow_caster_identity`)
     /// membership fingerprint changes. Counts alone are insufficient: a
     /// same-frame static/movable swap can preserve counts while changing the
     /// cached shadow atlas contents.

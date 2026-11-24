@@ -5,7 +5,10 @@
 //! `builtin_mesh_vertex`/`builtin_mesh_index` pools). Everything else a
 //! renderer needs to draw the instance is derived here from the authored
 //! value, as a second GPU registration on the component: the local bounds,
-//! the movable flag, and one [`MeshSectionDraw`] per material section with
+//! the movable and virtual-geometry flags, the content id of its full
+//! geometry (its virtual-geometry asset's identity on the GPU, whether the
+//! instance shows that geometry or its fallback), and one [`MeshSectionDraw`]
+//! per material section with
 //! the section's resolved material. SceneDB runs it on every insert,
 //! guarded write, removal, despawn and mirror replay of the component, so the
 //! rows always describe the current value; nothing calls it.
@@ -33,6 +36,10 @@ pub const MESH_SECTIONS_BUFFER: &str = "static_mesh_draw_sections";
 pub const MESH_BOUNDS_BUFFER: &str = "static_mesh_draw_bounds";
 /// Per instance: object-row flags (`helio_mesh_api::INSTANCE_FLAG_MOVABLE`).
 pub const MESH_FLAGS_BUFFER: &str = "static_mesh_draw_flags";
+/// Per instance: the content id of the mesh's full geometry as four `u32`
+/// words (low first), the identity of its virtual-geometry asset
+/// (`vg_asset_ready` rows are keyed by it); zero for no geometry.
+pub const MESH_VG_ASSET_BUFFER: &str = "static_mesh_draw_vg_asset";
 
 /// One drawable section of a mesh instance: an index range of the mesh's
 /// own indices and the material slot it draws with.
@@ -58,6 +65,8 @@ pub struct StaticMeshDraw {
     pub bounds_local: [f32; 4],
     #[gpu(buffer = "static_mesh_draw_flags")]
     pub flags: u32,
+    #[gpu(buffer = "static_mesh_draw_vg_asset")]
+    pub vg_asset: [u32; 4],
     #[gpu(buffer = "static_mesh_draw_sections")]
     pub sections: Vec<MeshSectionDraw>,
 }
@@ -85,13 +94,23 @@ impl StaticMeshDraw {
                 _pad: 0,
             })
             .collect();
+        let mut flags = 0;
+        if helio::Movability::from(mesh.movability).can_move() {
+            flags |= helio_mesh_api::INSTANCE_FLAG_MOVABLE;
+        }
+        if mesh.virtual_geometry {
+            flags |= helio_mesh_api::INSTANCE_FLAG_VIRTUAL_GEOMETRY;
+        }
+        let key = mesh.source_key().0;
         Self {
             bounds_local: mesh.bounds_local,
-            flags: if helio::Movability::from(mesh.movability).can_move() {
-                helio_mesh_api::INSTANCE_FLAG_MOVABLE
-            } else {
-                0
-            },
+            flags,
+            vg_asset: [
+                key as u32,
+                (key >> 32) as u32,
+                (key >> 64) as u32,
+                (key >> 96) as u32,
+            ],
             sections,
         }
     }

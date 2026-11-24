@@ -174,8 +174,7 @@ fn encode_cluster(dag: &Dag, ci: usize, attrs: &[u8], stride: usize, lat: &Latti
 
     let mut attr = Vec::with_capacity(verts.len() * stride + 3);
     for &v in &verts {
-        let s = dag.vs.attr[v as usize] as usize * stride;
-        attr.extend_from_slice(&attrs[s..s + stride]);
+        attr.extend_from_slice(dag.vs.record(v, attrs));
     }
     while attr.len() % 4 != 0 {
         attr.push(0);

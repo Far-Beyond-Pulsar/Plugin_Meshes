@@ -174,6 +174,47 @@ pub fn cut_draws_held(
     parent_refined && (!self_refined || !children_resident)
 }
 
+/// The overdraw valve's step (`cs_tiles`): a tile's valve state this frame
+/// (`scale`, `park`, `step` of the result) from last frame's state and the density
+/// of last frame's estimate ([`crate::TileValve::density`]).
+pub fn tile_valve_step(prev: &crate::TileValve, density: f32, limit: f32) -> crate::TileValve {
+    use crate::{
+        TileValve, TILE_BAND, TILE_SCALE_MAX, TILE_STEP_COARSEN, TILE_STEP_DOWN, TILE_STEP_HOLD,
+        TILE_STEP_RELAX, TILE_STEP_UP,
+    };
+    let mut next = TileValve {
+        scale: prev.scale.max(1.0),
+        park: prev.park,
+        step: TILE_STEP_HOLD,
+        ..TileValve::default()
+    };
+    if limit <= 0.0 {
+        next.scale = 1.0;
+        next.park = 0.0;
+        return next;
+    }
+    let (hi, lo) = (limit * (1.0 + TILE_BAND), limit / (1.0 + TILE_BAND));
+    if next.park > 0.0
+        && (density > hi
+            || density > next.park * (1.0 + TILE_BAND)
+            || density < next.park / (1.0 + TILE_BAND))
+    {
+        next.park = 0.0;
+    }
+    if next.park > 0.0 {
+        // Parked: hold.
+    } else if density > hi {
+        next.scale = (next.scale * TILE_STEP_UP).min(TILE_SCALE_MAX);
+        next.step = TILE_STEP_COARSEN;
+    } else if density < lo && prev.step == TILE_STEP_COARSEN {
+        next.park = density.max(1.0e-6);
+    } else if density < lo {
+        next.scale = (next.scale * TILE_STEP_DOWN).max(1.0);
+        next.step = TILE_STEP_RELAX;
+    }
+    next
+}
+
 /// Tier bin of a drawn cluster (no dense mask: `dense_overlap` supplied by
 /// the caller, `false` when there is none).
 pub fn choose_bin(

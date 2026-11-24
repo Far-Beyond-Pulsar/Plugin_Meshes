@@ -2,8 +2,9 @@
 // proxies (BLASes built from a streamed proxy LOD, see `src/rt.rs`).
 // The caller prepends `enable wgpu_ray_query;` (it must be the first token).
 //
-// Writes the same `dense_key` format as the NonRT peel (depth bits, vis id) so
-// T9 treats both Tier-3 backends identically, plus the hardware barycentrics
+// Writes the same `dense_key` format as the NonRT peel (`vg_raster_key`: the
+// little-endian words of `raster_key(depth, id)`, `[id, depth bits]`) so T9
+// treats both Tier-3 backends identically, plus the hardware barycentrics
 // packed like `bary_pack` (u | v << 16, v0 = 1 - u - v) into `dense_bary`.
 //
 // Vis ids: proxy BLAS primitives map (via `prim_map`) to a proxy-cluster-local
