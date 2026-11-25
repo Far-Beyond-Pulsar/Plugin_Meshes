@@ -46,6 +46,10 @@ fn every_material_class_composes_into_every_mesh_program() {
         helio_frame_api::rays::stream::SNIPPET,
         helio_light_api::LIGHT_LIST_SNIPPET,
         helio_light_api::LIGHT_FORWARD_SNIPPET,
+        // The forward drawers light through the frame's BSDF (as
+        // `helio_pass_forward` and `helio_pass_transparent` compose them).
+        helio_frame_api::gbuffer::BSDF_SNIPPET,
+        helio_frame_api::media::SNIPPET,
     ];
     let opaque_custom = [
         ("opal", helio_mats::templates::OPAL),
