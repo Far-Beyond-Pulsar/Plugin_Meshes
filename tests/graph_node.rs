@@ -168,9 +168,12 @@ fn every_mesh_pass_is_a_registered_node() {
 }
 
 /// The meshes' nodes in the default deferred graph, in execution order: the
-/// batches first, the dispatch arguments and culling around the depth
-/// pyramid, the shadow faces, the G-buffer with virtual geometry after it,
-/// transparency over the colour.
+/// batches first, the G-buffer's visibility (dispatch arguments, then culling
+/// around the depth pyramid) before the G-buffer, virtual geometry after it,
+/// transparency over the colour. The shadow faces read only the object batch and
+/// the shadow matrices (`ShadowDirtyPass` and `ShadowPass` declare nothing the
+/// culling writes), so the graph's stable topological order places them right
+/// after the batch, ahead of the culling: no wire orders them against it.
 #[test]
 fn the_default_graph_keeps_the_pass_order() {
     let _serial = serial();
@@ -198,11 +201,12 @@ fn the_default_graph_keeps_the_pass_order() {
         "helio.pass.indirect_dispatch",
         "helio.pass.occlusion_cull"
     ));
+    assert!(before("helio.pass.object_batch", "helio.pass.shadow_dirty"));
+    assert!(before("helio.pass.shadow_dirty", "helio.pass.shadow"));
     assert!(before(
         "helio.pass.occlusion_cull",
-        "helio.pass.shadow_dirty"
+        "helio.pass.gbuffer"
     ));
-    assert!(before("helio.pass.shadow_dirty", "helio.pass.shadow"));
     assert!(before("helio.pass.shadow", "helio.pass.gbuffer"));
     assert!(before("helio.pass.gbuffer", "helio.pass.virtual_geometry"));
     assert!(before(
