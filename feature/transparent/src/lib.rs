@@ -13,13 +13,12 @@
 pub mod feature;
 pub use feature::TransparentDrawers;
 
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use bytemuck::{Pod, Zeroable};
 use helio_core::graph::{ResourceBuilder, ResourceSize};
 use helio_core::{PassContext, PrepareContext, RenderPass, Result as HelioResult};
-use helio_mats::radiant::{RadiantShaderCache, RadiantShaderKey};
+use helio_mats::radiant::RadiantShaderKey;
 
 /// The meshes' transparent program (`shaders/transparent.wgsl`): a
 /// material's transparent template (its `radiant_eval_transparent`) is
@@ -65,8 +64,8 @@ pub struct TransparentPass {
     medium_fallback: wgpu::TextureView,
     medium_fallback_parameters: wgpu::Buffer,
     medium_sampler: wgpu::Sampler,
-    pipelines: HashMap<RadiantShaderKey, wgpu::RenderPipeline>,
-    shader_cache: RadiantShaderCache,
+    /// The material variants' pipelines, compiled off the frame.
+    pipelines: helio_core::compile::Variants<RadiantShaderKey, wgpu::RenderPipeline>,
     /// This pass's own class-0 override (the transparent base — never
     /// synced from the scene).
     /// [`TRANSPARENT_PROGRAM`] with the media composite.
@@ -342,8 +341,7 @@ impl TransparentPass {
             medium_fallback,
             medium_fallback_parameters,
             medium_sampler,
-            pipelines: HashMap::new(),
-            shader_cache: RadiantShaderCache::new(),
+            pipelines: Default::default(),
             program,
             local_templates: helio_mats::RadiantTemplateRegistry::new_transparent(),
             shared_registry: None,
@@ -990,194 +988,241 @@ impl RenderPass for TransparentPass {
                 graph_hash: segment.graph_hash,
                 feature_flags: segment.raster_flags(),
             };
-            let pipeline = self.get_or_create_pipeline(&ctx.device, key, "");
-            rp.set_pipeline(pipeline);
-            segments.draw(&mut rp, index);
+            if let Some(pipeline) = self.drawable_pipeline(&ctx.device, key) {
+                rp.set_pipeline(pipeline);
+                segments.draw(&mut rp, index);
+            }
         }
         Ok(())
     }
 }
 
 impl TransparentPass {
-    fn get_or_create_pipeline(
+    /// The pipeline to draw `key`'s segment with: its own once compiled, else
+    /// the default transparent material's of the same raster state, else none
+    /// (the segment is skipped until one is ready; the frame never waits for a
+    /// compile).
+    fn drawable_pipeline(
         &mut self,
         device: &wgpu::Device,
         key: RadiantShaderKey,
-        graph_wgsl: &str,
-    ) -> &wgpu::RenderPipeline {
-        if !self.pipelines.contains_key(&key) {
-            // Ids from `FIRST_CUSTOM_MATERIAL_CLASS` up are user-registered custom templates that live in the
-            // shared scene-wide registry; class 0 is this pass's own
-            // transparent base. `shared_arc` is a fresh local Arc clone so
-            // `guard`'s lifetime doesn't tie up `self`.
-            let shared_arc = if key.template_id >= helio_mats::FIRST_CUSTOM_MATERIAL_CLASS {
-                self.shared_registry.clone()
-            } else {
-                None
-            };
-            let guard = shared_arc.as_ref().map(|a| a.read().unwrap());
-            let template = guard
-                .as_ref()
-                .and_then(|g| g.get(key.template_id))
-                .unwrap_or_else(|| {
-                    if key.template_id >= helio_mats::FIRST_CUSTOM_MATERIAL_CLASS {
-                        log::debug!(
-                            "[Transparent] template class {} not found, falling back to class 0",
-                            key.template_id
-                        );
-                    }
-                    self.local_templates
-                        .get(0)
-                        .expect("the default transparent template (class 0)")
-                });
-            let supports_reactivity = self.program.contains("HELIO_TRANSPARENT_REACTIVITY");
-            let module = self.shader_cache.get_or_compile(
-                device,
-                key,
-                template,
-                self.program,
-                graph_wgsl,
-                &[
-                    helio_mesh_api::DRAW_ROWS_SNIPPET,
-                    helio_mesh_api::SKINNING_SNIPPET,
-                    helio_frame_api::rays::stream::SNIPPET,
-                    helio_light_api::LIGHT_LIST_SNIPPET,
-                    helio_light_api::LIGHT_FORWARD_SNIPPET,
-                    helio_frame_api::gbuffer::BSDF_SNIPPET,
-                    helio_frame_api::media::SNIPPET,
-                ],
-                helio_mats::MaterialBindingConfig::for_device(device),
-                "Transparent Shader",
-            );
-            let additive = wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::One,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::One,
-                    operation: wgpu::BlendOperation::Add,
-                },
-            };
-            let reveal = wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::Zero,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrc,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::Zero,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrc,
-                    operation: wgpu::BlendOperation::Add,
-                },
-            };
-            let mut targets = vec![
-                Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: Some(additive),
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R16Float,
-                    blend: Some(reveal),
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-            ];
-            if self.reactive_mask {
-                targets.push(Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R8Unorm,
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent::OVER,
-                    }),
-                    write_mask: if supports_reactivity {
-                        wgpu::ColorWrites::RED
-                    } else {
-                        wgpu::ColorWrites::empty()
-                    },
-                }));
-            }
-            let pipeline = helio_core::shader::create_render_pipeline(
-                &device,
-                wgpu::RenderPipelineDescriptor {
-                    label: Some("Transparent Pipeline"),
-                    layout: Some(&self.pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module,
-                        entry_point: Some("vs_main"),
-                        compilation_options: Default::default(),
-                        buffers: &[
-                            Some(wgpu::VertexBufferLayout {
-                                array_stride: 40,
-                                step_mode: wgpu::VertexStepMode::Vertex,
-                                attributes: &[
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Float32x3,
-                                        offset: 0,
-                                        shader_location: 0,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Float32,
-                                        offset: 12,
-                                        shader_location: 1,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Float32x2,
-                                        offset: 16,
-                                        shader_location: 2,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Float32x2,
-                                        offset: 24,
-                                        shader_location: 5,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Uint32,
-                                        offset: 32,
-                                        shader_location: 3,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Uint32,
-                                        offset: 36,
-                                        shader_location: 4,
-                                    },
-                                ],
-                            }),
-                            Some(helio_mesh_api::DRAW_SLOT_LAYOUT),
-                        ],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module,
-                        entry_point: Some("fs_main"),
-                        compilation_options: Default::default(),
-                        targets: &targets,
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        cull_mode: None,
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: wgpu::TextureFormat::Depth32Float,
-                        depth_write_enabled: Some(false),
-                        depth_compare: Some(helio_core::depth::NEARER),
-                        stencil: wgpu::StencilState::default(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                },
-            );
-            self.pipelines.insert(key, pipeline);
+    ) -> Option<&wgpu::RenderPipeline> {
+        self.request_pipeline(device, key);
+        let stand_in = RadiantShaderKey {
+            template_id: 0,
+            graph_hash: 0,
+            feature_flags: key.feature_flags,
+        };
+        let drawn = if self.pipelines.ready(&key).is_some() {
+            key
+        } else {
+            self.request_pipeline(device, stand_in);
+            stand_in
+        };
+        self.pipelines.ready(&drawn)
+    }
+
+    /// Starts compiling the pipeline of `key` (its program composed from the
+    /// material's template and graph) when nobody asked for it yet.
+    fn request_pipeline(&mut self, device: &wgpu::Device, key: RadiantShaderKey) {
+        if self.pipelines.contains(&key) {
+            return;
         }
-        self.pipelines.get(&key).unwrap()
+        // Ids from `FIRST_CUSTOM_MATERIAL_CLASS` up are user-registered custom
+        // templates that live in the shared scene-wide registry; class 0 is
+        // this pass's own transparent base.
+        let shared = if key.template_id >= helio_mats::FIRST_CUSTOM_MATERIAL_CLASS {
+            self.shared_registry.clone()
+        } else {
+            None
+        };
+        let guard = shared.as_ref().map(|shared| shared.read().unwrap());
+        let template = guard
+            .as_ref()
+            .and_then(|guard| guard.get(key.template_id))
+            .unwrap_or_else(|| {
+                if key.template_id >= helio_mats::FIRST_CUSTOM_MATERIAL_CLASS {
+                    log::debug!(
+                        "[Transparent] template class {} not found, falling back to class 0",
+                        key.template_id
+                    );
+                }
+                self.local_templates
+                    .get(0)
+                    .expect("the default transparent template (class 0)")
+            })
+            .clone();
+        drop(guard);
+        let graph_wgsl = if key.graph_hash != 0 {
+            helio_mats::graph_source(key.graph_hash).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let program = self.program;
+        let supports_reactivity = program.contains("HELIO_TRANSPARENT_REACTIVITY");
+        let reactive_mask = self.reactive_mask;
+        let layout = self.pipeline_layout.clone();
+        let material_binding = helio_mats::MaterialBindingConfig::for_device(device);
+        let label = format!(
+            "Transparent template {} graph {:x} flags {:x}",
+            key.template_id, key.graph_hash, key.feature_flags,
+        );
+        self.pipelines.get(
+            device,
+            &key,
+            || label,
+            move |device| {
+                let source = helio_mats::radiant::compose_program(
+                    &template,
+                    program,
+                    &graph_wgsl,
+                    &[
+                        helio_mesh_api::DRAW_ROWS_SNIPPET,
+                        helio_mesh_api::SKINNING_SNIPPET,
+                        helio_frame_api::rays::stream::SNIPPET,
+                        helio_light_api::LIGHT_LIST_SNIPPET,
+                        helio_light_api::LIGHT_FORWARD_SNIPPET,
+                        helio_frame_api::gbuffer::BSDF_SNIPPET,
+                        helio_frame_api::media::SNIPPET,
+                    ],
+                    material_binding,
+                );
+                // Runtime-generated WGSL (template + material graph + webgpu
+                // fixups): there is no source file to watch, so it cannot go
+                // through `helio_core::shader::module`'s registered path.
+                #[allow(clippy::disallowed_methods)]
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Transparent Shader"),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                });
+                let additive = wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                };
+                let reveal = wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::Zero,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::Zero,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                };
+                let mut targets = vec![
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(additive),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::R16Float,
+                        blend: Some(reveal),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ];
+                if reactive_mask {
+                    targets.push(Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::R8Unorm,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent::OVER,
+                        }),
+                        write_mask: if supports_reactivity {
+                            wgpu::ColorWrites::RED
+                        } else {
+                            wgpu::ColorWrites::empty()
+                        },
+                    }));
+                }
+                helio_core::shader::create_render_pipeline(
+                    device,
+                    wgpu::RenderPipelineDescriptor {
+                        label: Some("Transparent Pipeline"),
+                        layout: Some(&layout),
+                        vertex: wgpu::VertexState {
+                            module: &module,
+                            entry_point: Some("vs_main"),
+                            compilation_options: Default::default(),
+                            buffers: &[
+                                Some(wgpu::VertexBufferLayout {
+                                    array_stride: 40,
+                                    step_mode: wgpu::VertexStepMode::Vertex,
+                                    attributes: &[
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Float32x3,
+                                            offset: 0,
+                                            shader_location: 0,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Float32,
+                                            offset: 12,
+                                            shader_location: 1,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Float32x2,
+                                            offset: 16,
+                                            shader_location: 2,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Float32x2,
+                                            offset: 24,
+                                            shader_location: 5,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Uint32,
+                                            offset: 32,
+                                            shader_location: 3,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Uint32,
+                                            offset: 36,
+                                            shader_location: 4,
+                                        },
+                                    ],
+                                }),
+                                Some(helio_mesh_api::DRAW_SLOT_LAYOUT),
+                            ],
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &module,
+                            entry_point: Some("fs_main"),
+                            compilation_options: Default::default(),
+                            targets: &targets,
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleList,
+                            cull_mode: None,
+                            ..Default::default()
+                        },
+                        depth_stencil: Some(wgpu::DepthStencilState {
+                            format: wgpu::TextureFormat::Depth32Float,
+                            depth_write_enabled: Some(false),
+                            depth_compare: Some(helio_core::depth::NEARER),
+                            stencil: wgpu::StencilState::default(),
+                            bias: wgpu::DepthBiasState::default(),
+                        }),
+                        multisample: wgpu::MultisampleState::default(),
+                        multiview_mask: None,
+                        cache: None,
+                    },
+                )
+            },
+        );
     }
 }
 

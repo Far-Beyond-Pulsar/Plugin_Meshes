@@ -43,7 +43,7 @@ pub mod selection;
 use bytemuck::{Pod, Zeroable};
 
 pub mod depth_material;
-use helio_mats::radiant::{RadiantShaderCache, RadiantShaderKey};
+use helio_mats::radiant::RadiantShaderKey;
 use helio_mesh_api::{
     multi_draw_indexed_indirect, CulledBatchFrameData, DrawSlots, ObjectBatchFrameData,
     DRAW_SLOT_LAYOUT,
@@ -55,7 +55,6 @@ use helio_core::graph::{ResourceBuilder, ResourceSize};
 use helio_core::{
     DebugViewDescriptor, PassContext, PrepareContext, RenderPass, Result as HelioResult,
 };
-use std::collections::HashMap;
 
 // ── Uniform types ─────────────────────────────────────────────────────────────
 
@@ -84,7 +83,8 @@ pub struct GBufferPass {
     draw_slots: DrawSlots,
     timing_query: Option<wgpu::QuerySet>,
     material_binding: helio_mats::MaterialBindingConfig,
-    pipelines: HashMap<RadiantShaderKey, wgpu::RenderPipeline>,
+    /// The material variants' pipelines, compiled off the frame.
+    pipelines: helio_core::compile::Variants<RadiantShaderKey, wgpu::RenderPipeline>,
     /// Device supports `POLYGON_MODE_LINE`, so the wireframe debug view is offered.
     wireframe_supported: bool,
     /// The view the pass draws (`helio_core::view`): its winding and clip.
@@ -93,7 +93,6 @@ pub struct GBufferPass {
     /// instead of the culled instances (`Self::portal_occurrences`): loads
     /// the G-buffer the phase's opener cleared.
     occurrences: Option<Occurrences>,
-    shader_cache: RadiantShaderCache,
     /// The materials' opaque templates (`helio_mats::MaterialTemplates`),
     /// shared, never deep-cloned (see `SharedTemplateRegistry`). `None`: the
     /// built-in templates.
@@ -395,13 +394,12 @@ impl GBufferPass {
             draw_slots: DrawSlots::default(),
             timing_query: None,
             material_binding,
-            pipelines: HashMap::new(),
+            pipelines: Default::default(),
             wireframe_supported: device
                 .features()
                 .contains(wgpu::Features::POLYGON_MODE_LINE),
             view: helio_core::ViewDescription::PRIMARY,
             occurrences: None,
-            shader_cache: RadiantShaderCache::new(),
             template_registry: None,
             pipeline_layout,
             bind_group_layout_0,
@@ -1022,9 +1020,10 @@ impl RenderPass for GBufferPass {
                 graph_hash: 0,
                 feature_flags: 0,
             };
-            let pipeline = self.get_or_create_pipeline(&ctx.device, key, "");
-            pass.set_pipeline(pipeline);
-            multi_draw_indexed_indirect(&mut pass, indirect, 0, max_draws, draw_count);
+            if let Some(pipeline) = self.drawable_pipeline(&ctx.device, key) {
+                pass.set_pipeline(pipeline);
+                multi_draw_indexed_indirect(&mut pass, indirect, 0, max_draws, draw_count);
+            }
         } else {
             for (index, segment) in segments.in_bucket(helio_mesh_api::ShadingBucket::Opaque) {
                 let key = RadiantShaderKey {
@@ -1032,9 +1031,12 @@ impl RenderPass for GBufferPass {
                     graph_hash: segment.graph_hash,
                     feature_flags: segment.raster_flags(),
                 };
-                let pipeline = self.get_or_create_pipeline(&ctx.device, key, "");
-                pass.set_pipeline(pipeline);
-                segments.draw(&mut pass, index);
+                // A variant still compiling draws with the default material's
+                // pipeline, and with nothing before that one is ready.
+                if let Some(pipeline) = self.drawable_pipeline(&ctx.device, key) {
+                    pass.set_pipeline(pipeline);
+                    segments.draw(&mut pass, index);
+                }
             }
         }
         Ok(())
@@ -1114,188 +1116,226 @@ impl GBufferPass {
         self
     }
 
-    /// Get or create a render pipeline for the given key.
-    /// Compiles the shader lazily on first access, injecting `graph_wgsl` when
-    /// `graph_hash != 0`.
-    fn get_or_create_pipeline(
+    /// The pipeline to draw `key`'s segment with: its own once compiled, else
+    /// the default material's of the same raster state, else none (the
+    /// segment is skipped until one is ready; the frame never waits for a
+    /// compile).
+    fn drawable_pipeline(
         &mut self,
         device: &wgpu::Device,
         key: RadiantShaderKey,
-        graph_wgsl: &str,
-    ) -> &wgpu::RenderPipeline {
-        if !self.pipelines.contains_key(&key) {
-            let wireframe = self.wireframe_supported && self.debug_mode == WIREFRAME_DEBUG_MODE;
-            let lightmap_payload = self.lightmap_payload;
-            let registered_graph;
-            let graph_wgsl = if graph_wgsl.is_empty() && key.graph_hash != 0 {
-                registered_graph = helio_mats::graph_source(key.graph_hash);
-                registered_graph.as_deref().unwrap_or("")
-            } else {
-                graph_wgsl
-            };
-            // The renderer only ever hands us a shared registry when a
-            // caller actually registers custom (from `FIRST_CUSTOM_MATERIAL_CLASS` up) templates; nothing
-            // wires that up yet (see `template_registry`'s doc). Rather than
-            // hard-require it for every draw -- panicking on the overwhelming
-            // majority of scenes that only ever use the built-in classes
-            // (0 = default_pbr .. 4 = skin) -- fall back to a local registry
-            // that has those same built-ins, mirroring TransparentPass's
-            // `local_class0` fallback for the identical situation.
-            let local_fallback;
-            let registry_guard;
-            let template = if let Some(shared) = self.template_registry.as_ref() {
-                registry_guard = shared.read().unwrap();
-                match registry_guard.get(key.template_id) {
-                    Some(t) => t,
+    ) -> Option<&wgpu::RenderPipeline> {
+        self.request_pipeline(device, key);
+        let stand_in = RadiantShaderKey {
+            template_id: 0,
+            graph_hash: 0,
+            feature_flags: key.feature_flags,
+        };
+        let drawn = if self.pipelines.ready(&key).is_some() {
+            key
+        } else {
+            self.request_pipeline(device, stand_in);
+            stand_in
+        };
+        self.pipelines.ready(&drawn)
+    }
+
+    /// Starts compiling the pipeline of `key` (its program composed from the
+    /// material's template and graph) when nobody asked for it yet.
+    fn request_pipeline(&mut self, device: &wgpu::Device, key: RadiantShaderKey) {
+        if self.pipelines.contains(&key) {
+            return;
+        }
+        let wireframe = self.wireframe_supported && self.debug_mode == WIREFRAME_DEBUG_MODE;
+        let lightmap_payload = self.lightmap_payload;
+        let graph_wgsl = if key.graph_hash != 0 {
+            helio_mats::graph_source(key.graph_hash).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        // The renderer only ever hands us a shared registry when a caller
+        // actually registers custom (from `FIRST_CUSTOM_MATERIAL_CLASS` up)
+        // templates. Rather than hard-require it for every draw (panicking on
+        // the overwhelming majority of scenes that only ever use the built-in
+        // classes, 0 = default_pbr .. 4 = skin), fall back to a local registry
+        // that has those same built-ins, mirroring TransparentPass's
+        // `local_class0` fallback for the identical situation.
+        let template = match self.template_registry.as_ref() {
+            Some(shared) => {
+                let registry = shared.read().unwrap();
+                match registry.get(key.template_id) {
+                    Some(template) => template.clone(),
                     None => {
                         log::warn!(
                             "Radiant: template class {} not found, falling back to class 0",
                             key.template_id,
                         );
-                        registry_guard
+                        registry
                             .get(0)
                             .expect("Default PBR template (class 0) missing")
+                            .clone()
                     }
                 }
-            } else {
-                local_fallback = helio_mats::radiant::RadiantTemplateRegistry::new();
+            }
+            None => {
                 if key.template_id != 0 {
                     log::warn!(
                         "Radiant: no shared template registry synced yet; class {} unavailable, using class 0",
                         key.template_id,
                     );
                 }
-                local_fallback
+                helio_mats::radiant::RadiantTemplateRegistry::new()
                     .get(0)
                     .expect("Default PBR template (class 0) missing")
-            };
-            let (layout, vertex_entry, fragment_entry) = match self.occurrences.as_ref() {
-                Some(occurrences) => (
-                    &occurrences.pipeline_layout,
-                    "vs_occurrence",
-                    "fs_occurrence",
-                ),
-                None => (&self.pipeline_layout, "vs_main", "fs_main"),
-            };
-            let module = self.shader_cache.get_or_compile(
-                device,
-                key,
-                template,
-                GBUFFER_PROGRAM,
-                graph_wgsl,
-                &GBUFFER_PROGRAM_SNIPPETS,
-                self.material_binding,
-                "GBuffer Shader",
-            );
-            let pipeline = helio_core::shader::create_render_pipeline(
-                &device,
-                wgpu::RenderPipelineDescriptor {
-                    label: Some("GBuffer Pipeline"),
-                    layout: Some(layout),
-                    vertex: wgpu::VertexState {
-                        module,
-                        entry_point: Some(vertex_entry),
-                        compilation_options: wgpu::PipelineCompilationOptions {
-                            constants: &[(
-                                "LIGHTMAP_PAYLOAD",
-                                if lightmap_payload { 1.0 } else { 0.0 },
-                            )],
+                    .clone()
+            }
+        };
+        let (layout, vertex_entry, fragment_entry) = match self.occurrences.as_ref() {
+            Some(occurrences) => (
+                occurrences.pipeline_layout.clone(),
+                "vs_occurrence",
+                "fs_occurrence",
+            ),
+            None => (self.pipeline_layout.clone(), "vs_main", "fs_main"),
+        };
+        let material_binding = self.material_binding;
+        let clipped = self.view.clipped;
+        let front_face = helio_mesh_api::front_face(self.view.front_face(), key.feature_flags);
+        let double_sided = key.feature_flags & helio_mats::FLAG_DOUBLE_SIDED != 0;
+        let label = format!(
+            "{} template {} graph {:x} flags {:x}",
+            if self.occurrences.is_some() {
+                "GBuffer portal occurrences"
+            } else {
+                "GBuffer"
+            },
+            key.template_id,
+            key.graph_hash,
+            key.feature_flags,
+        );
+        self.pipelines.get(
+            device,
+            &key,
+            || label,
+            move |device| {
+                let source = helio_mats::radiant::compose_program(
+                    &template,
+                    GBUFFER_PROGRAM,
+                    &graph_wgsl,
+                    &GBUFFER_PROGRAM_SNIPPETS,
+                    material_binding,
+                );
+                // Runtime-generated WGSL (template + material graph + webgpu
+                // fixups): there is no source file to watch, so it cannot go
+                // through `helio_core::shader::module`'s registered path.
+                #[allow(clippy::disallowed_methods)]
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("GBuffer Shader"),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                });
+                helio_core::shader::create_render_pipeline(
+                    device,
+                    wgpu::RenderPipelineDescriptor {
+                        label: Some("GBuffer Pipeline"),
+                        layout: Some(&layout),
+                        vertex: wgpu::VertexState {
+                            module: &module,
+                            entry_point: Some(vertex_entry),
+                            compilation_options: wgpu::PipelineCompilationOptions {
+                                constants: &[(
+                                    "LIGHTMAP_PAYLOAD",
+                                    if lightmap_payload { 1.0 } else { 0.0 },
+                                )],
+                                ..Default::default()
+                            },
+                            // Full vertex layout (stride = 40 bytes, matching shared mesh buffer).
+                            //   offset  0 — position       Float32x3  location 0
+                            //   offset 12 — bitangent_sign Float32    location 1
+                            //   offset 16 — tex_coords0   Float32x2  location 2  (UV0: material/albedo)
+                            //   offset 24 — tex_coords1   Float32x2  location 5  (UV1: lightmap)
+                            //   offset 32 — normal        Uint32     location 3
+                            //   offset 36 — tangent       Uint32     location 4
+                            buffers: &[
+                                Some(wgpu::VertexBufferLayout {
+                                    array_stride: 40,
+                                    step_mode: wgpu::VertexStepMode::Vertex,
+                                    attributes: &[
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Float32x3,
+                                            offset: 0,
+                                            shader_location: 0,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Float32,
+                                            offset: 12,
+                                            shader_location: 1,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Float32x2,
+                                            offset: 16,
+                                            shader_location: 2,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Float32x2,
+                                            offset: 24,
+                                            shader_location: 5,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Uint32,
+                                            offset: 32,
+                                            shader_location: 3,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Uint32,
+                                            offset: 36,
+                                            shader_location: 4,
+                                        },
+                                    ],
+                                }),
+                                Some(crate::DRAW_SLOT_LAYOUT),
+                            ],
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &module,
+                            entry_point: Some(fragment_entry),
+                            compilation_options: wgpu::PipelineCompilationOptions {
+                                constants: &[(
+                                    helio_frame_api::view::CLIP_CONSTANT,
+                                    if clipped { 1.0 } else { 0.0 },
+                                )],
+                                ..Default::default()
+                            },
+                            targets: &helio_frame_api::gbuffer::color_targets(),
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleList,
+                            front_face,
+                            cull_mode: if wireframe || double_sided {
+                                None
+                            } else {
+                                Some(wgpu::Face::Back)
+                            },
+                            polygon_mode: if wireframe {
+                                wgpu::PolygonMode::Line
+                            } else {
+                                wgpu::PolygonMode::Fill
+                            },
                             ..Default::default()
                         },
-                        // Full vertex layout (stride = 40 bytes, matching shared mesh buffer).
-                        //   offset  0 — position       Float32x3  location 0
-                        //   offset 12 — bitangent_sign Float32    location 1
-                        //   offset 16 — tex_coords0   Float32x2  location 2  (UV0: material/albedo)
-                        //   offset 24 — tex_coords1   Float32x2  location 5  (UV1: lightmap)
-                        //   offset 32 — normal        Uint32     location 3
-                        //   offset 36 — tangent       Uint32     location 4
-                        buffers: &[
-                            Some(wgpu::VertexBufferLayout {
-                                array_stride: 40,
-                                step_mode: wgpu::VertexStepMode::Vertex,
-                                attributes: &[
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Float32x3,
-                                        offset: 0,
-                                        shader_location: 0,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Float32,
-                                        offset: 12,
-                                        shader_location: 1,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Float32x2,
-                                        offset: 16,
-                                        shader_location: 2,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Float32x2,
-                                        offset: 24,
-                                        shader_location: 5,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Uint32,
-                                        offset: 32,
-                                        shader_location: 3,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Uint32,
-                                        offset: 36,
-                                        shader_location: 4,
-                                    },
-                                ],
-                            }),
-                            Some(crate::DRAW_SLOT_LAYOUT),
-                        ],
+                        depth_stencil: Some(wgpu::DepthStencilState {
+                            format: wgpu::TextureFormat::Depth32Float,
+                            depth_write_enabled: Some(true),
+                            depth_compare: Some(helio_core::depth::NEARER_EQUAL),
+                            stencil: wgpu::StencilState::default(),
+                            bias: wgpu::DepthBiasState::default(),
+                        }),
+                        multisample: wgpu::MultisampleState::default(),
+                        multiview_mask: None,
+                        cache: None,
                     },
-                    fragment: Some(wgpu::FragmentState {
-                        module,
-                        entry_point: Some(fragment_entry),
-                        compilation_options: wgpu::PipelineCompilationOptions {
-                            constants: &[(
-                                helio_frame_api::view::CLIP_CONSTANT,
-                                if self.view.clipped { 1.0 } else { 0.0 },
-                            )],
-                            ..Default::default()
-                        },
-                        targets: &helio_frame_api::gbuffer::color_targets(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        front_face: helio_mesh_api::front_face(
-                            self.view.front_face(),
-                            key.feature_flags,
-                        ),
-                        cull_mode: if wireframe
-                            || key.feature_flags & helio_mats::FLAG_DOUBLE_SIDED != 0
-                        {
-                            None
-                        } else {
-                            Some(wgpu::Face::Back)
-                        },
-                        polygon_mode: if wireframe {
-                            wgpu::PolygonMode::Line
-                        } else {
-                            wgpu::PolygonMode::Fill
-                        },
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: wgpu::TextureFormat::Depth32Float,
-                        depth_write_enabled: Some(true),
-                        depth_compare: Some(helio_core::depth::NEARER_EQUAL),
-                        stencil: wgpu::StencilState::default(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                },
-            );
-            self.pipelines.insert(key, pipeline);
-        }
-        self.pipelines.get(&key).unwrap()
+                )
+            },
+        );
     }
 }
 

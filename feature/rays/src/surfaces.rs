@@ -130,7 +130,7 @@ fn build_program(
     label: &str,
 ) -> ProgramPipelines {
     // Runtime-composed WGSL (template, graph, lowering): no source file to
-    // watch, as the drawers' programs (`RadiantShaderCache`).
+    // watch, as the drawers' programs (`helio_mats::radiant::compose_program`).
     #[allow(clippy::disallowed_methods)]
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),

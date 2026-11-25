@@ -136,15 +136,15 @@ fn production_pipelines_accept_coverage_and_legacy_templates() {
                         .replace("return TransparentOutput(surface, vec4<f32>(clamp(surface.a, 0.0, 1.0)));", "return surface;");
                     pass.program = Box::leak(source.into_boxed_str());
                 }
-                pass.get_or_create_pipeline(
-                    &device,
-                    RadiantShaderKey {
-                        template_id: 0,
-                        graph_hash: 0,
-                        feature_flags: 0,
-                    },
-                    "",
-                );
+                let key = RadiantShaderKey {
+                    template_id: 0,
+                    graph_hash: 0,
+                    feature_flags: 0,
+                };
+                pass.request_pipeline(&device, key);
+                if let Err(reason) = pass.pipelines.wait(&key).expect("asked for") {
+                    panic!("the pipeline does not build: {reason}");
+                }
             }
         }
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();

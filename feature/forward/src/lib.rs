@@ -1,12 +1,11 @@
 pub mod feature;
 pub use feature::ForwardDrawers;
 
-use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use helio_core::graph::{ResourceBuilder, ResourceSize};
 use helio_core::{PassContext, PrepareContext, RenderPass, Result as HelioResult};
-use helio_mats::radiant::{RadiantShaderCache, RadiantShaderKey};
+use helio_mats::radiant::RadiantShaderKey;
 
 /// The meshes' forward program (`shaders/forward_lit.wgsl`): the vertex
 /// layout and instance rows, lit by the lights' forward function; a
@@ -39,8 +38,8 @@ pub struct ForwardLitPass {
     /// The draw slots the vertex shader reads (see `helio_mesh_api::DrawSlots`).
     draw_slots: helio_mesh_api::DrawSlots,
     material_binding: helio_mats::MaterialBindingConfig,
-    pipelines: HashMap<RadiantShaderKey, wgpu::RenderPipeline>,
-    shader_cache: RadiantShaderCache,
+    /// The material variants' pipelines, compiled off the frame.
+    pipelines: helio_core::compile::Variants<RadiantShaderKey, wgpu::RenderPipeline>,
     /// The built-in material classes, when the shared registry is
     /// absent or lacks a class.
     local_templates: helio_mats::RadiantTemplateRegistry,
@@ -194,8 +193,7 @@ impl ForwardLitPass {
         Self {
             draw_slots: Default::default(),
             material_binding,
-            pipelines: HashMap::new(),
-            shader_cache: RadiantShaderCache::new(),
+            pipelines: Default::default(),
             local_templates: helio_mats::RadiantTemplateRegistry::new(),
             stand_in: None,
             shared_registry: None,
@@ -219,159 +217,208 @@ impl ForwardLitPass {
         }
     }
 
-    fn get_or_create_pipeline(
+    /// The pipeline to draw `key`'s segment with: its own once compiled, else
+    /// the default material's of the same raster state, else none (the
+    /// segment is skipped until one is ready; the frame never waits for a
+    /// compile).
+    fn drawable_pipeline(
         &mut self,
         device: &wgpu::Device,
         key: RadiantShaderKey,
-        graph_wgsl: &str,
         write_depth: bool,
-    ) -> &wgpu::RenderPipeline {
-        if !self.pipelines.contains_key(&key) {
-            // Ids from `FIRST_CUSTOM_MATERIAL_CLASS` up are user-registered custom templates that live in the
-            // shared scene-wide registry; anything else (including a miss)
-            // falls back to this pass's own class-0 override. `shared_arc`
-            // is a fresh local Arc clone so `guard`'s lifetime doesn't tie
-            // up `self`.
-            let shared_arc = if key.template_id >= helio_mats::FIRST_CUSTOM_MATERIAL_CLASS {
-                self.shared_registry.clone()
-            } else {
-                None
-            };
-            let guard = shared_arc.as_ref().map(|a| a.read().unwrap());
-            let template = guard
-                .as_ref()
-                .and_then(|g| g.get(key.template_id))
-                .or_else(|| self.local_templates.get(key.template_id))
-                .unwrap_or_else(|| {
-                    log::debug!(
-                        "[ForwardLit] template class {} not found, falling back to class 0",
-                        key.template_id
-                    );
-                    self.local_templates
-                        .get(0)
-                        .expect("the default template (class 0)")
+    ) -> Option<&wgpu::RenderPipeline> {
+        self.request_pipeline(device, key, write_depth);
+        let stand_in = RadiantShaderKey {
+            template_id: 0,
+            graph_hash: 0,
+            feature_flags: key.feature_flags,
+        };
+        let drawn = if self.pipelines.ready(&key).is_some() {
+            key
+        } else {
+            self.request_pipeline(device, stand_in, write_depth);
+            stand_in
+        };
+        self.pipelines.ready(&drawn)
+    }
+
+    /// Starts compiling the pipeline of `key` (its program composed from the
+    /// material's template and graph) when nobody asked for it yet.
+    fn request_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        key: RadiantShaderKey,
+        write_depth: bool,
+    ) {
+        if self.pipelines.contains(&key) {
+            return;
+        }
+        // Ids from `FIRST_CUSTOM_MATERIAL_CLASS` up are user-registered custom
+        // templates that live in the shared scene-wide registry; anything else
+        // (including a miss) falls back to this pass's own class-0 override.
+        let shared = if key.template_id >= helio_mats::FIRST_CUSTOM_MATERIAL_CLASS {
+            self.shared_registry.clone()
+        } else {
+            None
+        };
+        let guard = shared.as_ref().map(|shared| shared.read().unwrap());
+        let template = guard
+            .as_ref()
+            .and_then(|guard| guard.get(key.template_id))
+            .or_else(|| self.local_templates.get(key.template_id))
+            .unwrap_or_else(|| {
+                log::debug!(
+                    "[ForwardLit] template class {} not found, falling back to class 0",
+                    key.template_id
+                );
+                self.local_templates
+                    .get(0)
+                    .expect("the default template (class 0)")
+            })
+            .clone();
+        drop(guard);
+        let graph_wgsl = if key.graph_hash != 0 {
+            helio_mats::graph_source(key.graph_hash).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let layout = self.pipeline_layout.clone();
+        let material_binding = self.material_binding;
+        let clipped = self.view.clipped;
+        let surface_format = self.surface_format;
+        let front_face = helio_mesh_api::front_face(self.view.front_face(), key.feature_flags);
+        let double_sided = key.feature_flags & helio_mats::FLAG_DOUBLE_SIDED != 0;
+        let label = format!(
+            "ForwardLit template {} graph {:x} flags {:x}",
+            key.template_id, key.graph_hash, key.feature_flags,
+        );
+        self.pipelines.get(
+            device,
+            &key,
+            || label,
+            move |device| {
+                let source = helio_mats::radiant::compose_program(
+                    &template,
+                    FORWARD_PROGRAM,
+                    &graph_wgsl,
+                    &[
+                        helio_mesh_api::DRAW_ROWS_SNIPPET,
+                        helio_mesh_api::SKINNING_SNIPPET,
+                        helio_frame_api::rays::stream::SNIPPET,
+                        helio_light_api::LIGHT_LIST_SNIPPET,
+                        helio_light_api::LIGHT_FORWARD_SNIPPET,
+                        helio_frame_api::gbuffer::BSDF_SNIPPET,
+                    ],
+                    material_binding,
+                );
+                // Runtime-generated WGSL (template + material graph + webgpu
+                // fixups): there is no source file to watch, so it cannot go
+                // through `helio_core::shader::module`'s registered path.
+                #[allow(clippy::disallowed_methods)]
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("ForwardLit Shader"),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
                 });
-            let module = self.shader_cache.get_or_compile(
-                device,
-                key,
-                template,
-                FORWARD_PROGRAM,
-                graph_wgsl,
-                &[
-                    helio_mesh_api::DRAW_ROWS_SNIPPET,
-                    helio_mesh_api::SKINNING_SNIPPET,
-                    helio_frame_api::rays::stream::SNIPPET,
-                    helio_light_api::LIGHT_LIST_SNIPPET,
-                    helio_light_api::LIGHT_FORWARD_SNIPPET,
-                    helio_frame_api::gbuffer::BSDF_SNIPPET,
-                ],
-                self.material_binding,
-                "ForwardLit Shader",
-            );
-            let pipeline = helio_core::shader::create_render_pipeline(
-                &device,
-                wgpu::RenderPipelineDescriptor {
-                    label: Some("ForwardLit Pipeline"),
-                    layout: Some(&self.pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module,
-                        entry_point: Some("vs_main"),
-                        compilation_options: Default::default(),
-                        buffers: &[
-                            Some(wgpu::VertexBufferLayout {
-                                array_stride: 40,
-                                step_mode: wgpu::VertexStepMode::Vertex,
-                                attributes: &[
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Float32x3,
-                                        offset: 0,
-                                        shader_location: 0,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Float32,
-                                        offset: 12,
-                                        shader_location: 1,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Float32x2,
-                                        offset: 16,
-                                        shader_location: 2,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Float32x2,
-                                        offset: 24,
-                                        shader_location: 5,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Uint32,
-                                        offset: 32,
-                                        shader_location: 3,
-                                    },
-                                    wgpu::VertexAttribute {
-                                        format: wgpu::VertexFormat::Uint32,
-                                        offset: 36,
-                                        shader_location: 4,
-                                    },
-                                ],
-                            }),
-                            Some(helio_mesh_api::DRAW_SLOT_LAYOUT),
-                        ],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module,
-                        entry_point: Some("fs_main"),
-                        compilation_options: wgpu::PipelineCompilationOptions {
-                            constants: &[(
-                                helio_frame_api::view::CLIP_CONSTANT,
-                                if self.view.clipped { 1.0 } else { 0.0 },
-                            )],
-                            ..Default::default()
+                helio_core::shader::create_render_pipeline(
+                    device,
+                    wgpu::RenderPipelineDescriptor {
+                        label: Some("ForwardLit Pipeline"),
+                        layout: Some(&layout),
+                        vertex: wgpu::VertexState {
+                            module: &module,
+                            entry_point: Some("vs_main"),
+                            compilation_options: Default::default(),
+                            buffers: &[
+                                Some(wgpu::VertexBufferLayout {
+                                    array_stride: 40,
+                                    step_mode: wgpu::VertexStepMode::Vertex,
+                                    attributes: &[
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Float32x3,
+                                            offset: 0,
+                                            shader_location: 0,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Float32,
+                                            offset: 12,
+                                            shader_location: 1,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Float32x2,
+                                            offset: 16,
+                                            shader_location: 2,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Float32x2,
+                                            offset: 24,
+                                            shader_location: 5,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Uint32,
+                                            offset: 32,
+                                            shader_location: 3,
+                                        },
+                                        wgpu::VertexAttribute {
+                                            format: wgpu::VertexFormat::Uint32,
+                                            offset: 36,
+                                            shader_location: 4,
+                                        },
+                                    ],
+                                }),
+                                Some(helio_mesh_api::DRAW_SLOT_LAYOUT),
+                            ],
                         },
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: self.surface_format,
-                            blend: if write_depth {
+                        fragment: Some(wgpu::FragmentState {
+                            module: &module,
+                            entry_point: Some("fs_main"),
+                            compilation_options: wgpu::PipelineCompilationOptions {
+                                constants: &[(
+                                    helio_frame_api::view::CLIP_CONSTANT,
+                                    if clipped { 1.0 } else { 0.0 },
+                                )],
+                                ..Default::default()
+                            },
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format: surface_format,
+                                blend: if write_depth {
+                                    None
+                                } else {
+                                    Some(wgpu::BlendState {
+                                        color: wgpu::BlendComponent {
+                                            src_factor: wgpu::BlendFactor::One,
+                                            dst_factor: wgpu::BlendFactor::Zero,
+                                            operation: wgpu::BlendOperation::Add,
+                                        },
+                                        alpha: wgpu::BlendComponent::OVER,
+                                    })
+                                },
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleList,
+                            front_face,
+                            cull_mode: if double_sided {
                                 None
                             } else {
-                                Some(wgpu::BlendState {
-                                    color: wgpu::BlendComponent {
-                                        src_factor: wgpu::BlendFactor::One,
-                                        dst_factor: wgpu::BlendFactor::Zero,
-                                        operation: wgpu::BlendOperation::Add,
-                                    },
-                                    alpha: wgpu::BlendComponent::OVER,
-                                })
+                                Some(wgpu::Face::Back)
                             },
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        front_face: helio_mesh_api::front_face(
-                            self.view.front_face(),
-                            key.feature_flags,
-                        ),
-                        cull_mode: if key.feature_flags & helio_mats::FLAG_DOUBLE_SIDED != 0 {
-                            None
-                        } else {
-                            Some(wgpu::Face::Back)
+                            ..Default::default()
                         },
-                        ..Default::default()
+                        depth_stencil: Some(wgpu::DepthStencilState {
+                            format: wgpu::TextureFormat::Depth32Float,
+                            depth_write_enabled: Some(write_depth),
+                            depth_compare: Some(helio_core::depth::NEARER_EQUAL),
+                            stencil: wgpu::StencilState::default(),
+                            bias: wgpu::DepthBiasState::default(),
+                        }),
+                        multisample: wgpu::MultisampleState::default(),
+                        multiview_mask: None,
+                        cache: None,
                     },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: wgpu::TextureFormat::Depth32Float,
-                        depth_write_enabled: Some(write_depth),
-                        depth_compare: Some(helio_core::depth::NEARER_EQUAL),
-                        stencil: wgpu::StencilState::default(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                },
-            );
-            self.pipelines.insert(key, pipeline);
-        }
-        self.pipelines.get(&key).unwrap()
+                )
+            },
+        );
     }
 }
 
@@ -697,12 +744,14 @@ impl RenderPass for ForwardLitPass {
                 graph_hash: 0,
                 feature_flags: if self.render_all_opaque { 1 << 31 } else { 0 },
             };
-            let pipeline =
-                self.get_or_create_pipeline(&ctx.device, key, "", self.render_all_opaque);
-            pass.set_pipeline(pipeline);
-            helio_mesh_api::multi_draw_indexed_indirect(
-                &mut pass, indirect, 0, max_draws, draw_count,
-            );
+            if let Some(pipeline) =
+                self.drawable_pipeline(&ctx.device, key, self.render_all_opaque)
+            {
+                pass.set_pipeline(pipeline);
+                helio_mesh_api::multi_draw_indexed_indirect(
+                    &mut pass, indirect, 0, max_draws, draw_count,
+                );
+            }
         } else {
             for (index, segment) in segments.in_bucket(bucket) {
                 let mut key = RadiantShaderKey {
@@ -713,10 +762,12 @@ impl RenderPass for ForwardLitPass {
                 if self.render_all_opaque {
                     key.feature_flags |= 1 << 31;
                 }
-                let pipeline =
-                    self.get_or_create_pipeline(&ctx.device, key, "", self.render_all_opaque);
-                pass.set_pipeline(pipeline);
-                segments.draw(&mut pass, index);
+                if let Some(pipeline) =
+                    self.drawable_pipeline(&ctx.device, key, self.render_all_opaque)
+                {
+                    pass.set_pipeline(pipeline);
+                    segments.draw(&mut pass, index);
+                }
             }
         }
         Ok(())
