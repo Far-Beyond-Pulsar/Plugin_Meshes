@@ -171,6 +171,11 @@ pub struct ShadowPass {
     dirty_readback: Option<DirtyReadback>,
     /// Frames each face stays in the serviced set (`DIRTY_LINGER_FRAMES`).
     recently_dirty: Vec<u8>,
+    /// Each face's pending dirty bits as the last readback showed them (the
+    /// bits `ShadowDirty` set and no service has cleared yet): whether any
+    /// serviced face has static work, which decides if the static layer's pass
+    /// opens at all.
+    pending_bits: Vec<u32>,
     /// The frame's lists, kept between frames so a frame allocates nothing.
     scratch: Scratch,
     /// Edge of both atlases in texels.
@@ -667,6 +672,7 @@ impl ShadowPass {
             readbacks: helio_core::gpu_cache::ReadbackPool::new("Shadow dirty readback"),
             dirty_readback: None,
             recently_dirty: vec![0; MAX_SHADOW_FACES],
+            pending_bits: vec![0; MAX_SHADOW_FACES],
             scratch: Scratch::default(),
             atlas_size,
             static_array_view: Some(array_view(&static_atlas)),
@@ -789,7 +795,9 @@ impl RenderPass for ShadowPass {
                         .get_mapped_range();
                     if let Ok(bytes) = view.map(|bytes| bytes.to_vec()) {
                         for (face, word) in bytes.chunks_exact(4).enumerate() {
-                            if word != [0; 4] {
+                            let bits = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                            self.pending_bits[face] = bits;
+                            if bits != 0 {
                                 self.recently_dirty[face] = DIRTY_LINGER_FRAMES;
                             }
                         }
@@ -1071,7 +1079,21 @@ impl RenderPass for ShadowPass {
         }
         // No face to service: no pass at all (a pass costs wgpu's validation of
         // everything it binds, whatever it draws).
-        for is_static in [true, false].into_iter().filter(|_| serviced > 0) {
+        // The static layer's pass is opened only when a serviced face has
+        // static work: rebuilding its cached layer (known here), or a pending
+        // static bit the readback showed. A visit that is only a movable
+        // caster's (the dynamic layer) must not pay for the pass: it cost
+        // 1.1 ms of GPU time with nothing drawn, in every frame that
+        // a character walked through a cascade.
+        let static_bit = FACE_REGION_GATES[2];
+        let static_work = !self.supports_multi_draw_count
+            || selected
+                .iter()
+                .any(|&(face, rebuilding)| rebuilding || self.pending_bits[face] & static_bit != 0);
+        for is_static in [true, false]
+            .into_iter()
+            .filter(|&is_static| serviced > 0 && (!is_static || static_work))
+        {
             let scope = if is_static {
                 "Shadow: static layer"
             } else {
