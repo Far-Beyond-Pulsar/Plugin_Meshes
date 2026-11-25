@@ -39,7 +39,7 @@ pub struct ForwardLitPass {
     draw_slots: helio_mesh_api::DrawSlots,
     material_binding: helio_mats::MaterialBindingConfig,
     /// The material variants' pipelines, compiled off the frame.
-    pipelines: helio_core::compile::Variants<RadiantShaderKey, wgpu::RenderPipeline>,
+    pipelines: helio_core::compile::Variants<RadiantShaderKey, helio_core::shader::DeferredRender>,
     /// The built-in material classes, when the shared registry is
     /// absent or lacks a class.
     local_templates: helio_mats::RadiantTemplateRegistry,
@@ -226,7 +226,7 @@ impl ForwardLitPass {
         device: &wgpu::Device,
         key: RadiantShaderKey,
         write_depth: bool,
-    ) -> Option<&wgpu::RenderPipeline> {
+    ) -> Option<&helio_core::shader::DeferredRender> {
         self.request_pipeline(device, key, write_depth);
         let stand_in = RadiantShaderKey {
             template_id: 0,
@@ -319,7 +319,7 @@ impl ForwardLitPass {
                     label: Some("ForwardLit Shader"),
                     source: wgpu::ShaderSource::Wgsl(source.into()),
                 });
-                helio_core::shader::create_render_pipeline(
+                helio_core::shader::create_render_pipeline_deferred(
                     device,
                     wgpu::RenderPipelineDescriptor {
                         label: Some("ForwardLit Pipeline"),

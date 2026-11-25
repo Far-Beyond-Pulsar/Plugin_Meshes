@@ -54,7 +54,7 @@ pub(crate) struct DebugParams {
 pub(crate) struct DebugPipeline {
     bgl0: wgpu::BindGroupLayout,
     bgl1: wgpu::BindGroupLayout,
-    pipeline: wgpu::ComputePipeline,
+    pipeline: helio_core::shader::DeferredCompute,
     params: wgpu::Buffer,
 }
 
@@ -102,7 +102,7 @@ impl DebugPipeline {
             immediate_size: 0,
         });
         let module = helio_core::shader::module(device, "VgShade debug", debug_source().as_str());
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let pipeline = helio_core::shader::create_compute_pipeline_deferred(device, wgpu::ComputePipelineDescriptor {
             label: Some("VgShade vg_debug"),
             layout: Some(&layout),
             module: &module,

@@ -38,7 +38,7 @@ struct ShadowDirtyUniforms {
 pub struct ShadowDirtyPass {
     /// `casters`, `detect`, `faces`, `finish` (see `shadow_dirty.wgsl`), run in
     /// that order.
-    pipelines: [wgpu::ComputePipeline; 4],
+    pipelines: [helio_core::shader::DeferredCompute; 4],
     #[allow(dead_code)]
     bgl: wgpu::BindGroupLayout,
 
@@ -285,7 +285,7 @@ impl ShadowDirtyPass {
         });
 
         let pipeline = |entry_point: &'static str| {
-            helio_core::shader::create_compute_pipeline(
+            helio_core::shader::create_compute_pipeline_deferred(
                 &device,
                 wgpu::ComputePipelineDescriptor {
                     label: Some(entry_point),

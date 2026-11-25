@@ -384,7 +384,7 @@ struct Inputs {
 pub struct VgBvhPass {
     cfg: BvhConfig,
     bgls: Vec<wgpu::BindGroupLayout>,
-    pipelines: Vec<wgpu::ComputePipeline>,
+    pipelines: Vec<helio_core::shader::DeferredCompute>,
     cfg_uniform: wgpu::Buffer,
     sort_bits: wgpu::Buffer,
     header: wgpu::Buffer,
@@ -455,7 +455,7 @@ impl VgBvhPass {
                 bind_group_layouts: &[Some(&bgl)],
                 immediate_size: 0,
             });
-            pipelines.push(helio_core::shader::create_compute_pipeline(
+            pipelines.push(helio_core::shader::create_compute_pipeline_deferred(
                 device,
                 wgpu::ComputePipelineDescriptor {
                     label: Some(kernel.name),

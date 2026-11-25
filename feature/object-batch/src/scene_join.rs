@@ -194,7 +194,7 @@ impl Output {
 /// The scene join as a scene derivation. See the module doc.
 pub struct SceneJoin {
     keys: SceneJoinKeys,
-    mesh_pipeline: wgpu::ComputePipeline,
+    mesh_pipeline: helio_core::shader::DeferredCompute,
     mesh_uniforms: wgpu::Buffer,
     /// Bound in place of an optional input that is not registered yet.
     empty: wgpu::Buffer,
@@ -232,7 +232,7 @@ struct PlacementState {
 /// transforms rewrites just those owners' object rows instead of every row.
 /// See `shaders/scene_join_moved.wgsl`.
 struct MovedJoin {
-    pipelines: [wgpu::ComputePipeline; 3],
+    pipelines: [helio_core::shader::DeferredCompute; 3],
     /// Every binding, for the finish kernel that sizes the carry dispatch.
     layout: wgpu::BindGroupLayout,
     /// Without the indirect arguments, which the dispatch they size must not
@@ -324,7 +324,7 @@ impl MovedJoin {
                 bind_group_layouts: &[Some(layout)],
                 immediate_size: 0,
             });
-            helio_core::shader::create_compute_pipeline(
+            helio_core::shader::create_compute_pipeline_deferred(
                 &device,
                 wgpu::ComputePipelineDescriptor {
                     label: Some(entry),
@@ -443,7 +443,7 @@ impl SceneJoin {
                 label: Some(label),
                 source: wgpu::ShaderSource::Wgsl(join_wgsl(source).into()),
             });
-            helio_core::shader::create_compute_pipeline(
+            helio_core::shader::create_compute_pipeline_deferred(
                 &device,
                 wgpu::ComputePipelineDescriptor {
                     label: Some(label),

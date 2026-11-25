@@ -208,13 +208,13 @@ fn make_compute_pipeline(
     bgl: &wgpu::BindGroupLayout,
     module: &wgpu::ShaderModule,
     entry_point: &str,
-) -> wgpu::ComputePipeline {
+) -> helio_core::shader::DeferredCompute {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
         bind_group_layouts: &[Some(bgl)],
         immediate_size: 0,
     });
-    helio_core::shader::create_compute_pipeline(
+    helio_core::shader::create_compute_pipeline_deferred(
         &device,
         wgpu::ComputePipelineDescriptor {
             label: Some(label),
@@ -233,13 +233,13 @@ fn make_compute_pipeline_with(
     bgls: &[Option<&wgpu::BindGroupLayout>],
     module: &wgpu::ShaderModule,
     entry_point: &str,
-) -> wgpu::ComputePipeline {
+) -> helio_core::shader::DeferredCompute {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
         bind_group_layouts: bgls,
         immediate_size: 0,
     });
-    helio_core::shader::create_compute_pipeline(
+    helio_core::shader::create_compute_pipeline_deferred(
         &device,
         wgpu::ComputePipelineDescriptor {
             label: Some(label),
@@ -297,21 +297,21 @@ struct BindGroupLayouts {
 }
 
 struct Pipelines {
-    gather: wgpu::ComputePipeline,
-    prepare: wgpu::ComputePipeline,
-    final_gather: wgpu::ComputePipeline,
-    moved_args: wgpu::ComputePipeline,
-    final_gather_moved: wgpu::ComputePipeline,
-    group_local_scan: wgpu::ComputePipeline,
-    group_block_scan: wgpu::ComputePipeline,
-    group_write: wgpu::ComputePipeline,
-    group_write_sentinel: wgpu::ComputePipeline,
-    prepare_groups: wgpu::ComputePipeline,
-    build_draw_calls: wgpu::ComputePipeline,
-    range_local_scan: wgpu::ComputePipeline,
-    range_block_scan: wgpu::ComputePipeline,
-    range_write: wgpu::ComputePipeline,
-    shadow_partition: wgpu::ComputePipeline,
+    gather: helio_core::shader::DeferredCompute,
+    prepare: helio_core::shader::DeferredCompute,
+    final_gather: helio_core::shader::DeferredCompute,
+    moved_args: helio_core::shader::DeferredCompute,
+    final_gather_moved: helio_core::shader::DeferredCompute,
+    group_local_scan: helio_core::shader::DeferredCompute,
+    group_block_scan: helio_core::shader::DeferredCompute,
+    group_write: helio_core::shader::DeferredCompute,
+    group_write_sentinel: helio_core::shader::DeferredCompute,
+    prepare_groups: helio_core::shader::DeferredCompute,
+    build_draw_calls: helio_core::shader::DeferredCompute,
+    range_local_scan: helio_core::shader::DeferredCompute,
+    range_block_scan: helio_core::shader::DeferredCompute,
+    range_write: helio_core::shader::DeferredCompute,
+    shadow_partition: helio_core::shader::DeferredCompute,
 }
 
 /// Every scratch buffer this pipeline owns, sized to `capacity` rows (or

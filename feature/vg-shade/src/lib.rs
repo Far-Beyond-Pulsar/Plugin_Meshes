@@ -288,22 +288,22 @@ pub struct VgShade {
 
     resolve_bgl0: wgpu::BindGroupLayout,
     resolve_bgl1: wgpu::BindGroupLayout,
-    resolve_pipeline: wgpu::ComputePipeline,
+    resolve_pipeline: helio_core::shader::DeferredCompute,
     bin_bgl: wgpu::BindGroupLayout,
-    bin_count_pipeline: wgpu::ComputePipeline,
-    bin_scan_pipeline: wgpu::ComputePipeline,
-    bin_scatter_pipeline: wgpu::ComputePipeline,
+    bin_count_pipeline: helio_core::shader::DeferredCompute,
+    bin_scan_pipeline: helio_core::shader::DeferredCompute,
+    bin_scatter_pipeline: helio_core::shader::DeferredCompute,
     shade_bgl0: wgpu::BindGroupLayout,
     shade_bgl1: wgpu::BindGroupLayout,
     shade_bgl2: wgpu::BindGroupLayout,
     shade_layout: wgpu::PipelineLayout,
     shade_modules: HashMap<u32, wgpu::ShaderModule>,
-    shade_pipelines: Vec<Option<wgpu::ComputePipeline>>,
+    shade_pipelines: Vec<Option<helio_core::shader::DeferredCompute>>,
     depth_bgl: wgpu::BindGroupLayout,
-    depth_pipeline: wgpu::RenderPipeline,
+    depth_pipeline: helio_core::shader::DeferredRender,
     /// The final depth of a run drawn through another space ([`Self::with_remaps`]):
     /// its pixels tagged with their instance's remap.
-    depth_remapped: Option<(wgpu::BindGroupLayout, wgpu::RenderPipeline)>,
+    depth_remapped: Option<(wgpu::BindGroupLayout, helio_core::shader::DeferredRender)>,
     /// Created on the first frame a debug view is selected.
     debug: Option<debug::DebugPipeline>,
 
@@ -433,7 +433,7 @@ impl VgShade {
             "VgShade depth (remapped)",
             shader_source::depth().as_str(),
         );
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipeline = helio_core::shader::create_render_pipeline_deferred(device, wgpu::RenderPipelineDescriptor {
             label: Some("VgShade depth (remapped)"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
@@ -509,7 +509,7 @@ impl VgShade {
                        layout: &wgpu::PipelineLayout,
                        module: &wgpu::ShaderModule,
                        entry: &str| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            helio_core::shader::create_compute_pipeline_deferred(device, wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
                 module,
@@ -605,7 +605,7 @@ impl VgShade {
             immediate_size: 0,
         });
         let depth_module = module("VgShade depth", shader_source::depth());
-        let depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let depth_pipeline = helio_core::shader::create_render_pipeline_deferred(device, wgpu::RenderPipelineDescriptor {
             label: Some("VgShade depth"),
             layout: Some(&depth_layout),
             vertex: wgpu::VertexState {
@@ -886,8 +886,9 @@ impl VgShade {
                 self.shade_modules.insert(class, module);
             }
             let module = &self.shade_modules[&class];
-            self.shade_pipelines[bin as usize] = Some(device.create_compute_pipeline(
-                &wgpu::ComputePipelineDescriptor {
+            self.shade_pipelines[bin as usize] = Some(helio_core::shader::create_compute_pipeline_deferred(
+                device,
+                wgpu::ComputePipelineDescriptor {
                     label: Some("VgShade vg_shade"),
                     layout: Some(&self.shade_layout),
                     module,

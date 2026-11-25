@@ -90,7 +90,7 @@ fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 /// Publishes [`VgRun::SECONDARY`]'s instances: the frame's VG instances each
 /// live portal chain may show, placed where it draws them.
 pub struct VgPortalInstancesPass {
-    pipeline: wgpu::ComputePipeline,
+    pipeline: helio_core::shader::DeferredCompute,
     layout: wgpu::BindGroupLayout,
     bind_group: helio_core::CachedBindGroup,
     params: wgpu::Buffer,
@@ -170,7 +170,7 @@ impl VgPortalInstancesPass {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = helio_core::shader::create_compute_pipeline(
+        let pipeline = helio_core::shader::create_compute_pipeline_deferred(
             device,
             wgpu::ComputePipelineDescriptor {
                 label: Some("VgPortalInstances"),

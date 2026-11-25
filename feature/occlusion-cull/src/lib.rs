@@ -83,7 +83,7 @@ pub(crate) struct RangeCompactParams {
 /// occurrences over theirs.
 pub(crate) struct RangeCompaction {
     pub layout: wgpu::BindGroupLayout,
-    pub pipeline: wgpu::ComputePipeline,
+    pub pipeline: helio_core::shader::DeferredCompute,
     /// Three `RangeCompactParams`, one per bucket, 256 bytes apart (bound
     /// with a dynamic offset).
     pub params: wgpu::Buffer,
@@ -127,7 +127,7 @@ impl RangeCompaction {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = helio_core::shader::create_compute_pipeline(
+        let pipeline = helio_core::shader::create_compute_pipeline_deferred(
             device,
             wgpu::ComputePipelineDescriptor {
                 label: Some(label),
@@ -430,7 +430,7 @@ fn create_segment_buf(
 }
 
 pub struct OcclusionCullPass {
-    pipeline: wgpu::ComputePipeline,
+    pipeline: helio_core::shader::DeferredCompute,
     bgl: wgpu::BindGroupLayout,
     range_compaction: RangeCompaction,
     range_compact_group: helio_core::CachedBindGroup,
@@ -668,7 +668,7 @@ impl OcclusionCullPass {
             ("STAT_VERTICES", VERTICES),
             ("STAT_INSTANCES", INSTANCES),
         ]);
-        let pipeline = helio_core::shader::create_compute_pipeline(
+        let pipeline = helio_core::shader::create_compute_pipeline_deferred(
             &device,
             wgpu::ComputePipelineDescriptor {
                 label: Some("OcclusionCull Pipeline"),

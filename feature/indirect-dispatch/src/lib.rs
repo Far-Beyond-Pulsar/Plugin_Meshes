@@ -37,7 +37,7 @@ struct CullUniforms {
 const MIN_CAPACITY: u32 = 256;
 
 pub struct IndirectDispatchPass {
-    pipeline: wgpu::ComputePipeline,
+    pipeline: helio_core::shader::DeferredCompute,
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buf: wgpu::Buffer,
     /// The frame stats' counters (`FrameStats::buffer`) its shader adds to.
@@ -198,7 +198,7 @@ impl IndirectDispatchPass {
             ("STAT_VERTICES", VERTICES),
             ("STAT_INSTANCES", INSTANCES),
         ]);
-        let pipeline = helio_core::shader::create_compute_pipeline(
+        let pipeline = helio_core::shader::create_compute_pipeline_deferred(
             &device,
             wgpu::ComputePipelineDescriptor {
                 label: Some("IndirectDispatch Pipeline"),

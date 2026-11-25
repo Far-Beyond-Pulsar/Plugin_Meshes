@@ -427,8 +427,8 @@ fn compute(
     layout: &wgpu::PipelineLayout,
     module: &wgpu::ShaderModule,
     entry: &str,
-) -> wgpu::ComputePipeline {
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+) -> helio_core::shader::DeferredCompute {
+    helio_core::shader::create_compute_pipeline_deferred(device, wgpu::ComputePipelineDescriptor {
         label: Some(label),
         layout: Some(layout),
         module,
@@ -439,13 +439,13 @@ fn compute(
 }
 
 struct Sw64 {
-    pipeline: wgpu::ComputePipeline,
+    pipeline: helio_core::shader::DeferredCompute,
     bgl1: wgpu::BindGroupLayout,
 }
 struct TileFallback {
-    bin: wgpu::ComputePipeline,
+    bin: helio_core::shader::DeferredCompute,
     bin_bgl1: wgpu::BindGroupLayout,
-    raster: wgpu::ComputePipeline,
+    raster: helio_core::shader::DeferredCompute,
     raster_bgl1: wgpu::BindGroupLayout,
 }
 
@@ -453,15 +453,15 @@ struct TileFallback {
 /// fallback, chosen at construction), and tile classification.
 pub struct VgRaster {
     pub config: VgRasterConfig,
-    hw: wgpu::RenderPipeline,
+    hw: helio_core::shader::DeferredRender,
     bgl0_vertex: wgpu::BindGroupLayout,
     bgl0_compute: wgpu::BindGroupLayout,
     sw64: Option<Sw64>,
     tile: Option<TileFallback>,
     /// Tiles dense last frame first, then the others (they share the slots).
-    classify_kept: wgpu::ComputePipeline,
-    classify_new: wgpu::ComputePipeline,
-    classify_args: wgpu::ComputePipeline,
+    classify_kept: helio_core::shader::DeferredCompute,
+    classify_new: helio_core::shader::DeferredCompute,
+    classify_args: helio_core::shader::DeferredCompute,
     classify_bgl: wgpu::BindGroupLayout,
     binding: helio_mats::MaterialBindingConfig,
     /// Built on first use: devices and scenes without alpha-tested materials
@@ -472,10 +472,10 @@ pub struct VgRaster {
 }
 
 struct MaskedPipelines {
-    hw: wgpu::RenderPipeline,
+    hw: helio_core::shader::DeferredRender,
     hw_bgl1: wgpu::BindGroupLayout,
     /// Software masked kernel (64-bit atomics only) and its alpha group (2).
-    sw: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    sw: Option<(helio_core::shader::DeferredCompute, wgpu::BindGroupLayout)>,
 }
 
 impl VgRaster {
@@ -512,7 +512,7 @@ impl VgRaster {
         let hw_mod = module(device, "VG HW Raster", shaders::hw_raster_source(clip));
         let hw_layout =
             pipeline_layout_with_clip(device, "VG HW Raster PL", &[&bgl0_vertex], clip_render);
-        let hw = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let hw = helio_core::shader::create_render_pipeline_deferred(device, wgpu::RenderPipelineDescriptor {
             label: Some("VG HW Raster"),
             layout: Some(&hw_layout),
             vertex: wgpu::VertexState {
@@ -703,7 +703,7 @@ impl VgRaster {
                 &[&self.bgl0_vertex, &hw_bgl1],
                 self.clip_bgl.as_ref().map(|(render, _)| render),
             );
-            let hw = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            let hw = helio_core::shader::create_render_pipeline_deferred(device, wgpu::RenderPipelineDescriptor {
                 label: Some("VG HW Raster Masked"),
                 layout: Some(&hw_layout),
                 vertex: wgpu::VertexState {

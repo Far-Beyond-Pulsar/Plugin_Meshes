@@ -96,7 +96,7 @@ struct SelectParams {
 pub struct SelectionSelectPass {
     editor: bool,
     shared: Arc<Mutex<SelectionDraws>>,
-    pipeline: wgpu::ComputePipeline,
+    pipeline: helio_core::shader::DeferredCompute,
     params: wgpu::Buffer,
     bind: Option<(Vec<wgpu::Buffer>, wgpu::BindGroup)>,
 }
@@ -109,7 +109,7 @@ impl SelectionSelectPass {
             helio_core::include_wgsl!("../shaders/selection_select.wgsl"),
             &[helio_mesh_api::DRAW_ROWS_SNIPPET],
         );
-        let pipeline = helio_core::shader::create_compute_pipeline(
+        let pipeline = helio_core::shader::create_compute_pipeline_deferred(
             device,
             wgpu::ComputePipelineDescriptor {
                 label: Some("Mesh Selection Select"),
@@ -264,7 +264,7 @@ impl RenderPass for SelectionSelectPass {
 pub struct SelectionMaskPass {
     editor: bool,
     shared: Arc<Mutex<SelectionDraws>>,
-    pipeline: wgpu::RenderPipeline,
+    pipeline: helio_core::shader::DeferredRender,
     draw_slots: DrawSlots,
     /// Bound for an absent optional input (no skinned meshes, no coordinate
     /// spaces): one identity matrix.
@@ -284,7 +284,7 @@ impl SelectionMaskPass {
                 helio_frame_api::rays::stream::SNIPPET,
             ],
         );
-        let pipeline = helio_core::shader::create_render_pipeline(
+        let pipeline = helio_core::shader::create_render_pipeline_deferred(
             device,
             wgpu::RenderPipelineDescriptor {
                 label: Some("Mesh Selection Mask"),

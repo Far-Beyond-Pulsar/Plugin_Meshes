@@ -65,7 +65,7 @@ pub struct TransparentPass {
     medium_fallback_parameters: wgpu::Buffer,
     medium_sampler: wgpu::Sampler,
     /// The material variants' pipelines, compiled off the frame.
-    pipelines: helio_core::compile::Variants<RadiantShaderKey, wgpu::RenderPipeline>,
+    pipelines: helio_core::compile::Variants<RadiantShaderKey, helio_core::shader::DeferredRender>,
     /// This pass's own class-0 override (the transparent base — never
     /// synced from the scene).
     /// [`TRANSPARENT_PROGRAM`] with the media composite.
@@ -401,7 +401,7 @@ pub struct TransparentCompositePass {
     input_alias: Option<&'static str>,
     output: &'static str,
     format: wgpu::TextureFormat,
-    pipeline: wgpu::RenderPipeline,
+    pipeline: helio_core::shader::DeferredRender,
     layout: wgpu::BindGroupLayout,
     bindings: Option<([wgpu::TextureView; 3], wgpu::BindGroup)>,
 }
@@ -438,7 +438,7 @@ impl TransparentCompositePass {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = helio_core::shader::create_render_pipeline(
+        let pipeline = helio_core::shader::create_render_pipeline_deferred(
             device,
             wgpu::RenderPipelineDescriptor {
                 label: Some("Transparent OIT Composite Pipeline"),
@@ -1006,7 +1006,7 @@ impl TransparentPass {
         &mut self,
         device: &wgpu::Device,
         key: RadiantShaderKey,
-    ) -> Option<&wgpu::RenderPipeline> {
+    ) -> Option<&helio_core::shader::DeferredRender> {
         self.request_pipeline(device, key);
         let stand_in = RadiantShaderKey {
             template_id: 0,
@@ -1149,7 +1149,7 @@ impl TransparentPass {
                         },
                     }));
                 }
-                helio_core::shader::create_render_pipeline(
+                helio_core::shader::create_render_pipeline_deferred(
                     device,
                     wgpu::RenderPipelineDescriptor {
                         label: Some("Transparent Pipeline"),

@@ -84,7 +84,7 @@ pub struct GBufferPass {
     timing_query: Option<wgpu::QuerySet>,
     material_binding: helio_mats::MaterialBindingConfig,
     /// The material variants' pipelines, compiled off the frame.
-    pipelines: helio_core::compile::Variants<RadiantShaderKey, wgpu::RenderPipeline>,
+    pipelines: helio_core::compile::Variants<RadiantShaderKey, helio_core::shader::DeferredRender>,
     /// Device supports `POLYGON_MODE_LINE`, so the wireframe debug view is offered.
     wireframe_supported: bool,
     /// The view the pass draws (`helio_core::view`): its winding and clip.
@@ -1124,7 +1124,7 @@ impl GBufferPass {
         &mut self,
         device: &wgpu::Device,
         key: RadiantShaderKey,
-    ) -> Option<&wgpu::RenderPipeline> {
+    ) -> Option<&helio_core::shader::DeferredRender> {
         self.request_pipeline(device, key);
         let stand_in = RadiantShaderKey {
             template_id: 0,
@@ -1233,7 +1233,7 @@ impl GBufferPass {
                     label: Some("GBuffer Shader"),
                     source: wgpu::ShaderSource::Wgsl(source.into()),
                 });
-                helio_core::shader::create_render_pipeline(
+                helio_core::shader::create_render_pipeline_deferred(
                     device,
                     wgpu::RenderPipelineDescriptor {
                         label: Some("GBuffer Pipeline"),

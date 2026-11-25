@@ -135,7 +135,7 @@ pub fn caster_geometry() -> String {
 pub struct ShadowPass {
     depth_materials: helio_pass_gbuffer::depth_material::DepthMaterialBindings,
     /// Shadow geometry pipeline (depth-only, front-face culled, depth-bias = 2.0).
-    pipeline: wgpu::RenderPipeline,
+    pipeline: helio_core::shader::DeferredRender,
     face_static_gen: Vec<u64>,
     face_light_gen: Vec<u64>,
     face_last_update: Vec<u64>,
@@ -152,7 +152,7 @@ pub struct ShadowPass {
 
     /// Depth-clear pipeline: one draw per layer clears the pages of every
     /// serviced face to z = 1.0 (`DepthCompare::Always`) before geometry.
-    depth_clear_pipeline: wgpu::RenderPipeline,
+    depth_clear_pipeline: helio_core::shader::DeferredRender,
     /// The clear draw's jobs (`depth_clear.wgsl`), rewritten each frame, and
     /// the group that binds them with the dirty state it gates on.
     clear_jobs: wgpu::Buffer,
@@ -160,7 +160,7 @@ pub struct ShadowPass {
     /// Retires the serviced faces in one dispatch (`retire.wgsl`): the faces,
     /// rewritten each frame, and the group over them and the matrix buffers
     /// (rebuilt when either grows).
-    retire_pipeline: wgpu::ComputePipeline,
+    retire_pipeline: helio_core::shader::DeferredCompute,
     retire_layout: wgpu::BindGroupLayout,
     retire_jobs: wgpu::Buffer,
     retire_group: Option<wgpu::BindGroup>,
@@ -389,7 +389,7 @@ impl ShadowPass {
             immediate_size: 0,
         });
 
-        let pipeline = helio_core::shader::create_render_pipeline(
+        let pipeline = helio_core::shader::create_render_pipeline_deferred(
             &device,
             wgpu::RenderPipelineDescriptor {
                 label: Some("Shadow Pipeline"),
@@ -514,7 +514,7 @@ impl ShadowPass {
             ],
         });
 
-        let depth_clear_pipeline = helio_core::shader::create_render_pipeline(
+        let depth_clear_pipeline = helio_core::shader::create_render_pipeline_deferred(
             &device,
             wgpu::RenderPipelineDescriptor {
                 label: Some("Shadow/DepthClear Pipeline"),
@@ -562,7 +562,7 @@ impl ShadowPass {
                 storage_entry(5, false, compute),
             ],
         });
-        let retire_pipeline = helio_core::shader::create_compute_pipeline(
+        let retire_pipeline = helio_core::shader::create_compute_pipeline_deferred(
             device,
             wgpu::ComputePipelineDescriptor {
                 label: Some("Shadow/Retire Pipeline"),

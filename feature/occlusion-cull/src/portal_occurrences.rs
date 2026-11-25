@@ -42,9 +42,9 @@ const MIN_OCCURRENCES: u32 = 1024;
 const GROUPS_PER_ROW: u32 = 65_535;
 
 pub struct PortalOccurrencePass {
-    count_pipeline: wgpu::ComputePipeline,
-    scan_pipeline: wgpu::ComputePipeline,
-    write_pipeline: wgpu::ComputePipeline,
+    count_pipeline: helio_core::shader::DeferredCompute,
+    scan_pipeline: helio_core::shader::DeferredCompute,
+    write_pipeline: helio_core::shader::DeferredCompute,
     layout: wgpu::BindGroupLayout,
     bind_group: helio_core::CachedBindGroup,
     params: wgpu::Buffer,
@@ -136,7 +136,7 @@ impl PortalOccurrencePass {
             immediate_size: 0,
         });
         let pipeline = |entry: &'static str| {
-            helio_core::shader::create_compute_pipeline(
+            helio_core::shader::create_compute_pipeline_deferred(
                 device,
                 wgpu::ComputePipelineDescriptor {
                     label: Some(entry),

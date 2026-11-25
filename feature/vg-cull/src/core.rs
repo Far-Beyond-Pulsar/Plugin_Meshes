@@ -397,12 +397,12 @@ impl TileValveReadback {
 }
 
 struct Pipelines {
-    tiles: wgpu::ComputePipeline,
-    seed: wgpu::ComputePipeline,
-    seed_instances: wgpu::ComputePipeline,
-    phase_init: wgpu::ComputePipeline,
-    traverse: wgpu::ComputePipeline,
-    finalize: wgpu::ComputePipeline,
+    tiles: helio_core::shader::DeferredCompute,
+    seed: helio_core::shader::DeferredCompute,
+    seed_instances: helio_core::shader::DeferredCompute,
+    phase_init: helio_core::shader::DeferredCompute,
+    traverse: helio_core::shader::DeferredCompute,
+    finalize: helio_core::shader::DeferredCompute,
 }
 
 type BindCache = Option<(
@@ -528,7 +528,7 @@ impl VgCullCore {
             immediate_size: 0,
         });
         let pipeline = |label: &str, layout: &wgpu::PipelineLayout, entry: &str| {
-            helio_core::shader::create_compute_pipeline(
+            helio_core::shader::create_compute_pipeline_deferred(
                 device,
                 wgpu::ComputePipelineDescriptor {
                     label: Some(label),

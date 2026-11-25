@@ -476,9 +476,9 @@ pub struct VgHizPass {
     run: &'static VgRun,
     source: VgHizSource,
     gate: Option<helio_vg_format::VgRunGate>,
-    mip0: wgpu::ComputePipeline,
+    mip0: helio_core::shader::DeferredCompute,
     mip0_bgl: wgpu::BindGroupLayout,
-    mipn: wgpu::ComputePipeline,
+    mipn: helio_core::shader::DeferredCompute,
     mipn_bgl: wgpu::BindGroupLayout,
     levels: Vec<HizLevel>,
     /// Source depth view the level 0 group was built for.
@@ -563,7 +563,7 @@ impl VgHizPass {
                 bind_group_layouts: &[Some(bgl)],
                 immediate_size: 0,
             });
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            helio_core::shader::create_compute_pipeline_deferred(device, wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
                 module: &module,

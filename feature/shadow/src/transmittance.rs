@@ -15,8 +15,8 @@ pub const TRANSMITTANCE_KEY: &str = helio_light_api::SHADOW_TRANSMITTANCE;
 pub const TRANSMITTANCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 pub(crate) struct Transmittance {
-    pipeline: wgpu::RenderPipeline,
-    clear_pipeline: wgpu::RenderPipeline,
+    pipeline: helio_core::shader::DeferredRender,
+    clear_pipeline: helio_core::shader::DeferredRender,
     bgl_1: wgpu::BindGroupLayout,
     params: wgpu::Buffer,
     pub(crate) view: wgpu::TextureView,
@@ -137,7 +137,7 @@ impl Transmittance {
             bind_group_layouts: &[Some(bgl_0), Some(&bgl_1)],
             immediate_size: 0,
         });
-        let pipeline = helio_core::shader::create_render_pipeline(
+        let pipeline = helio_core::shader::create_render_pipeline_deferred(
             &device,
             wgpu::RenderPipelineDescriptor {
                 label: Some("Shadow/Transmittance Pipeline"),
@@ -209,7 +209,7 @@ impl Transmittance {
             bind_group_layouts: &[Some(bgl_0)],
             immediate_size: 0,
         });
-        let clear_pipeline = helio_core::shader::create_render_pipeline(
+        let clear_pipeline = helio_core::shader::create_render_pipeline_deferred(
             &device,
             wgpu::RenderPipelineDescriptor {
                 label: Some("Clear transmission tile"),
