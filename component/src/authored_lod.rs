@@ -313,7 +313,7 @@ impl AuthoredLodSelection {
             let vertex = active._gpu.vertex_range();
             let index = active._gpu.index_range();
             let section_offset = sections.len() as u32;
-            if active._mesh.upload.sections.is_empty() {
+            if active._mesh.sections.is_empty() {
                 if index.count > 0 {
                     sections.push(AssetSectionRow {
                         first_index: 0,
@@ -321,7 +321,7 @@ impl AuthoredLodSelection {
                     });
                 }
             } else {
-                sections.extend(active._mesh.upload.sections.iter().map(|section| {
+                sections.extend(active._mesh.sections.iter().map(|section| {
                     AssetSectionRow {
                         first_index: section.first_index,
                         index_count: section.index_count,

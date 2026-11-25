@@ -54,8 +54,8 @@ fn gpu_mesh_upload_preserves_uv0_uv1_normals_and_stride() {
     world.insert(
         entity,
         StaticMeshComponent {
-            vertices: vertices.clone(),
-            indices: vec![0, 1, 2],
+            vertices: vertices.clone().into(),
+            indices: vec![0, 1, 2].into(),
             ..Default::default()
         },
     );

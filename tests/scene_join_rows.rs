@@ -43,8 +43,8 @@ fn mesh(movability: ObjectMovability) -> StaticMeshComponent {
             vertex(1.0, 0.0),
             vertex(0.0, 1.0),
             vertex(1.0, 1.0),
-        ],
-        indices: vec![0, 1, 2, 2, 1, 3],
+        ].into(),
+        indices: vec![0, 1, 2, 2, 1, 3].into(),
         mesh_sections: vec![
             meshes_component::mesh_cache::MeshSection {
                 first_index: 0,

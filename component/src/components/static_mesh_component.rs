@@ -13,7 +13,7 @@ use helio_component::subsystems::resolve_asset_path;
 use pulsar_scenedb::gpu::{BufferKey, GpuMirrorHandle, InternedGpuLease};
 use pulsar_scenedb::handle_ledger::HandleId;
 use pulsar_scenedb::{AssetId, AssetPayload, AssetView, Prefetch, Residency};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // Mat4/Quat/Vec3 used to build the transform passed to sync_mesh_object.
 
@@ -141,8 +141,8 @@ impl pulsar_scenedb::handle_ledger::ContentAddressed for MeshGeometryKey {
 #[derive(Debug, Default)]
 pub struct MeshGeometry {
     pub key: MeshGeometryKey,
-    pub vertices: Vec<PackedVertex>,
-    pub indices: Vec<u32>,
+    pub vertices: Arc<[PackedVertex]>,
+    pub indices: Arc<[u32]>,
     pub sections: Vec<MeshSection>,
 }
 
@@ -163,11 +163,11 @@ pub enum FullGeometry {
     /// cache), under the key its binding gave it.
     Asset {
         key: MeshGeometryKey,
-        mesh: std::sync::Arc<LoadedMesh>,
+        mesh: Arc<LoadedMesh>,
     },
     /// Geometry its writer filled in (a generated mesh), shared by the
     /// instances that showed it.
-    Owned(std::sync::Arc<MeshGeometry>),
+    Owned(Arc<MeshGeometry>),
 }
 
 impl FullGeometry {
@@ -180,21 +180,37 @@ impl FullGeometry {
 
     pub fn vertices(&self) -> &[PackedVertex] {
         match self {
-            Self::Asset { mesh, .. } => &mesh.upload.geometry.vertices,
+            Self::Asset { mesh, .. } => &mesh.vertices,
             Self::Owned(geometry) => &geometry.vertices,
         }
     }
 
     pub fn indices(&self) -> &[u32] {
         match self {
-            Self::Asset { mesh, .. } => &mesh.upload.geometry.indices,
+            Self::Asset { mesh, .. } => &mesh.indices,
             Self::Owned(geometry) => &geometry.indices,
+        }
+    }
+
+    /// The vertices as the instance holds them: shared, not copied.
+    pub fn shared_vertices(&self) -> Arc<[PackedVertex]> {
+        match self {
+            Self::Asset { mesh, .. } => Arc::clone(&mesh.vertices),
+            Self::Owned(geometry) => Arc::clone(&geometry.vertices),
+        }
+    }
+
+    /// The indices as the instance holds them: shared, not copied.
+    pub fn shared_indices(&self) -> Arc<[u32]> {
+        match self {
+            Self::Asset { mesh, .. } => Arc::clone(&mesh.indices),
+            Self::Owned(geometry) => Arc::clone(&geometry.indices),
         }
     }
 
     pub fn sections(&self) -> &[MeshSection] {
         match self {
-            Self::Asset { mesh, .. } => &mesh.upload.sections,
+            Self::Asset { mesh, .. } => &mesh.sections,
             Self::Owned(geometry) => &geometry.sections,
         }
     }
@@ -221,9 +237,18 @@ impl std::fmt::Debug for FullGeometry {
 pub const MESH_ASSET_KIND: &str = "mesh";
 
 /// A loaded mesh asset: what every component showing it is bound to.
+///
+/// The geometry is held once, here, and the components showing it hold clones
+/// of these `Arc`s (their GPU copy is one interned range per content id, so
+/// the CPU side is one allocation per asset the same way): binding an asset to
+/// thousands of instances copies no vertex.
 pub struct LoadedMesh {
-    pub upload: MeshAssetUpload,
-    /// Local-space bounding sphere of `upload`'s vertices.
+    pub vertices: Arc<[PackedVertex]>,
+    pub indices: Arc<[u32]>,
+    /// Index ranges that route the geometry to material slots.
+    pub sections: Vec<MeshSection>,
+    pub material_slots: Vec<MeshMaterialSlot>,
+    /// Local-space bounding sphere of the vertices.
     pub bounds_local: [f32; 4],
     /// The content id the file was read as (0 when it has none).
     pub content_id: u128,
@@ -250,25 +275,15 @@ impl LoadedMeshGpuLease {
 impl LoadedMesh {
     fn resident_size_bytes(&self) -> usize {
         let geometry = self
-            .upload
-            .geometry
             .vertices
             .len()
             .saturating_mul(std::mem::size_of::<PackedVertex>())
-            .saturating_add(
-                self.upload
-                    .geometry
-                    .indices
-                    .len()
-                    .saturating_mul(std::mem::size_of::<u32>()),
-            );
+            .saturating_add(self.indices.len().saturating_mul(std::mem::size_of::<u32>()));
         let sections = self
-            .upload
             .sections
             .len()
             .saturating_mul(std::mem::size_of::<MeshSection>());
         let material_metadata = self
-            .upload
             .material_slots
             .iter()
             .map(|slot| slot.name.len())
@@ -380,7 +395,7 @@ pub fn acquire_mesh_asset_gpu_lease(
         .interned_var_len_pool::<PackedVertex>(BufferKey::of("builtin_mesh_vertex"))
         .ok_or_else(|| "SceneDB mesh vertex pool is not registered".to_owned())?;
     let vertices = vertex_pool
-        .acquire_shared(mirror.queue(), identity, &mesh.upload.geometry.vertices)
+        .acquire_shared(mirror.queue(), identity, &mesh.vertices)
         .map_err(|error| format!("could not allocate LOD vertices: {error}"))?;
     store.sync_var_len_pool(
         BufferKey::of("builtin_mesh_vertex"),
@@ -390,7 +405,7 @@ pub fn acquire_mesh_asset_gpu_lease(
         .interned_var_len_pool::<u32>(BufferKey::of("builtin_mesh_index"))
         .ok_or_else(|| "SceneDB mesh index pool is not registered".to_owned())?;
     let indices = index_pool
-        .acquire_shared(mirror.queue(), identity, &mesh.upload.geometry.indices)
+        .acquire_shared(mirror.queue(), identity, &mesh.indices)
         .map_err(|error| format!("could not allocate LOD indices: {error}"))?;
     store.sync_var_len_pool(BufferKey::of("builtin_mesh_index"), index_pool.underlying());
     Ok(LoadedMeshGpuLease { vertices, indices })
@@ -460,10 +475,21 @@ fn load_mesh_asset_data(source: &str) -> Result<LoadedMesh, String> {
         upload.geometry.indices.len(),
         upload.sections.len()
     );
+    // The one copy of the geometry: from here on instances share it.
+    let MeshAssetUpload {
+        geometry,
+        sections,
+        material_slots,
+        bounds,
+        ..
+    } = upload;
     Ok(LoadedMesh {
-        bounds_local: local_bounding_sphere_from_bounds(upload.bounds),
+        vertices: geometry.vertices.into(),
+        indices: geometry.indices.into(),
+        sections,
+        material_slots,
+        bounds_local: local_bounding_sphere_from_bounds(bounds),
         content_id,
-        upload,
     })
 }
 
@@ -485,13 +511,14 @@ fn bind_mesh_asset(component: &mut StaticMeshComponent, view: &AssetView) {
     // The asset's geometry replaces whatever the instance showed (its
     // fallback included); the virtual-geometry host cuts a new one.
     component.full_geometry = None;
-    component.vertices = mesh.upload.geometry.vertices.clone();
-    component.indices = mesh.upload.geometry.indices.clone();
+    // Shared with every other instance of the asset: no vertex is copied.
+    component.vertices = Arc::clone(&mesh.vertices);
+    component.indices = Arc::clone(&mesh.indices);
     component.material_slots =
-        reconcile_material_slots(&component.material_slots, &mesh.upload.material_slots);
+        reconcile_material_slots(&component.material_slots, &mesh.material_slots);
     apply_legacy_material_override(component);
-    component.mesh_sections = mesh.upload.sections.clone();
-    component.material_slot_metadata = mesh.upload.material_slots.clone();
+    component.mesh_sections = mesh.sections.clone();
+    component.material_slot_metadata = mesh.material_slots.clone();
     component.geometry_key = MeshGeometryKey(if mesh.content_id != 0 {
         mesh.content_id
     } else {
@@ -503,8 +530,8 @@ fn bind_mesh_asset(component: &mut StaticMeshComponent, view: &AssetView) {
 /// The "no mesh" geometry: what a component without a loadable mesh shows.
 fn clear_mesh_geometry(component: &mut StaticMeshComponent) {
     component.bounds_local = [0.0, 0.0, 0.0, 0.5];
-    component.vertices.clear();
-    component.indices.clear();
+    component.vertices = Arc::default();
+    component.indices = Arc::default();
     component.mesh_sections.clear();
     component.material_slot_metadata.clear();
     component.geometry_key = MeshGeometryKey::NONE;
@@ -1259,7 +1286,12 @@ pub struct StaticMeshComponent {
     /// `..._gpu_handle` accessors resolve to the shared range.
     #[gpu(buffer = "builtin_mesh_vertex", mirror = Once, content_id = "geometry_key")]
     #[serde(skip)]
-    pub vertices: Vec<PackedVertex>,
+    ///
+    /// Held shared (`Arc<[T]>`): the CPU copy is the loaded asset's own
+    /// ([`LoadedMesh`]), an `Arc` clone per instance, as the GPU copy is one
+    /// interned range per content id. SceneDB's derive reads the elements
+    /// only when a content id first reaches the pool.
+    pub vertices: Arc<[PackedVertex]>,
     /// See [`Self::vertices`] -- same rules, the index half of the same
     /// upload, interned under the SAME `geometry_key` content id (a separate
     /// pool from `vertices`' own -- see `gpu::interned_pool`'s module doc
@@ -1267,7 +1299,7 @@ pub struct StaticMeshComponent {
     /// them).
     #[gpu(buffer = "builtin_mesh_index", mirror = Once, content_id = "geometry_key")]
     #[serde(skip)]
-    pub indices: Vec<u32>,
+    pub indices: Arc<[u32]>,
 
     /// Names and source material indices discovered while loading the mesh.
     /// These are asset metadata, not authored per-instance overrides.
@@ -1338,8 +1370,8 @@ impl StaticMeshComponent {
             let kept = full(self);
             self.full_geometry = Some(kept);
         }
-        self.vertices = fallback.vertices.clone();
-        self.indices = fallback.indices.clone();
+        self.vertices = Arc::clone(&fallback.vertices);
+        self.indices = Arc::clone(&fallback.indices);
         self.mesh_sections = fallback.sections.clone();
         self.geometry_key = fallback.key;
     }
@@ -1349,8 +1381,8 @@ impl StaticMeshComponent {
         let Some(full) = self.full_geometry.take() else {
             return;
         };
-        self.vertices = full.vertices().to_vec();
-        self.indices = full.indices().to_vec();
+        self.vertices = full.shared_vertices();
+        self.indices = full.shared_indices();
         self.mesh_sections = full.sections().to_vec();
         self.geometry_key = full.key();
     }

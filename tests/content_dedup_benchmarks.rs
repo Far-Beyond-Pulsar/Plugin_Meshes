@@ -108,8 +108,8 @@ fn bm3_bulk_hydrate_10k_entities_one_shared_asset() {
             StaticMeshComponent {
                 mesh_asset: MeshAssetPath::new("bm3_asset.mesh"),
                 geometry_key: MeshGeometryKey::for_path(&MeshAssetPath::new("bm3_asset.mesh")),
-                vertices: upload.vertices,
-                indices: upload.indices,
+                vertices: upload.vertices.into(),
+                indices: upload.indices.into(),
                 bounds_local: [0.0, 0.0, 0.0, 0.5],
                 ..Default::default()
             },

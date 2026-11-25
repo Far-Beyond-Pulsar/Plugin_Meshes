@@ -119,7 +119,7 @@ fn mesh_assets_load_replace_and_survive_bad_input() {
     let cube_residency = mesh_asset_residency(cube.mesh).expect("declared mesh residency");
     let cube_payload = cube_residency.get().expect("resident cube mesh");
     assert_eq!(
-        cube_payload.upload.geometry.vertices.len(),
+        cube_payload.vertices.len(),
         cube.vertices.len()
     );
     assert!(Arc::ptr_eq(
@@ -129,7 +129,7 @@ fn mesh_assets_load_replace_and_survive_bad_input() {
     let sphere_prefetch = prefetch_mesh_asset(sphere.mesh).expect("sphere prefetch");
     let sphere_payload = sphere_prefetch.wait().expect("prefetched sphere mesh");
     assert_eq!(
-        sphere_payload.upload.geometry.vertices.len(),
+        sphere_payload.vertices.len(),
         sphere.vertices.len()
     );
 
@@ -247,7 +247,7 @@ fn mesh_assets_load_replace_and_survive_bad_input() {
         "the edit did not reload the (now deleted) asset"
     );
     if let Some(stats) = flush(&world) {
-        let geometry_bytes = std::mem::size_of_val(sphere.vertices.as_slice()) as u64;
+        let geometry_bytes = std::mem::size_of_val(&*sphere.vertices) as u64;
         assert!(
             stats.bytes < geometry_bytes / 10,
             "a movability edit uploaded {} bytes; the geometry is {geometry_bytes}",

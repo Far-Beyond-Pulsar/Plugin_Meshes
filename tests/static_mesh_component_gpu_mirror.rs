@@ -104,8 +104,8 @@ fn vertices_and_indices_land_in_their_shared_gpu_pools_through_world_insert() {
             geometry_key: MeshGeometryKey::for_path(&MeshAssetPath::new(
                 "meshes/primitives/SM_Cube.fbx",
             )),
-            vertices: vec![v(1.0), v(2.0), v(3.0)],
-            indices: vec![0, 1, 2],
+            vertices: vec![v(1.0), v(2.0), v(3.0)].into(),
+            indices: vec![0, 1, 2].into(),
             bounds_local: [0.0, 0.0, 0.0, 0.5],
             ..Default::default()
         },
@@ -183,7 +183,7 @@ fn re_insert_with_different_length_data_still_round_trips_through_world() {
             geometry_key: MeshGeometryKey::for_path(&MeshAssetPath::new(
                 "meshes/primitives/SM_Cube.fbx",
             )),
-            vertices: vec![v(1.0), v(2.0), v(3.0), v(4.0)],
+            vertices: vec![v(1.0), v(2.0), v(3.0), v(4.0)].into(),
             indices: (0..6).collect(),
             bounds_local: [0.0, 0.0, 0.0, 0.5],
             ..Default::default()
@@ -204,8 +204,8 @@ fn re_insert_with_different_length_data_still_round_trips_through_world() {
             geometry_key: MeshGeometryKey::for_path(&MeshAssetPath::new(
                 "meshes/primitives/SM_Sphere.fbx",
             )),
-            vertices: vec![v(9.0)],
-            indices: vec![0],
+            vertices: vec![v(9.0)].into(),
+            indices: vec![0].into(),
             bounds_local: [0.0, 0.0, 0.0, 0.5],
             ..Default::default()
         },

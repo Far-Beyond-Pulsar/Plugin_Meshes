@@ -444,10 +444,8 @@ impl VirtualGeometryHost {
                         .asset_payload::<LoadedMesh>(mesh.mesh)
                         .filter(|loaded| {
                             (loaded.content_id == content || loaded.content_id == 0)
-                                && loaded.upload.geometry.vertices.len()
-                                    == mesh.source_vertices().len()
-                                && loaded.upload.geometry.indices.len()
-                                    == mesh.source_indices().len()
+                                && loaded.vertices.len() == mesh.source_vertices().len()
+                                && loaded.indices.len() == mesh.source_indices().len()
                         });
                     let shared = self.owned.get(&content).and_then(Weak::upgrade);
                     let mut kept = None;
@@ -756,7 +754,7 @@ fn fallback_geometry(
     lod: &helio_vg_stream::ProxyLodCpu,
     full_sections: &[MeshSection],
 ) -> MeshGeometry {
-    let vertices = lod
+    let vertices: Vec<PackedVertex> = lod
         .positions
         .iter()
         .zip(&lod.records)
@@ -797,8 +795,8 @@ fn fallback_geometry(
         .collect();
     MeshGeometry {
         key: MeshGeometryKey(key),
-        vertices,
-        indices: lod.indices.clone(),
+        vertices: vertices.into(),
+        indices: lod.indices.as_slice().into(),
         sections,
     }
 }
@@ -1093,8 +1091,8 @@ mod tests {
         StaticMeshComponent {
             virtual_geometry: on,
             geometry_key: MeshGeometryKey(content),
-            vertices: vec![PackedVertex::default(); 3],
-            indices: vec![0, 1, 2],
+            vertices: vec![PackedVertex::default(); 3].into(),
+            indices: vec![0, 1, 2].into(),
             ..Default::default()
         }
     }
@@ -1112,8 +1110,8 @@ mod tests {
     fn fallback(content: u128, vertices: usize) -> Arc<MeshGeometry> {
         Arc::new(MeshGeometry {
             key: MeshGeometryKey(fallback_key(content, 0.01)),
-            vertices: vec![PackedVertex::default(); vertices],
-            indices: vec![0, 1, 2],
+            vertices: vec![PackedVertex::default(); vertices].into(),
+            indices: vec![0, 1, 2].into(),
             sections: vec![MeshSection {
                 first_index: 0,
                 index_count: 3,
@@ -1155,7 +1153,7 @@ mod tests {
     fn instances_swap_to_the_fallback_and_back() {
         let mut world = World::new();
         let full = StaticMeshComponent {
-            vertices: vec![PackedVertex::default(); 9],
+            vertices: vec![PackedVertex::default(); 9].into(),
             indices: (0..9).collect(),
             mesh_sections: vec![MeshSection {
                 first_index: 0,

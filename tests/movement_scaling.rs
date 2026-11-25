@@ -49,8 +49,8 @@ fn mesh() -> StaticMeshComponent {
     };
     StaticMeshComponent {
         mesh_asset: MeshAssetPath::new(""),
-        vertices: vec![vertex(0.0, 0.0), vertex(1.0, 0.0), vertex(0.0, 1.0)],
-        indices: vec![0, 1, 2],
+        vertices: vec![vertex(0.0, 0.0), vertex(1.0, 0.0), vertex(0.0, 1.0)].into(),
+        indices: vec![0, 1, 2].into(),
         mesh_sections: vec![meshes_component::mesh_cache::MeshSection {
             first_index: 0,
             index_count: 3,

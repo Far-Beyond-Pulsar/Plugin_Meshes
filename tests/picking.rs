@@ -46,8 +46,8 @@ fn scene_pick_does_not_select_empty_aabb_space_inside_mesh_bounds() {
             vertex([-1.0, -1.0, 0.0]),
             vertex([1.0, -1.0, 0.0]),
             vertex([-1.0, 1.0, 0.0]),
-        ],
-        indices: vec![0, 1, 2],
+        ].into(),
+        indices: vec![0, 1, 2].into(),
         geometry_key: MeshGeometryKey(0x705),
         ..Default::default()
     };
