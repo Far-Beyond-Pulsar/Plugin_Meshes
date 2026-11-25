@@ -198,7 +198,7 @@ impl Transmittance {
 
         let clear_source = format!(
             "{}\n@fragment fn fs_clear() -> @location(0) vec4f {{ return vec4f(0); }}",
-            include_str!("../shaders/depth_clear.wgsl")
+            include_str!("../shaders/transmittance_clear.wgsl")
         );
         let clear_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Clear transmission tile"),

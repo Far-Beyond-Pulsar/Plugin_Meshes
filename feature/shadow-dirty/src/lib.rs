@@ -342,6 +342,7 @@ impl ShadowDirtyPass {
             size: (MAX_SHADOW_FACES * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }));

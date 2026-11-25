@@ -1,13 +1,21 @@
 //! Packed, budgeted shadow atlases with persistent static and dynamic caches.
-//! CPU scheduling scans a fixed resident pool. GPU dirty bits gate cached draws;
-//! each scheduled tile is cleared through its scissor and publishes its matrix
-//! only after the matching depth commands. Pending dirty bits survive deferral.
+//! CPU scheduling scans a fixed resident pool. GPU dirty bits gate cached draws.
+//! Which faces to visit comes from the dirty bits themselves, read back
+//! without waiting (`DIRTY_LINGER_FRAMES`) beside what the CPU knows (a face
+//! never drawn, a light or a static caster that changed): a face nothing has
+//! dirtied costs no commands, and a frame with none opens no pass. The visited
+//! faces' pages are cleared in one draw per layer (`depth_clear.wgsl`), their
+//! casters drawn into the tile (a viewport, the face's constants and one
+//! multi-draw each), and their matrices published and dirty state cleared in
+//! one dispatch (`retire.wgsl`), only after the matching depth commands.
+//! Pending dirty bits survive deferral.
 
 pub mod feature;
 pub use feature::ShadowDrawers;
 
 use helio_core::graph::ResourceBuilder;
 use helio_core::{PassContext, PrepareContext, RenderPass, Result as HelioResult};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 mod transmittance;
@@ -27,6 +35,16 @@ const FACE_BUF_STRIDE: u64 = 256;
 /// cached static layer is current, so only the GPU's dirty flags decide
 /// whether they draw anything.
 const MAX_UNMETERED_FACES_PER_FRAME: usize = 192;
+/// Frames a face stays in the serviced set after the GPU's dirty bits last
+/// showed it pending. Which faces are dirty is decided on the GPU
+/// (`ShadowDirty`) and reaches the CPU through a readback that trails by about
+/// two frames (the copy, then the map), so a face is first visited that late.
+/// A dirty bit stays set until its face is serviced, so nothing is lost by
+/// the delay; a face that keeps being dirtied (a moving caster, a sun cascade
+/// following the camera) stays in the set and is drawn the frame the GPU
+/// dirties it. Twice the readback's latency, so one missed sample does not
+/// drop a face that is still moving.
+const DIRTY_LINGER_FRAMES: u8 = 4;
 
 /// Regions of the face-index buffer, each `MAX_SHADOW_FACES` slots. The slot's
 /// second word is the `ShadowDirty` bit its layer draws only when set (see
@@ -34,6 +52,8 @@ const MAX_UNMETERED_FACES_PER_FRAME: usize = 192;
 const FACE_REGIONS: usize = 3;
 /// Pages per face (an 8x8 grid): the instances of the depth-clear draw.
 const PAGES_PER_FACE: u32 = 64;
+/// Threads of one workgroup of the retire dispatch (`retire.wgsl`).
+const RETIRE_WORKGROUP: u32 = 64;
 /// Region 0: ungated (the face's cached static layer is being rebuilt).
 /// Region 1: gated on the dynamic bit. Region 2: gated on the static bit.
 const FACE_REGION_GATES: [u32; FACE_REGIONS] = [0, 1, 2];
@@ -63,6 +83,35 @@ const TRANSMISSIVE_COUNTS: usize = 2;
 /// Byte offset of `face`'s count in a region of `face_geom_count_buf`.
 fn face_count_offset(region: usize, face: usize) -> u64 {
     (region * MAX_SHADOW_FACES + face) as u64 * 4
+}
+
+/// Bytes of one job of the depth-clear draw: face, gate, tile origin, tile size.
+const CLEAR_JOB_BYTES: u64 = 16;
+/// Jobs of the clear draw: both layers of every face, after a header entry.
+const CLEAR_JOB_CAPACITY: u64 = 1 + 2 * MAX_SHADOW_FACES as u64;
+/// Words of the retire list: the count, the region size, then every face.
+const RETIRE_WORD_CAPACITY: u64 = 2 + MAX_SHADOW_FACES as u64;
+
+/// A copy of `face_dirty_buf` on its way to the CPU: the buffer, whether its
+/// map finished, and whether the map was started (it is, the frame after the
+/// copy was submitted).
+struct DirtyReadback {
+    buffer: helio_core::gpu_cache::PooledBuffer,
+    ready: Arc<AtomicBool>,
+    mapping: bool,
+}
+
+/// The lists a frame builds, owned by the pass so they are allocated once.
+#[derive(Default)]
+struct Scratch {
+    /// (face, rebuilds the static layer, urgency), then ranked.
+    candidates: Vec<(usize, bool, f32)>,
+    /// The faces serviced this frame and whether each rebuilds its static layer.
+    selected: Vec<(usize, bool)>,
+    /// The depth-clear draw's jobs, as written to `clear_jobs`.
+    clear: Vec<[u32; 4]>,
+    /// The retire dispatch's words, as written to `retire_jobs`.
+    retire: Vec<u32>,
 }
 
 // ── Pass struct ───────────────────────────────────────────────────────────────
@@ -101,9 +150,31 @@ pub struct ShadowPass {
     /// Faces serviced last frame: (metered by the budget, unmetered GPU-gated).
     last_visits: (usize, usize),
 
-    /// Depth-clear pipeline — renders a full-screen triangle at z=1.0 with
-    /// `DepthCompare::Always` to GPU-clear individual atlas faces before geometry.
+    /// Depth-clear pipeline: one draw per layer clears the pages of every
+    /// serviced face to z = 1.0 (`DepthCompare::Always`) before geometry.
     depth_clear_pipeline: wgpu::RenderPipeline,
+    /// The clear draw's jobs (`depth_clear.wgsl`), rewritten each frame, and
+    /// the group that binds them with the dirty state it gates on.
+    clear_jobs: wgpu::Buffer,
+    clear_group: wgpu::BindGroup,
+    /// Retires the serviced faces in one dispatch (`retire.wgsl`): the faces,
+    /// rewritten each frame, and the group over them and the matrix buffers
+    /// (rebuilt when either grows).
+    retire_pipeline: wgpu::ComputePipeline,
+    retire_layout: wgpu::BindGroupLayout,
+    retire_jobs: wgpu::Buffer,
+    retire_group: Option<wgpu::BindGroup>,
+    retire_group_key: Option<[wgpu::Buffer; 2]>,
+    /// The GPU's pending-dirty bits, read back without waiting: the faces that
+    /// may need servicing are the ones this shows (`recently_dirty`).
+    readbacks: helio_core::gpu_cache::ReadbackPool,
+    dirty_readback: Option<DirtyReadback>,
+    /// Frames each face stays in the serviced set (`DIRTY_LINGER_FRAMES`).
+    recently_dirty: Vec<u8>,
+    /// The frame's lists, kept between frames so a frame allocates nothing.
+    scratch: Scratch,
+    /// Edge of both atlases in texels.
+    atlas_size: u32,
 
     #[allow(dead_code)]
     bgl_0: wgpu::BindGroupLayout,
@@ -385,15 +456,58 @@ impl ShadowPass {
         );
 
         // ── Depth-clear pipeline ───────────────────────────────────────────────
-        // GPU-clear individual shadow atlas faces: renders a full-screen triangle
-        // at depth=1.0 (far plane) using DepthCompare::Always to overwrite existing
-        // depth values.  No vertex buffer, no fragment shader, no depth bias.
+        // GPU-clear the serviced faces' pages: one draw per layer of quads at
+        // depth = 1.0 (far plane) using DepthCompare::Always to overwrite
+        // existing depth values, placed in the atlas from the jobs the pass
+        // writes each frame. No vertex buffer, no fragment shader, no bias.
+        let storage_entry = |binding, read_only, visibility| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let clear_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Shadow/DepthClear BGL"),
+            entries: &[
+                storage_entry(0, true, wgpu::ShaderStages::VERTEX),
+                storage_entry(1, true, wgpu::ShaderStages::VERTEX),
+                storage_entry(2, true, wgpu::ShaderStages::VERTEX),
+            ],
+        });
         let depth_clear_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Shadow/DepthClear PL"),
-                bind_group_layouts: &[Some(&bgl_0)],
+                bind_group_layouts: &[Some(&clear_layout)],
                 immediate_size: 0,
             });
+        let clear_jobs = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Shadow/DepthClear jobs"),
+            size: CLEAR_JOB_CAPACITY * CLEAR_JOB_BYTES,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let clear_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Shadow/DepthClear group"),
+            layout: &clear_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: clear_jobs.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: face_dirty_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: face_pages_buf.as_entire_binding(),
+                },
+            ],
+        });
 
         let depth_clear_pipeline = helio_core::shader::create_render_pipeline(
             &device,
@@ -424,6 +538,46 @@ impl ShadowPass {
                 cache: None,
             },
         );
+
+        // ── Retire dispatch ────────────────────────────────────────────────────
+        let retire_shader = helio_core::shader::module(
+            device,
+            "Shadow/Retire",
+            helio_core::include_wgsl!("../shaders/retire.wgsl"),
+        );
+        let compute = wgpu::ShaderStages::COMPUTE;
+        let retire_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Shadow/Retire BGL"),
+            entries: &[
+                storage_entry(0, true, compute),
+                storage_entry(1, true, compute),
+                storage_entry(2, false, compute),
+                storage_entry(3, false, compute),
+                storage_entry(4, false, compute),
+                storage_entry(5, false, compute),
+            ],
+        });
+        let retire_pipeline = helio_core::shader::create_compute_pipeline(
+            device,
+            wgpu::ComputePipelineDescriptor {
+                label: Some("Shadow/Retire Pipeline"),
+                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Shadow/Retire PL"),
+                    bind_group_layouts: &[Some(&retire_layout)],
+                    immediate_size: 0,
+                })),
+                module: &retire_shader,
+                entry_point: Some("retire"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        );
+        let retire_jobs = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Shadow/Retire jobs"),
+            size: RETIRE_WORD_CAPACITY * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // One u32 per face at FACE_BUF_STRIDE byte intervals.
         // The CPU never touches this buffer after construction.
@@ -503,6 +657,18 @@ impl ShadowPass {
             face_strength_written: vec![(f32::NAN, u64::MAX); MAX_SHADOW_FACES],
             schedule_frame: 0,
             depth_clear_pipeline,
+            clear_jobs,
+            clear_group,
+            retire_pipeline,
+            retire_layout,
+            retire_jobs,
+            retire_group: None,
+            retire_group_key: None,
+            readbacks: helio_core::gpu_cache::ReadbackPool::new("Shadow dirty readback"),
+            dirty_readback: None,
+            recently_dirty: vec![0; MAX_SHADOW_FACES],
+            scratch: Scratch::default(),
+            atlas_size,
             static_array_view: Some(array_view(&static_atlas)),
             transmittance,
             has_glass: false,
@@ -608,6 +774,31 @@ impl RenderPass for ShadowPass {
 
     fn prepare(&mut self, _ctx: &PrepareContext) -> HelioResult<()> {
         helio_core::cpu_scope!("Shadow: prepare");
+        // Last frames' pending bits: map the copy once it has been submitted,
+        // and read it once mapped. A face with a bit set stays serviced for a
+        // few frames (`DIRTY_LINGER_FRAMES`); the rest are not visited.
+        if let Some(readback) = self.dirty_readback.as_mut() {
+            if !readback.mapping {
+                readback.buffer.map_read(Arc::clone(&readback.ready));
+                readback.mapping = true;
+            } else if readback.ready.load(Ordering::Acquire) {
+                {
+                    let view = readback
+                        .buffer
+                        .slice(..MAX_SHADOW_FACES as u64 * 4)
+                        .get_mapped_range();
+                    if let Ok(bytes) = view.map(|bytes| bytes.to_vec()) {
+                        for (face, word) in bytes.chunks_exact(4).enumerate() {
+                            if word != [0; 4] {
+                                self.recently_dirty[face] = DIRTY_LINGER_FRAMES;
+                            }
+                        }
+                    }
+                }
+                readback.buffer.unmap();
+                self.dirty_readback = None;
+            }
+        }
         Ok(())
     }
 
@@ -713,8 +904,12 @@ impl RenderPass for ShadowPass {
         }
         helio_core::cpu_scope!("Shadow: gather candidates");
         self.schedule_frame += 1;
+        for frames in &mut self.recently_dirty {
+            *frames = frames.saturating_sub(1);
+        }
         self.has_glass = batch.readback_shadow_transmissive_draw_count > 0;
-        let mut candidates = Vec::with_capacity(MAX_SHADOW_FACES);
+        let mut candidates = std::mem::take(&mut self.scratch.candidates);
+        candidates.clear();
         let fade_step = 1.0 / data.budget.fade_frames.max(1) as f32;
         for (slot, r) in residency.residents.iter().enumerate() {
             for (f, t) in r.tiles.iter().enumerate() {
@@ -748,6 +943,11 @@ impl RenderPass for ShadowPass {
                 }
                 let static_dirty =
                     changed || self.face_static_gen[face] != batch.shadow_static_generation;
+                // A face nothing has dirtied is not visited: its cached layers
+                // are current and its tile costs no commands.
+                if !static_dirty && self.recently_dirty[face] == 0 {
+                    continue;
+                }
                 // Aging guarantees low-priority pending faces are eventually serviced.
                 let age = self
                     .schedule_frame
@@ -777,8 +977,9 @@ impl RenderPass for ShadowPass {
 
         // ── Select the faces to service this frame ───────────────────────────
         helio_core::cpu_scope!("Shadow: select faces");
-        let mut selected: Vec<(usize, bool)> = Vec::with_capacity(candidates.len());
-        for (face, static_dirty, _) in candidates {
+        let mut selected = std::mem::take(&mut self.scratch.selected);
+        selected.clear();
+        for &(face, static_dirty, _) in &candidates {
             let r = &residency.residents[face / 6];
             let tile = r.tiles[face % 6];
             let layers = 3;
@@ -813,13 +1014,64 @@ impl RenderPass for ShadowPass {
         }
         self.last_visits = (selected.len() - free_visits, free_visits);
 
-        // ── Both depth layers: one render pass each, every selected face's
-        // tile drawn in turn (a viewport and scissor per face), instead of two
-        // passes per face. A clean face costs a few state changes and an empty
-        // multi-draw, no pass boundary. The layers are separate textures, so
-        // they are timed apart.
-        let mut cmds = ctx.graphics_cmds();
+        self.scratch.candidates = candidates;
+
+        // ── The depth-clear draw's jobs: both layers of every serviced face ──
+        // (header first), written once so each layer clears all its faces in
+        // one draw with no per-face state.
+        let serviced = selected.len() as u32;
+        let mut clear_jobs = std::mem::take(&mut self.scratch.clear);
+        clear_jobs.clear();
+        clear_jobs.push([self.atlas_size, 0, 0, 0]);
         for is_static in [true, false] {
+            for &(face, static_dirty) in &selected {
+                let tile = residency.residents[face / 6].tiles[face % 6];
+                // The dirty bit the layer is gated on (1 dynamic, 2 static);
+                // 0 clears it unconditionally (its static layer is rebuilt).
+                let gate = if static_dirty {
+                    0
+                } else if is_static {
+                    2
+                } else {
+                    1
+                };
+                clear_jobs.push([face as u32, gate, tile.x | (tile.y << 16), tile.size]);
+            }
+        }
+        if serviced > 0 {
+            ctx.write_buffer(&self.clear_jobs, 0, bytemuck::cast_slice(&clear_jobs));
+        }
+        self.scratch.clear = clear_jobs;
+
+        // ── Both depth layers: one render pass each. The pages of every
+        // serviced face are cleared in one draw, then each face's casters are
+        // drawn into its tile (a viewport, the face's constants and one
+        // multi-draw), so a clean face costs three commands and no pass
+        // boundary. The layers are separate textures, so they are timed apart.
+        let mut cmds = ctx.graphics_cmds();
+        // The pending bits as they stand now, after `ShadowDirty` has marked
+        // this frame's changes and before the faces serviced below clear
+        // theirs: what the next frames' selection reads (one copy in flight).
+        if self.dirty_readback.is_none() {
+            let buffer = self
+                .readbacks
+                .get(ctx.device, MAX_SHADOW_FACES as u64 * 4);
+            cmds.copy_buffer_to_buffer(
+                &self.face_dirty_buf,
+                0,
+                &buffer,
+                0,
+                MAX_SHADOW_FACES as u64 * 4,
+            );
+            self.dirty_readback = Some(DirtyReadback {
+                buffer,
+                ready: Arc::new(AtomicBool::new(false)),
+                mapping: false,
+            });
+        }
+        // No face to service: no pass at all (a pass costs wgpu's validation of
+        // everything it binds, whatever it draws).
+        for is_static in [true, false].into_iter().filter(|_| serviced > 0) {
             let scope = if is_static {
                 "Shadow: static layer"
             } else {
@@ -848,82 +1100,74 @@ impl RenderPass for ShadowPass {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                pass.set_vertex_buffer(0, vertices.buffer.slice(..));
-                pass.set_vertex_buffer(1, slots.slice(..));
-                pass.set_index_buffer(indices.buffer.slice(..), wgpu::IndexFormat::Uint32);
-                for &(face, static_dirty) in &selected {
-                    let r = &residency.residents[face / 6];
-                    let tile = r.tiles[face % 6];
-                    let dynamic_offset = face_idx_offset(face, static_dirty, is_static);
-                    let face_count = |region| helio_mesh_api::GpuDrawCount {
-                        buffer: &self.face_geom_count_buf,
-                        offset: face_count_offset(region, face),
-                    };
-                    pass.set_viewport(
-                        tile.x as f32,
-                        tile.y as f32,
-                        tile.size as f32,
-                        tile.size as f32,
-                        0.0,
-                        1.0,
-                    );
-                    pass.set_scissor_rect(tile.x, tile.y, tile.size, tile.size);
+                if serviced > 0 {
+                    let first = if is_static { 0 } else { serviced * PAGES_PER_FACE };
                     pass.set_pipeline(&self.depth_clear_pipeline);
-                    pass.set_bind_group(0, bg, &[dynamic_offset]);
-                    pass.draw(0..6, 0..PAGES_PER_FACE);
-                    let disabled = r.flags & if is_static { 16 } else { 32 } != 0;
-                    if disabled {
-                        continue;
-                    }
-                    pass.set_pipeline(&self.pipeline);
-                    pass.set_bind_group(1, self.depth_materials.group.as_ref().unwrap(), &[]);
-                    pass.set_bind_group(0, bg, &[dynamic_offset]);
-                    // With GPU counts, every list is bounded by its capacity
-                    // and drawn to this frame's live count, so a caster
-                    // spawned or despawned this frame is already (or no
-                    // longer) in it.
-                    if is_static {
-                        let (max_draws, count) = batch.shadow_static_draws();
-                        // A face not known to be dirty is redrawn only if
-                        // `ShadowDirty` dirtied it on the GPU (a light's
-                        // matrix changed): its per-face count is the live
-                        // count then, else 0. Drawing the full list and
-                        // discarding it in the vertex shader ran every static
-                        // caster's vertices for every scheduled face.
-                        let count = if self.supports_multi_draw_count && !static_dirty {
-                            Some(face_count(STATIC_COUNTS))
-                        } else {
-                            count
-                        };
-                        helio_mesh_api::multi_draw_indexed_indirect(
-                            &mut pass,
-                            batch.shadow_static_indirect,
-                            0,
-                            max_draws,
-                            count,
-                        );
+                    pass.set_bind_group(0, &self.clear_group, &[]);
+                    pass.draw(0..6, first..first + serviced * PAGES_PER_FACE);
+                    let (max_draws, count) = if is_static {
+                        batch.shadow_static_draws()
                     } else {
-                        let (max_draws, count) = batch.shadow_movable_draws();
-                        let count = if self.supports_multi_draw_count && !static_dirty {
-                            // `ShadowDirty`'s per-face count: the live count
-                            // when the face's movable casters changed, else 0.
-                            Some(face_count(MOVABLE_COUNTS))
+                        batch.shadow_movable_draws()
+                    };
+                    // Nothing to draw anywhere: the clear above is all a
+                    // layer without casters needs.
+                    if max_draws > 0 {
+                        let indirect = if is_static {
+                            batch.shadow_static_indirect
                         } else {
-                            count
+                            batch.shadow_movable_indirect
                         };
-                        helio_mesh_api::multi_draw_indexed_indirect(
-                            &mut pass,
-                            batch.shadow_movable_indirect,
-                            0,
-                            max_draws,
-                            count,
-                        );
+                        let counts_region = if is_static { STATIC_COUNTS } else { MOVABLE_COUNTS };
+                        pass.set_pipeline(&self.pipeline);
+                        pass.set_bind_group(1, self.depth_materials.group.as_ref().unwrap(), &[]);
+                        pass.set_vertex_buffer(0, vertices.buffer.slice(..));
+                        pass.set_vertex_buffer(1, slots.slice(..));
+                        pass.set_index_buffer(indices.buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        for &(face, static_dirty) in &selected {
+                            let r = &residency.residents[face / 6];
+                            if r.flags & if is_static { 16 } else { 32 } != 0 {
+                                continue;
+                            }
+                            let tile = r.tiles[face % 6];
+                            pass.set_viewport(
+                                tile.x as f32,
+                                tile.y as f32,
+                                tile.size as f32,
+                                tile.size as f32,
+                                0.0,
+                                1.0,
+                            );
+                            pass.set_bind_group(
+                                0,
+                                bg,
+                                &[face_idx_offset(face, static_dirty, is_static)],
+                            );
+                            // With GPU counts, every list is bounded by its
+                            // capacity and drawn to this frame's live count,
+                            // so a caster spawned or despawned this frame is
+                            // already (or no longer) in it. A face not known
+                            // to be dirty draws the list only if `ShadowDirty`
+                            // dirtied it on the GPU (a light's matrix changed
+                            // or a movable caster moved): its per-face count
+                            // is the live count then, else 0.
+                            let count = if self.supports_multi_draw_count && !static_dirty {
+                                Some(helio_mesh_api::GpuDrawCount {
+                                    buffer: &self.face_geom_count_buf,
+                                    offset: face_count_offset(counts_region, face),
+                                })
+                            } else {
+                                count
+                            };
+                            helio_mesh_api::multi_draw_indexed_indirect(
+                                &mut pass, indirect, 0, max_draws, count,
+                            );
+                        }
                     }
                 }
             }
             ctx.end_gpu_scope(&mut cmds, scope);
         }
-
         // ── Glass transmittance (follows the static layer) ───────────────────
         if let Some(depth) = self.static_array_view.as_ref() {
             helio_core::cpu_scope!("Shadow: transmittance");
@@ -972,18 +1216,67 @@ impl RenderPass for ShadowPass {
             ctx.end_gpu_scope(&mut cmds, "Shadow: transmittance");
         }
 
-        // ── Activate each serviced face's matrix and retire its dirty state ──
-        // Only after its matching depth has been rendered.
-        helio_core::cpu_scope!("Shadow: activate faces");
-        ctx.begin_gpu_scope(&mut cmds, "Shadow: activate faces");
+        // ── Retire each serviced face ─────────────────────────────────────────
+        // Only after its matching depth has been rendered: publish its matrix
+        // and clear its dirty state, in one dispatch for all of them.
+        helio_core::cpu_scope!("Shadow: retire faces");
+        if serviced > 0 {
+            let mut retire = std::mem::take(&mut self.scratch.retire);
+            retire.clear();
+            retire.push(serviced);
+            retire.push(MAX_SHADOW_FACES as u32);
+            retire.extend(selected.iter().map(|&(face, _)| face as u32));
+            ctx.write_buffer(&self.retire_jobs, 0, bytemuck::cast_slice(&retire));
+            self.scratch.retire = retire;
+            let key = [desired.clone(), data.shadow_matrices.clone()];
+            if self.retire_group_key.as_ref() != Some(&key) {
+                self.retire_group = Some(ctx.device.create_bind_group(
+                    &wgpu::BindGroupDescriptor {
+                        label: Some("Shadow/Retire group"),
+                        layout: &self.retire_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.retire_jobs.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: desired.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: data.shadow_matrices.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: self.face_dirty_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: self.face_pages_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: self.face_geom_count_buf.as_entire_binding(),
+                            },
+                        ],
+                    },
+                ));
+                self.retire_group_key = Some(key);
+            }
+            ctx.begin_gpu_scope(&mut cmds, "Shadow: activate faces");
+            {
+                let mut pass = cmds.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Shadow/Retire"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.retire_pipeline);
+                pass.set_bind_group(0, self.retire_group.as_ref().unwrap(), &[]);
+                pass.dispatch_workgroups(serviced.div_ceil(RETIRE_WORKGROUP), 1, 1);
+            }
+            ctx.end_gpu_scope(&mut cmds, "Shadow: activate faces");
+        }
         for &(face, static_dirty) in &selected {
-            cmds.copy_buffer_to_buffer(
-                desired,
-                face as u64 * 96,
-                data.shadow_matrices,
-                face as u64 * 96,
-                64,
-            );
             // The "ready" marker only changes when the face was (re)assigned:
             // a rebuild of its static layer, or its first service.
             if static_dirty || self.face_last_update[face] == 0 {
@@ -993,20 +1286,11 @@ impl RenderPass for ShadowPass {
                     bytemuck::bytes_of(&2u32),
                 );
             }
-            cmds.clear_buffer(&self.face_dirty_buf, face as u64 * 4, Some(4));
-            cmds.clear_buffer(&self.face_pages_buf, face as u64 * 8, Some(8));
-            for region in [MOVABLE_COUNTS, STATIC_COUNTS, TRANSMISSIVE_COUNTS] {
-                cmds.clear_buffer(
-                    &self.face_geom_count_buf,
-                    face_count_offset(region, face),
-                    Some(4),
-                );
-            }
             self.face_static_gen[face] = batch.shadow_static_generation;
             self.face_light_gen[face] = data.per_caster_dirty_gen[face / 6];
             self.face_last_update[face] = self.schedule_frame;
         }
-        ctx.end_gpu_scope(&mut cmds, "Shadow: activate faces");
+        self.scratch.selected = selected;
         self.last_work = (updates, texels);
         Ok(())
     }
