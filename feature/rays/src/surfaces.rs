@@ -35,9 +35,16 @@
 //! programs past the bound are evaluated by the table-driven program (their
 //! row's factors and textures), never left without a surface.
 //!
+//! The bins' dispatches overlap (`ComputeCmds::begin_overlap`: no barrier
+//! between them, their arguments validated together): a bin with few hits
+//! takes about one kernel's latency, and bins in a row with barriers
+//! between them cost that latency each, whatever their hits (r2 measured
+//! 0.03-0.06 ms a program with hits); overlapped, they share it.
+//!
 //! Cost: the table-driven dispatch alone is one pass over the stream; with
 //! programs, three binning passes plus one dispatch a bin (empty bins
-//! dispatch no workgroups), each kernel over its own hits only.
+//! dispatch no workgroups), each kernel over its own hits only, the bins
+//! running concurrently.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -873,11 +880,16 @@ impl MeshHitSurfaces {
                 timestamp_writes: writes(STAGE_SHADE),
             });
             pass.set_bind_group(1, Some(materials), &[]);
+            // The bins write disjoint rows of the stream's surfaces (a hit
+            // is in one bin): they run concurrently, with no barrier between
+            // them and their arguments validated together.
+            pass.begin_overlap();
             for (k, program) in self.bins.iter().enumerate() {
                 pass.set_pipeline(program.of(self.detail));
                 pass.set_bind_group(0, Some(surface_group), &[(k as u64 * BIN_STRIDE) as u32]);
                 pass.dispatch_workgroups_indirect(bins, k as u64 * BIN_WORDS * 4);
             }
+            pass.end_overlap();
         }
         // The bins' counts, read back frames later, so programs with no
         // hits take no bin.
