@@ -5,6 +5,10 @@ use meshes_editor::{level_editor, thumbnails};
 use ui_common::asset_thumbnails::ThumbnailRendererRegistration;
 use ui_level_editor::extend::{CreateEntry, ObjectIconRegistration};
 
+// The authored LOD levels edit as a reflected list (one card per level).
+// A type attachment (no origin): it stays with the type it hints.
+ui_common::register_reflected_list_editor!(meshes_component::LODLevel);
+
 /// The Create menu's primitive meshes ([`level_editor::PRIMITIVES`]).
 macro_rules! primitive_entries {
     ($p:expr; $($index:literal),*) => {$(

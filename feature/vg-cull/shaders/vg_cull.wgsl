@@ -303,6 +303,32 @@ struct InstCtx {
     asset: u32,
 }
 
+// Axis lengths of the model matrix may differ by this fraction and still count
+// as a uniform (angle-preserving) scale.
+const UNIFORM_SCALE_TOLERANCE: f32 = 1.0e-3;
+
+/// Cone (backface) culling in asset space is valid only while the instance
+/// transform preserves angles and orientation: finite non-zero uniform scale
+/// and no mirroring. Decided here, from this frame's transform, so an object
+/// that moves changes nothing the instance derivation writes.
+fn cone_cull_allowed(m: mat4x4<f32>) -> bool {
+    let c0 = m[0].xyz;
+    let c1 = m[1].xyz;
+    let c2 = m[2].xyz;
+    let l0 = length(c0);
+    let l1 = length(c1);
+    let l2 = length(c2);
+    let low = min(l0, min(l1, l2));
+    let high = max(l0, max(l1, l2));
+    if !(low > 0.0) || !(high <= 3.4028235e38) {
+        return false;
+    }
+    if high - low > UNIFORM_SCALE_TOLERANCE * high {
+        return false;
+    }
+    return dot(cross(c0, c1), c2) > 0.0;
+}
+
 fn load_inst(id: u32) -> InstCtx {
     let inst = vg_instances[id];
     let t = objects[inst.object_row].transform;
@@ -317,6 +343,9 @@ fn load_inst(id: u32) -> InstCtx {
     c.scale = max(length(m[0].xyz), max(length(m[1].xyz), length(m[2].xyz)));
     c.err_scale = max(inst.lod_error_scale, 1.0e-4);
     c.flags = inst.flags;
+    if !cone_cull_allowed(m) {
+        c.flags = c.flags & ~VG_INST_CONE_CULL;
+    }
     c.asset = inst.asset_slot;
     c.tau = select(params.tau_px, ROOT_ONLY_TAU, (inst.flags & VG_INST_FORCE_ROOT_ONLY) != 0u);
     return c;

@@ -38,9 +38,6 @@ const F32_MAX: f32 = 3.4028235e38;
 const NO_ASSET: u32 = 0xffffffffu;
 const ASSET_READY_BIT: u32 = 1u;
 const OVERRIDE_PRESENT: u32 = 0x80000000u;
-// Axis lengths of the model matrix may differ by this fraction and still count
-// as a uniform (angle-preserving) scale.
-const UNIFORM_SCALE_TOLERANCE: f32 = 1.0e-3;
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> owners: array<Owner>;
@@ -96,28 +93,6 @@ fn find_asset(content: vec4<u32>) -> u32 {
         return low;
     }
     return NO_ASSET;
-}
-
-/// Cone (backface) culling in asset space is valid only when the instance
-/// transform preserves angles and orientation: finite non-zero uniform scale
-/// and no mirroring.
-fn cone_cull_allowed(object: u32) -> bool {
-    let m = objects[object].transform;
-    let c0 = vec3<f32>(m[0][0], m[0][1], m[0][2]);
-    let c1 = vec3<f32>(m[1][0], m[1][1], m[1][2]);
-    let c2 = vec3<f32>(m[2][0], m[2][1], m[2][2]);
-    let l0 = length(c0);
-    let l1 = length(c1);
-    let l2 = length(c2);
-    let low = min(l0, min(l1, l2));
-    let high = max(l0, max(l1, l2));
-    if !(low > 0.0) || !(high <= F32_MAX) {
-        return false;
-    }
-    if high - low > UNIFORM_SCALE_TOLERANCE * high {
-        return false;
-    }
-    return dot(cross(c0, c1), c2) > 0.0;
 }
 
 @compute @workgroup_size(64)
@@ -201,9 +176,11 @@ fn cs_classify(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     flags = flags | VG_INST_LOD_SUPPRESS
         | (min(draws.count, VG_INST_SECTION_MASK) << VG_INST_SECTION_SHIFT);
-    if cone_cull_allowed(first) {
-        flags = flags | VG_INST_CONE_CULL;
-    }
+    // Asked for on every instance; the cull pass applies it only while the
+    // instance's transform preserves angles and orientation
+    // (`vg_cull.wgsl`, `cone_cull_allowed`), which it reads every frame. A
+    // moved object then changes nothing derived here.
+    flags = flags | VG_INST_CONE_CULL;
     candidates[row] = VgInstance(asset_ready[asset].asset_slot, flags, scale, draws.offset);
     if owner < arrayLength(&suppressed) {
         atomicStore(&suppressed[owner], 1u);

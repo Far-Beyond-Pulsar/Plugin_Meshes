@@ -157,6 +157,10 @@ impl VgInstanceKeys {
 
 /// The scene join's published object rows (`StaticObjectComponent`).
 const OBJECTS_KEY: BufferKey = helio_mesh_api::STATIC_OBJECTS.key();
+/// The join's marker that moves only when the object rows' structure does
+/// (objects added, removed, or their mesh, material or flags changed), not
+/// when objects merely move.
+const OBJECTS_STRUCTURE_KEY: BufferKey = helio_mesh_api::OBJECTS_STRUCTURE.key();
 
 /// Runtime switch for the derivation, from `VirtualGeometrySettings`: when
 /// off, no instance is VG-active and nothing is suppressed. Cloneable; hold
@@ -441,6 +445,19 @@ impl SceneDerivation for VirtualGeometryInstances {
         let object_rows = objects.map_or(0, |h| rows_of(h, OBJECT_ROW_BYTES));
         let grew = grew | self.classic.ensure(ctx.device, object_rows);
 
+        // What is read of an object row is its structure (mesh slot and
+        // generation, flags): a frame that only moved objects changes none of
+        // the outputs, so it must not rerun this or move their generations
+        // (the object batch would re-sort and the VG BVH rebuild every frame
+        // anything moves). The join's structure marker says when the rows
+        // changed in a way read here; without one every change counts.
+        let structure = inputs.get(OBJECTS_STRUCTURE_KEY);
+        let (objects_input, objects_layout) = match (structure, objects) {
+            (Some(structure), Some(objects)) => {
+                (Some(structure), [objects.epoch, objects.buffer.size()])
+            }
+            _ => (objects, [0, 0]),
+        };
         let signature = signature(
             &[
                 owners,
@@ -449,10 +466,12 @@ impl SceneDerivation for VirtualGeometryInstances {
                 overrides,
                 section_handles,
                 vg_assets,
-                objects,
+                objects_input,
                 asset_ready,
             ],
             &[
+                objects_layout[0],
+                objects_layout[1],
                 u64::from(enabled),
                 self.candidates.epoch,
                 self.instances.epoch,

@@ -182,6 +182,15 @@ pub struct LODLevel {
     pub mesh_asset: MeshAssetPath,
 }
 
+impl helio_component::components::reflected_list::ReflectedListItem for LODLevel {
+    const CLASS_NAME: &'static str = "LODLevel";
+    const NOUN: &'static str = "level";
+
+    fn title(&self, index: usize) -> String {
+        format!("LOD {index} (from {} m)", self.distance_threshold)
+    }
+}
+
 fn serialize_lod_level_json(value: &LODLevel) -> ReflectResult<serde_json::Value> {
     serde_json::to_value(value).map_err(|e| ReflectError::SerializationFailed(e.to_string()))
 }
