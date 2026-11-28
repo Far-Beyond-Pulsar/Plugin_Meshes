@@ -52,7 +52,7 @@ use helio_core::{
 };
 use helio_pass_vg_bvh::{keys as bvh_keys, VgBvhPass};
 use helio_pass_vg_cull::{
-    VgCullConfig, VgCullDynamic, VgCullEarlyPass, VgCullInputs, KEY_CULL, KEY_INPUTS,
+    VgCullConfig, VgCullDemand, VgCullDynamic, VgCullEarlyPass, VgCullInputs, KEY_CULL, KEY_INPUTS,
 };
 use helio_pass_vg_dense::VgDensePass;
 use helio_pass_vg_raster::{
@@ -138,6 +138,7 @@ struct InputsSnapshot {
     dense_mask: Option<wgpu::Buffer>,
     materials: Option<wgpu::Buffer>,
     instance_count: u32,
+    demand: VgCullDemand,
     dense_tiles: [u32; 2],
 }
 
@@ -233,11 +234,12 @@ impl RenderPass for VgInputsPass {
             }
             None => None,
         };
-        let Some(stream) = self.runtime.with_store(|store| {
+        let Some((stream, largest)) = self.runtime.with_store(|store| {
             let b = store.stream_buffers();
-            StreamSnapshot {
+            let stream = StreamSnapshot {
                 stream: b.as_array().map(|buffer| buffer.clone()),
-            }
+            };
+            (stream, store.largest_asset())
         }) else {
             return Ok(());
         };
@@ -261,10 +263,13 @@ impl RenderPass for VgInputsPass {
                 instances.size() / 16
             );
         }
+        let instance_count = (instances.size()
+            / std::mem::size_of::<helio_vg_format::GpuVgInstance>() as u64)
+            as u32;
         self.snapshot = Some(InputsSnapshot {
-            instance_count: (instances.size()
-                / std::mem::size_of::<helio_vg_format::GpuVgInstance>() as u64)
-                as u32,
+            instance_count,
+            // Every row: how many are live is known only to the GPU.
+            demand: VgCullDemand::for_instances(instance_count, largest),
             instances: instances.clone(),
             objects: objects.clone(),
             remaps: remaps.cloned(),
@@ -304,6 +309,7 @@ impl RenderPass for VgInputsPass {
                 dense_mask: s.dense_mask.as_ref(),
                 materials: s.materials.as_ref(),
                 instance_count: s.instance_count,
+                demand: s.demand,
                 dense_tiles: s.dense_tiles,
                 remaps: s.remaps.as_ref(),
             })

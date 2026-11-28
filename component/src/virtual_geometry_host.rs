@@ -80,22 +80,23 @@ use std::sync::{Arc, Weak};
 
 use helio_core::{SceneDerivation, SceneDerivationContext, SceneDerivationOutput};
 use helio_mesh_api::PackedVertex;
-use helio_vg_format::{FORMAT_VERSION, VgAssetReadyRow};
+use helio_vg_format::{VgAssetReadyRow, FORMAT_VERSION};
 use helio_vg_stream::{
-    ProxyOptions, VgAssetReport, VgRuntime, VgRuntimeSettings, VgeoBytes, VgeoSource,
-    content_words,
+    content_words, ProxyOptions, VgAssetReport, VgRuntime, VgRuntimeSettings, VgeoBytes, VgeoSource,
 };
 use pulsar_scenedb::gpu::GpuMirrorHandle;
 use pulsar_scenedb::handle_ledger::HandleId;
-use pulsar_scenedb::{ChangeCursor, ChangeRead, ComponentChange, ComponentChangeKind, Entity, World};
+use pulsar_scenedb::{
+    ChangeCursor, ChangeRead, ComponentChange, ComponentChangeKind, Entity, World,
+};
 
 use crate::components::{
     FullGeometry, LoadedMesh, MeshAssetPath, MeshGeometry, MeshGeometryKey, StaticMeshComponent,
 };
 use crate::mesh_cache::MeshSection;
 use crate::virtual_geometry_instances::{
-    Output, VG_ASSET_READY_KEY, VG_ASSET_READY_ROW_BYTES, VgInstanceControl, VgInstanceKeys,
-    VirtualGeometryInstances,
+    Output, VgInstanceControl, VgInstanceKeys, VirtualGeometryInstances, VG_ASSET_READY_KEY,
+    VG_ASSET_READY_ROW_BYTES,
 };
 
 enum HostAsset {
@@ -741,7 +742,11 @@ fn fallback_key(content: u128, error: f32) -> u128 {
     let low = mix(content as u64 ^ tag);
     let high = mix((content >> 64) as u64 ^ tag.rotate_left(17));
     let key = (u128::from(high) << 64) | u128::from(low);
-    if key == 0 || key == content { key ^ 1 } else { key }
+    if key == 0 || key == content {
+        key ^ 1
+    } else {
+        key
+    }
 }
 
 /// The fallback geometry of `lod` (a [`ProxyOptions::fallback`] cut) for a
@@ -775,7 +780,7 @@ fn fallback_geometry(
                 attr.tangent,
                 attr.bitangent_sign,
             );
-            vertex.tex_coords1 = attr.uv1;
+            vertex.set_lightmap_uv(attr.uv1);
             vertex
         })
         .collect();
@@ -816,11 +821,11 @@ fn spawn_cut(
     let asset = mesh.mesh_asset.clone();
     let sections = mesh.source_sections().to_vec();
     helio_tasks::submit(
-        helio_tasks::JobSpec::new(format!("Cut virtual geometry fallback: {name}"))
-            .owner("meshes"),
+        helio_tasks::JobSpec::new(format!("Cut virtual geometry fallback: {name}")).owner("meshes"),
         move |task| {
             task.set_phase("Reading the mesh's settings");
-            let (lo, hi) = crate::vg_settings::VirtualGeometrySettings::FALLBACK_RELATIVE_ERROR_RANGE;
+            let (lo, hi) =
+                crate::vg_settings::VirtualGeometrySettings::FALLBACK_RELATIVE_ERROR_RANGE;
             let error = crate::components::mesh_asset_settings(&asset)
                 .vg_fallback_error
                 .filter(|e| e.is_finite())
@@ -861,7 +866,6 @@ fn spawn_cut(
     rx
 }
 
-
 /// Where a mesh's `.vgeo` is kept: embedded in its native `.mesh`, or as
 /// derived data in the project cache (module doc).
 enum Store {
@@ -895,9 +899,10 @@ fn display_name(mesh: &MeshAssetPath, content: u128) -> String {
     if mesh.generated_content_id().is_some() || mesh.as_str().trim().is_empty() {
         return format!("generated mesh {:08x}", (content >> 96) as u32);
     }
-    Path::new(mesh.as_str())
-        .file_name()
-        .map_or_else(|| mesh.as_str().to_owned(), |n| n.to_string_lossy().into_owned())
+    Path::new(mesh.as_str()).file_name().map_or_else(
+        || mesh.as_str().to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    )
 }
 
 /// The `.vgeo` attribute records of `vertices` (`helio_vg_format::attr_record`).
@@ -908,9 +913,9 @@ fn attribute_bytes(vertices: &[PackedVertex]) -> Vec<u8> {
             helio_vg_format::attr_record(
                 v.normal,
                 v.tangent,
-                v.bitangent_sign,
+                v.bitangent_sign(),
                 v.tex_coords0,
-                v.tex_coords1,
+                v.lightmap_uv(),
             )
         })
         .collect()
@@ -1016,8 +1021,9 @@ fn build_or_load(
     let saved = match store {
         // Keeps the classic geometry and material payload, replaces the file
         // atomically.
-        Store::Embedded(path) => crate::mesh_cache::write_embedded_vgeo(path, content, &bytes)
-            .map(|()| path.as_path()),
+        Store::Embedded(path) => {
+            crate::mesh_cache::write_embedded_vgeo(path, content, &bytes).map(|()| path.as_path())
+        }
         // `write_file` creates the parent folders.
         Store::Cache(path) => engine_fs::virtual_fs::write_file(path, &bytes)
             .map(|()| path.as_path())
@@ -1134,13 +1140,19 @@ mod tests {
         assert!(!elsewhere.vote(&other_world, false));
         assert!(vg.vote(&world, true), "another world's renderer has no say");
         assert!(!classic.vote(&world, false));
-        assert!(!vg.vote(&world, true), "a classic renderer of the world vetoes");
+        assert!(
+            !vg.vote(&world, true),
+            "a classic renderer of the world vetoes"
+        );
         drop(classic);
         assert!(vg.vote(&world, true), "the vote left with its renderer");
         // Drawing another world moves the vote.
         let mut moving = WorldVote::new();
         assert!(!moving.vote(&world, false));
-        assert!(!moving.vote(&other_world, true), "the other world's classic renderer vetoes");
+        assert!(
+            !moving.vote(&other_world, true),
+            "the other world's classic renderer vetoes"
+        );
         assert!(vg.vote(&world, true));
     }
 
@@ -1264,8 +1276,10 @@ mod tests {
         let vertex = geometry.vertices[1];
         assert_eq!(vertex.position, [1.0, 0.0, 0.0]);
         assert_eq!(vertex.tex_coords0, [0.25, 0.5]);
-        assert_eq!(vertex.tex_coords1, [0.75, 1.0]);
-        assert_eq!(vertex.bitangent_sign, -1.0);
+        for (got, want) in vertex.lightmap_uv().into_iter().zip([0.75, 1.0]) {
+            assert!((got - want).abs() <= 1.0 / 65535.0, "{got} {want}");
+        }
+        assert_eq!(vertex.bitangent_sign(), -1.0);
         assert_eq!((vertex.normal >> 8) & 0xff, 127, "normal +y");
     }
 
@@ -1308,7 +1322,10 @@ mod tests {
 
         // Turned off, then a second instance of the same mesh and an
         // unbound one (no geometry yet) are placed.
-        world.get_mut::<StaticMeshComponent>(a).unwrap().virtual_geometry = false;
+        world
+            .get_mut::<StaticMeshComponent>(a)
+            .unwrap()
+            .virtual_geometry = false;
         let b = world.spawn();
         world.insert(b, vg_mesh(7, true));
         let unbound = world.spawn();

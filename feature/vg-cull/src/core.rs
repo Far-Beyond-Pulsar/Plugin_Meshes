@@ -19,6 +19,54 @@ const ROUND_STRIDE: u64 = 256;
 /// Job queues: the early phase's, and the deferred work the late phase starts
 /// from (see the crate docs, "Traversal").
 const QUEUES: u64 = 2;
+/// Entries a bin or queue starts with.
+const INITIAL_CAPACITY: u32 = 1 << 12;
+/// The most a queue grows ahead of a frame. The bound on a frame's jobs is far
+/// above what its live frontier reaches, so a queue grows past this only once
+/// the GPU reports it full.
+pub const QUEUE_DEMAND_CEILING: u32 = 1 << 20;
+/// The most a queue ever grows.
+const MAX_QUEUE_CAPACITY: u32 = 1 << 24;
+
+/// The most one frame of a run can ask of the cull, as far as the CPU knows it
+/// before recording: what the bins and queues grow to ahead of the frame, so
+/// they never overflow below their ceilings. Zero means unknown: the buffers
+/// then grow only after the GPU reports them filling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VgCullDemand {
+    /// Visible clusters, all bins together; any one bin may take all of them.
+    pub clusters: u64,
+    /// Traversal jobs.
+    pub jobs: u64,
+}
+
+impl VgCullDemand {
+    /// The bound for `instances` rows of assets that have at most `largest`.
+    /// A frame emits each cluster of an instance at most once (over both
+    /// phases), and queues each of its nodes, groups and clusters at most once,
+    /// besides the instance itself and its share of the instance BVH.
+    pub fn for_instances(instances: u32, largest: helio_vg_format::GpuAssetHeader) -> Self {
+        let rows = u64::from(instances);
+        let clusters = u64::from(largest.cluster_count);
+        let jobs = clusters + u64::from(largest.node_count) + u64::from(largest.group_count);
+        if clusters == 0 {
+            return Self::default();
+        }
+        Self {
+            clusters: rows.saturating_mul(clusters),
+            jobs: rows.saturating_mul(jobs.saturating_add(3)),
+        }
+    }
+}
+
+/// `capacity` grown to hold `demand` entries, in powers of two, no further than
+/// `ceiling`. Never smaller than it was.
+fn grown_to(capacity: u32, demand: u64, ceiling: u32) -> u32 {
+    let wanted = (demand.min(u64::from(ceiling)) as u32)
+        .next_power_of_two()
+        .min(ceiling);
+    capacity.max(wanted)
+}
 
 /// Tunables. Defaults match the plan (tau 1 px, SW at <= 2 px edges).
 #[derive(Clone, Debug)]
@@ -41,17 +89,17 @@ pub struct VgCullConfig {
     /// correct (workgroups that do not fit on the GPU at once start late and
     /// find the work done); more than fit only adds idle polling.
     pub max_groups: u32,
-    /// Initial entries per bin. The default is the ceiling [`MAX_BIN_CAPACITY`]:
-    /// a bin that overflows drops clusters for that frame, and growing only after
-    /// an asynchronous stats readback means several frames of silently missing
-    /// geometry (which changes with the camera: it reads as flicker) plus a
-    /// rebuild of every cull buffer that resets the visibility history. 8 bins of
-    /// 1M entries cost 64 MiB, so the ceiling is allocated up front. Tests lower it
-    /// to exercise the growth path.
+    /// Entries per bin before anything is drawn (8 bytes each). The bins grow
+    /// ahead of each frame to what it can emit ([`VgCullDemand`]), up to
+    /// [`Self::max_bin_capacity`], so a run with little or nothing to draw
+    /// stays this small. A bin that overflows drops clusters for that frame,
+    /// which is why growth goes by that bound and not by what the GPU reports
+    /// afterwards: a read-back arrives frames late and reads as flicker.
     pub initial_bin_capacity: u32,
-    /// Initial entries per job queue (3 queues, 8 bytes per entry). Jobs past a
-    /// queue are lost work, so this also starts large (24 MiB); it still grows
-    /// like the bins if a frame ever fills it.
+    /// Entries per job queue ([`QUEUES`] queues, 8 bytes each) before anything
+    /// is drawn. Jobs past a queue are lost work, so the queues grow ahead of
+    /// the frame like the bins, up to [`QUEUE_DEMAND_CEILING`]; past that, only
+    /// a queue the GPU reports full grows further.
     pub initial_queue_capacity: u32,
     /// Bits of the visible-last-frame hash set (power of two).
     pub history_bits: u32,
@@ -88,8 +136,8 @@ impl Default for VgCullConfig {
             mode: VgMode::Auto,
             two_phase_occlusion: true,
             max_groups: 256,
-            initial_bin_capacity: MAX_BIN_CAPACITY,
-            initial_queue_capacity: 1 << 20,
+            initial_bin_capacity: INITIAL_CAPACITY,
+            initial_queue_capacity: INITIAL_CAPACITY,
             history_bits: 1 << 22,
             stats: true,
             max_bin_capacity: MAX_BIN_CAPACITY,
@@ -126,6 +174,8 @@ pub struct VgCullInputs<'a> {
     pub instance_count: u32,
     /// Dense-mask grid `[tiles_x, tiles_y]`.
     pub dense_tiles: [u32; 2],
+    /// The most this frame can ask of the bins and queues.
+    pub demand: VgCullDemand,
     /// Per `instances` row, the surface remap its pixels carry
     /// (`helio_vg_format::VgInstanceSource::Registry::remaps`): a run drawn
     /// through another space. The raster clips to it and the shading tags
@@ -148,8 +198,9 @@ pub struct VgCullFrame {
     pub height: u32,
 }
 
-/// Buffers sized for the current capacities. Replaced (new `Arc`) when they
-/// grow; pass wrappers re-read it each frame.
+/// Buffers sized for the current capacities. Replaced (new `Arc`) when one of
+/// them grows; pass wrappers and the passes after them re-read it each frame
+/// and keep no bind group across frames.
 pub struct VgCullBuffers {
     pub visible: wgpu::Buffer,
     /// Every word the cull writes with atomics: the counters, ranges and args
@@ -189,31 +240,66 @@ impl VgCullBuffers {
         history_words: u32,
         tiles: [u32; 2],
     ) -> Self {
-        let storage = wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_SRC
-            | wgpu::BufferUsages::COPY_DST;
-        let mk = |label: &str, bytes: u64, usage| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: bytes.max(16),
-                usage,
-                mapped_at_creation: false,
-            })
-        };
         let (state, history_ro) = Self::history_buffers(device, history_words, tiles);
         Self {
-            visible: mk(
-                "VgCull Visible",
-                crate::BIN_COUNT as u64 * bin_capacity as u64 * 8,
-                storage,
-            ),
+            visible: Self::visible_buffer(device, bin_capacity),
             state,
-            queues: mk("VgCull Queues", QUEUES * queue_capacity as u64 * 8, storage),
+            queues: Self::queue_buffer(device, queue_capacity),
             history_ro,
             bin_capacity,
             queue_capacity,
             history_words,
             tiles,
+        }
+    }
+
+    fn visible_buffer(device: &wgpu::Device, bin_capacity: u32) -> wgpu::Buffer {
+        let bytes = u64::from(crate::BIN_COUNT) * u64::from(bin_capacity) * 8;
+        Self::entry_buffer(device, "VgCull Visible", bytes)
+    }
+
+    fn queue_buffer(device: &wgpu::Device, queue_capacity: u32) -> wgpu::Buffer {
+        let bytes = QUEUES * u64::from(queue_capacity) * 8;
+        Self::entry_buffer(device, "VgCull Queues", bytes)
+    }
+
+    fn entry_buffer(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes.max(16),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// These buffers with other bin and queue capacities: only the one that
+    /// changed is replaced. Both hold one frame's entries, so nothing is
+    /// copied, and the visibility history is kept.
+    fn with_capacities(
+        &self,
+        device: &wgpu::Device,
+        bin_capacity: u32,
+        queue_capacity: u32,
+    ) -> Self {
+        Self {
+            visible: if bin_capacity == self.bin_capacity {
+                self.visible.clone()
+            } else {
+                Self::visible_buffer(device, bin_capacity)
+            },
+            state: self.state.clone(),
+            queues: if queue_capacity == self.queue_capacity {
+                self.queues.clone()
+            } else {
+                Self::queue_buffer(device, queue_capacity)
+            },
+            history_ro: self.history_ro.clone(),
+            bin_capacity,
+            queue_capacity,
+            history_words: self.history_words,
+            tiles: self.tiles,
         }
     }
 
@@ -782,8 +868,11 @@ impl VgCullCore {
     ) {
         self.poll_readback();
         let b = &self.buffers;
-        let mut bin_cap = b.bin_capacity;
-        let mut queue_cap = b.queue_capacity;
+        let bin_ceiling = self.config.max_bin_capacity.clamp(16, MAX_BIN_CAPACITY);
+        // Ahead of this frame, to the most it can emit.
+        let mut bin_cap = grown_to(b.bin_capacity, inputs.demand.clusters, bin_ceiling);
+        let mut queue_cap = grown_to(b.queue_capacity, inputs.demand.jobs, QUEUE_DEMAND_CEILING);
+        // And after an earlier one, by what the GPU saw.
         if let Some(words) = self.pending_capacity_stats.take() {
             let st = |i: u32| words[(state::STATS + i) as usize];
             let max_bin = (0..crate::BIN_COUNT)
@@ -791,12 +880,11 @@ impl VgCullCore {
                 .max()
                 .unwrap_or(0);
             if st(stats::VISIBLE_OVERFLOW) > 0 || max_bin > bin_cap / 4 * 3 {
-                bin_cap = (max_bin.max(bin_cap) * 2)
-                    .next_power_of_two()
-                    .min(self.config.max_bin_capacity.clamp(16, MAX_BIN_CAPACITY));
+                let seen = (max_bin.max(b.bin_capacity) * 2).next_power_of_two();
+                bin_cap = bin_cap.max(seen.min(bin_ceiling));
             }
-            if st(stats::JOB_OVERFLOW) > 0 || st(stats::PEAK_QUEUE) > queue_cap / 4 * 3 {
-                queue_cap = (queue_cap * 2).min(1 << 24);
+            if st(stats::JOB_OVERFLOW) > 0 || st(stats::PEAK_QUEUE) > b.queue_capacity / 4 * 3 {
+                queue_cap = queue_cap.max((b.queue_capacity * 2).min(MAX_QUEUE_CAPACITY));
             }
             if std::env::var_os("VG_DEBUG").is_some() {
                 eprintln!(
@@ -818,13 +906,7 @@ impl VgCullCore {
             self.last_stats = Some(words);
         }
         if bin_cap != b.bin_capacity || queue_cap != b.queue_capacity {
-            self.buffers = Arc::new(VgCullBuffers::new(
-                device,
-                bin_cap,
-                queue_cap,
-                b.history_words,
-                b.tiles,
-            ));
+            self.buffers = Arc::new(b.with_capacities(device, bin_cap, queue_cap));
             self.bind_cache = [None, None];
         }
         let tiles = [

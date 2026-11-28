@@ -106,7 +106,6 @@ override HELIO_VIEW_CLIP: bool = false;
 
 struct Vertex {
     @location(0) position:       vec3<f32>,
-    @location(1) bitangent_sign: f32,
     @location(2) tex_coords:     vec2<f32>,  // UV0 — material/albedo channel (may tile)
     @location(3) normal:         u32,
     @location(4) tangent:        u32,
@@ -227,7 +226,7 @@ fn mesh_vertex(
     out.world_position     = world_pos.xyz;
     out.world_normal       = normalize(normal_mat  * local_normal);
     out.world_tangent      = normalize(model_mat3  * local_tangent);
-    out.bitangent_sign     = v.bitangent_sign;
+    out.bitangent_sign     = unpack4x8snorm(v.tangent).w;
     out.tex_coords         = v.tex_coords;
     out.material_id        = inst.material_id;
     out.prev_clip_position = prev_clip;

@@ -72,7 +72,7 @@ pub fn convert_vertex(v: &Vertex, flip_uv_y: bool) -> PackedVertex {
 
     let mut packed =
         PackedVertex::from_components(position, normal, tex_coords, tangent, bitangent_sign);
-    packed.tex_coords1 = tex_coords1;
+    packed.set_lightmap_uv(tex_coords1);
     packed
 }
 
@@ -261,6 +261,6 @@ mod tests {
         let packed = convert_vertex(&v, false);
         assert_eq!(packed.position, [1.0, 2.0, 3.0]);
         assert_eq!(packed.tex_coords0, [0.0, 0.0]);
-        assert_eq!(packed.tex_coords1, [0.0, 0.0]);
+        assert_eq!(packed.lightmap_uv(), [0.0, 0.0]);
     }
 }

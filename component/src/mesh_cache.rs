@@ -43,7 +43,7 @@ use std::sync::{Mutex, OnceLock};
 pub use asset_import::options::{FieldConstraints, ImportField, OptionsSchema};
 use bytemuck::Zeroable;
 use helio_mesh_api::{MeshUpload, PackedVertex};
-use pulsar_reflection::{RUNTIME_TYPE_REGISTRY, RuntimeTypeInfo, TypeStructure};
+use pulsar_reflection::{RuntimeTypeInfo, TypeStructure, RUNTIME_TYPE_REGISTRY};
 
 const MAGIC: &[u8; 4] = b"PMSH";
 /// Current WRITE version — every fresh `encode` call produces this.
@@ -527,12 +527,70 @@ pub fn prime_content_id_cache(abs_path: &Path, id: u128) {
 /// always produce the same id; this crate never claims anything stronger
 /// (e.g. semantic equivalence of differently-tessellated meshes).
 pub fn content_id_for_bytes(mesh: &MeshUpload) -> u128 {
-    let mut buf = Vec::with_capacity(
-        mesh.vertices.len() * std::mem::size_of::<PackedVertex>() + mesh.indices.len() * 4,
-    );
-    buf.extend_from_slice(bytemuck::cast_slice(&mesh.vertices));
+    let mut buf =
+        Vec::with_capacity(mesh.vertices.len() * DISK_VERTEX_BYTES + mesh.indices.len() * 4);
+    buf.extend_from_slice(&disk_vertex_bytes(&mesh.vertices));
     buf.extend_from_slice(bytemuck::cast_slice(&mesh.indices));
     twox_hash::XxHash3_128::oneshot(&buf)
+}
+
+/// A vertex as every `.mesh` version stores it. A native asset may be a
+/// mesh's only copy, so the file keeps this layout whatever the GPU's
+/// [`PackedVertex`] becomes, and content ids are hashes of these bytes.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DiskVertex {
+    position: [f32; 3],
+    bitangent_sign: f32,
+    tex_coords0: [f32; 2],
+    tex_coords1: [f32; 2],
+    /// snorm8x4, w zero.
+    normal: u32,
+    /// snorm8x4, w zero.
+    tangent: u32,
+}
+
+const DISK_VERTEX_BYTES: usize = std::mem::size_of::<DiskVertex>();
+
+impl From<&PackedVertex> for DiskVertex {
+    fn from(v: &PackedVertex) -> Self {
+        Self {
+            position: v.position,
+            bitangent_sign: v.bitangent_sign(),
+            tex_coords0: v.tex_coords0,
+            tex_coords1: v.lightmap_uv(),
+            normal: v.normal,
+            tangent: v.tangent & 0x00ff_ffff,
+        }
+    }
+}
+
+impl From<DiskVertex> for PackedVertex {
+    fn from(v: DiskVertex) -> Self {
+        let mut packed = Self {
+            position: v.position,
+            tex_coords0: v.tex_coords0,
+            tex_coords1: [0, 0],
+            normal: v.normal,
+            tangent: v.tangent,
+        };
+        packed.set_lightmap_uv(v.tex_coords1);
+        packed.set_bitangent_sign(v.bitangent_sign);
+        packed
+    }
+}
+
+fn disk_vertex_bytes(vertices: &[PackedVertex]) -> Vec<u8> {
+    let disk: Vec<DiskVertex> = vertices.iter().map(DiskVertex::from).collect();
+    bytemuck::cast_slice(&disk).to_vec()
+}
+
+/// `bytes` holds whole [`DiskVertex`]es, at any alignment.
+fn read_disk_vertices(bytes: &[u8]) -> Vec<PackedVertex> {
+    bytes
+        .chunks_exact(DISK_VERTEX_BYTES)
+        .map(|chunk| PackedVertex::from(bytemuck::pod_read_unaligned::<DiskVertex>(chunk)))
+        .collect()
 }
 
 fn write_bounds(out: &mut Vec<u8>, bounds: MeshLocalBounds) {
@@ -568,16 +626,14 @@ fn read_bounds(bytes: &[u8]) -> Option<MeshLocalBounds> {
 /// should compute it via [`content_id_for_bytes`] first.
 pub fn encode(mesh: &MeshUpload, content_id: u128) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        HEADER_V2
-            + mesh.vertices.len() * std::mem::size_of::<PackedVertex>()
-            + mesh.indices.len() * 4,
+        HEADER_V2 + mesh.vertices.len() * DISK_VERTEX_BYTES + mesh.indices.len() * 4,
     );
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&(mesh.vertices.len() as u64).to_le_bytes());
     out.extend_from_slice(&(mesh.indices.len() as u64).to_le_bytes());
     out.extend_from_slice(&content_id.to_le_bytes());
-    out.extend_from_slice(bytemuck::cast_slice(&mesh.vertices));
+    out.extend_from_slice(&disk_vertex_bytes(&mesh.vertices));
     out.extend_from_slice(bytemuck::cast_slice(&mesh.indices));
     out
 }
@@ -600,7 +656,7 @@ pub fn encode_asset(asset: &MeshAssetUpload, content_id: u128) -> Vec<u8> {
     };
     let mut out = Vec::with_capacity(
         HEADER_V5
-            + mesh.vertices.len() * std::mem::size_of::<PackedVertex>()
+            + mesh.vertices.len() * DISK_VERTEX_BYTES
             + mesh.indices.len() * 4
             + metadata.len(),
     );
@@ -612,7 +668,7 @@ pub fn encode_asset(asset: &MeshAssetUpload, content_id: u128) -> Vec<u8> {
     out.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes()); // optional vgeo length, populated by vgeo writer
     write_bounds(&mut out, bounds);
-    out.extend_from_slice(bytemuck::cast_slice(&mesh.vertices));
+    out.extend_from_slice(&disk_vertex_bytes(&mesh.vertices));
     out.extend_from_slice(bytemuck::cast_slice(&mesh.indices));
     out.extend_from_slice(&metadata);
     out
@@ -667,7 +723,7 @@ pub fn embedded_vgeo(bytes: &[u8]) -> Option<&[u8]> {
         }
     }
     let geometry_end = vstart
-        .checked_add(vcount.checked_mul(std::mem::size_of::<PackedVertex>())?)?
+        .checked_add(vcount.checked_mul(DISK_VERTEX_BYTES)?)?
         .checked_add(icount.checked_mul(4)?)?;
     let metadata_end = geometry_end.checked_add(metadata_len)?;
     let end = metadata_end.checked_add(vgeo_len)?;
@@ -732,7 +788,7 @@ pub fn decode_asset(bytes: &[u8]) -> Option<(MeshAssetUpload, u128)> {
     }
     let vcount = usize::try_from(u64::from_le_bytes(bytes[8..16].try_into().ok()?)).ok()?;
     let icount = usize::try_from(u64::from_le_bytes(bytes[16..24].try_into().ok()?)).ok()?;
-    let vbytes = vcount.checked_mul(std::mem::size_of::<PackedVertex>())?;
+    let vbytes = vcount.checked_mul(DISK_VERTEX_BYTES)?;
     let ibytes = icount.checked_mul(4)?;
     let (vstart, stored_id, metadata_len) = match version {
         1 => (HEADER, None, 0usize),
@@ -796,17 +852,17 @@ pub fn decode_asset(bytes: &[u8]) -> Option<(MeshAssetUpload, u128)> {
         return None;
     }
 
-    // Copy into properly-aligned Vecs — the source byte slice alignment is not
-    // guaranteed to match `PackedVertex`, so casting it directly could panic.
-    let mut vertices = vec![PackedVertex::zeroed(); vcount];
-    bytemuck::cast_slice_mut(&mut vertices).copy_from_slice(&bytes[vstart..istart]);
+    // Read into properly-aligned Vecs: the source byte slice may be at any
+    // alignment.
+    let vertices = read_disk_vertices(&bytes[vstart..istart]);
     let mut indices = vec![0u32; icount];
     bytemuck::cast_slice_mut(&mut indices).copy_from_slice(&bytes[istart..geometry_end]);
 
     let geometry = MeshUpload { vertices, indices };
     let id = match stored_id {
         Some(id) => id,
-        None => content_id_for_bytes(&geometry),
+        // The file's own bytes: what `content_id_for_bytes` hashed.
+        None => twox_hash::XxHash3_128::oneshot(&bytes[vstart..geometry_end]),
     };
     let metadata_end = geometry_end.checked_add(metadata_len)?;
     let (sections, material_slots, settings) = if version == VERSION_WITH_SECTIONS
@@ -892,7 +948,7 @@ fn read_asset_settings_inner(path: &Path) -> Option<MeshAssetSettings> {
     let icount = u64::from_le_bytes(header[16..24].try_into().ok()?);
     let metadata_len = u64::from_le_bytes(header[HEADER_V2..HEADER_V3].try_into().ok()?);
     let geometry_end = (vstart as u64)
-        .checked_add(vcount.checked_mul(std::mem::size_of::<PackedVertex>() as u64)?)?
+        .checked_add(vcount.checked_mul(DISK_VERTEX_BYTES as u64)?)?
         .checked_add(icount.checked_mul(4)?)?;
     // Metadata is a few KB of JSON; anything far larger is a corrupt header.
     if metadata_len > 64 << 20 {
@@ -1360,7 +1416,7 @@ mod tests {
         v1.extend_from_slice(&1u32.to_le_bytes());
         v1.extend_from_slice(&(mesh.vertices.len() as u64).to_le_bytes());
         v1.extend_from_slice(&(mesh.indices.len() as u64).to_le_bytes());
-        v1.extend_from_slice(bytemuck::cast_slice(&mesh.vertices));
+        v1.extend_from_slice(&disk_vertex_bytes(&mesh.vertices));
         v1.extend_from_slice(bytemuck::cast_slice(&mesh.indices));
 
         let (decoded, id) = decode(&v1).expect("v1 must still decode");
@@ -1498,7 +1554,10 @@ mod tests {
         };
         let revision = asset_settings_revision();
         set_asset_settings(&path, on).unwrap();
-        assert!(asset_settings_revision() > revision, "readers of the settings see the change");
+        assert!(
+            asset_settings_revision() > revision,
+            "readers of the settings see the change"
+        );
         let bytes = std::fs::read(&path).unwrap();
         let (decoded, id) = decode_asset(&bytes).unwrap();
         assert_eq!((decoded.settings, id), (on, 9));

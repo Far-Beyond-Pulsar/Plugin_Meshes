@@ -1052,6 +1052,6 @@ mod tests {
             size("SkinVertex"),
             std::mem::size_of::<helio_mesh_api::SkinVertex>()
         );
-        assert_eq!(std::mem::size_of::<helio_mesh_api::PackedVertex>(), 40);
+        assert_eq!(helio_mesh_api::PackedVertex::STRIDE, 32);
     }
 }

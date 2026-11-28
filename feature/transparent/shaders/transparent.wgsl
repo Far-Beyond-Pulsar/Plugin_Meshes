@@ -74,7 +74,6 @@ struct Transform {
 
 struct Vertex {
     @location(0) position:       vec3<f32>,
-    @location(1) bitangent_sign: f32,
     @location(2) tex_coords:     vec2<f32>,
     @location(3) normal:         u32,
     @location(4) tangent:        u32,
@@ -117,7 +116,7 @@ fn vs_main(vertex: Vertex, @location(15) slot: u32, @builtin(vertex_index) verte
     out.world_normal   = normalize(normal_mat * local_normal);
     out.world_tangent  = normalize(normal_mat * local_tangent);
     out.tex_coords     = vertex.tex_coords;
-    out.bitangent_sign = vertex.bitangent_sign;
+    out.bitangent_sign = unpack4x8snorm(vertex.tangent).w;
     out.material_id    = inst.material_id;
     return out;
 }

@@ -198,7 +198,8 @@ mod core;
 mod pass;
 
 pub use crate::core::{
-    VgCullBuffers, VgCullConfig, VgCullCore, VgCullFrame, VgCullInputs, VgCullTree,
+    VgCullBuffers, VgCullConfig, VgCullCore, VgCullDemand, VgCullFrame, VgCullInputs, VgCullTree,
+    QUEUE_DEMAND_CEILING,
 };
 pub use crate::pass::{
     VgCullDynamic, VgCullEarlyPass, VgCullFrameData, VgCullLatePass, VgCullSettingsSource,

@@ -148,18 +148,13 @@ fn leaf_opacity_casts_identical_cutout_shadows_from_both_sides() {
                 compilation_options: Default::default(),
                 buffers: &[
                     Some(wgpu::VertexBufferLayout {
-                        array_stride: 40,
+                        array_stride: helio_mesh_api::PackedVertex::STRIDE,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &[
+                            helio_mesh_api::PackedVertex::POSITION,
                             wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x3,
-                                offset: 0,
-                                shader_location: 0,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x2,
-                                offset: 16,
                                 shader_location: 1,
+                                ..helio_mesh_api::PackedVertex::UV0
                             },
                         ],
                     }),

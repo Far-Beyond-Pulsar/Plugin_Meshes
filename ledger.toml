@@ -287,22 +287,22 @@ status = "verified"
 [[buffer]]
 key = "skeletal_bone_palette"
 producers = ["SkeletalMeshComponent"]
-consumers = ["helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-shadow", "helio-pass-transparent"]
-owner = "helio_component (SkeletalMeshComponent)"
-disposition = "keep: each instance's current and previous joint matrices, in the mesh's own space; passes skin the vertex before the instance's model matrix, so a moved camera origin needs nothing here"
+consumers = ["meshes_component"]
+owner = "meshes_component::components::skeletal_mesh_component (written); meshes_component::skin_cache (read)"
+disposition = "keep: each instance's current and previous joint matrices, in the mesh's own space; only the skin cache reads them, and every drawer and the ray-traced scene draw its posed vertices"
 target_contract = "SceneDB#84; 03-gpu-reflection-and-rendering.md"
-test = "none: no test covers SkeletalMeshComponent yet; the rigged import is covered by plugins/vendor/meshes/tests/import_rigged_import.rs"
-status = "unverified"
+test = "plugins/vendor/meshes/component/tests/skin_cache.rs (the_skin_cache_poses_settles_and_skips_unchanged_poses)"
+status = "verified"
 
 [[buffer]]
 key = "skeletal_skin_vertices"
 producers = ["SkeletalMeshComponent"]
-consumers = ["helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-shadow", "helio-pass-transparent"]
-owner = "helio_component (SkeletalMeshComponent)"
-disposition = "keep: four joint indices and weights per vertex, parallel to builtin_mesh_vertex so static geometry keeps its vertex layout"
+consumers = ["meshes_component"]
+owner = "meshes_component::components::skeletal_mesh_component (written); meshes_component::skin_cache (read)"
+disposition = "keep: four joint indices and weights per vertex, parallel to builtin_mesh_vertex so static geometry keeps its vertex layout; only the skin cache reads them"
 target_contract = "SceneDB#84; 03-gpu-reflection-and-rendering.md"
-test = "none: no test covers SkeletalMeshComponent yet; the rigged import is covered by plugins/vendor/meshes/tests/import_rigged_import.rs"
-status = "unverified"
+test = "plugins/vendor/meshes/component/tests/skin_cache.rs (the_skin_cache_poses_settles_and_skips_unchanged_poses)"
+status = "verified"
 
 [[buffer]]
 key = "builtin_mesh_index"
@@ -407,7 +407,7 @@ status = "unverified"
 [[buffer]]
 key = "scene_objects_structure"
 producers = []
-consumers = ["helio-pass-object-batch", "helio-pass-vg-bvh"]
+consumers = ["helio-pass-object-batch", "helio-pass-vg-bvh", "meshes_component"]
 owner = "helio-pass-object-batch"
 disposition = "keep: the kind's own, moved with it into its plugin (plugin-migration.md Phases B and C)"
 target_contract = "Phase C; plugin-migration.md"
@@ -419,7 +419,7 @@ status = "unverified"
 [[pass]]
 crate = "helio-pass-forward-lit"
 in_default_graph = false
-reads = ["builtin_mesh_index", "builtin_mesh_vertex", "materials", "scene_lights", "skeletal_bone_palette", "skeletal_skin_vertices"]
+reads = ["builtin_mesh_index", "builtin_mesh_vertex", "materials", "scene_lights", "skin_cache", "skin_cache_rows"]
 owner = "helio-presets (mapping); helio-pass-forward-lit (algorithm)"
 disposition = "not in the engine's graph: part of Helio's forward graph, not the engine's deferred graph"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -429,11 +429,11 @@ status = "out-of-scope"
 [[pass]]
 crate = "helio-pass-gbuffer"
 in_default_graph = false
-reads = ["builtin_mesh_index", "builtin_mesh_vertex", "materials", "scene_lights", "skeletal_bone_palette", "skeletal_skin_vertices"]
+reads = ["builtin_mesh_index", "builtin_mesh_vertex", "materials", "object_selected", "scene_lights", "skin_cache", "skin_cache_rows", "static_object_owners"]
 owner = "helio-presets (mapping); helio-pass-gbuffer (algorithm)"
-disposition = "keep: draws the joined mesh rows and the authored mesh pools (Phase 2)"
+disposition = "keep: draws the joined mesh rows and the authored mesh pools (Phase 2); skinned instances are drawn from the skin cache. Its selection drawers draw the selected instances into the editor's selection mask, reading object_selected and static_object_owners"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
-test = "plugins/installed/tests/render_acceptance.rs (meshes_and_lights_reach_the_frame_from_every_producer); plugins/installed/tests/render_acceptance.rs (every_pass_of_the_editor_graph_runs)"
+test = "plugins/installed/tests/render_acceptance.rs (meshes_and_lights_reach_the_frame_from_every_producer); plugins/installed/tests/render_acceptance.rs (every_pass_of_the_editor_graph_runs); plugins/installed/tests/render_acceptance.rs (a_selected_mesh_is_outlined_in_the_editor_and_the_outline_leaves_with_the_selection)"
 status = "verified"
 
 [[pass]]
@@ -449,7 +449,7 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-object-batch"
 in_default_graph = false
-reads = ["classic_suppressed", "materials", "scene_objects_moved", "scene_objects_structure", "static_objects"]
+reads = ["classic_suppressed", "materials", "scene_objects_moved", "scene_objects_structure", "static_object_owners", "static_objects"]
 owner = "helio-presets (mapping); helio-pass-object-batch (algorithm)"
 disposition = "keep: reads the scene join's draw and material rows (static_objects, materials), built on the GPU from authored StaticMeshComponent pools (Phase 2)"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -479,7 +479,7 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-shadow"
 in_default_graph = false
-reads = ["builtin_mesh_index", "builtin_mesh_vertex", "materials", "skeletal_bone_palette", "skeletal_skin_vertices"]
+reads = ["builtin_mesh_index", "builtin_mesh_vertex", "materials", "skin_cache", "skin_cache_rows"]
 owner = "helio-presets (mapping); helio-pass-shadow (algorithm)"
 disposition = "keep: draws the authored mesh pools into shadow maps for the joined lights"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -489,9 +489,9 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-shadow-dirty"
 in_default_graph = false
-reads = []
+reads = ["skin_cache_rows"]
 owner = "helio-pass-shadow-dirty"
-disposition = "keep: engine-internal (no authored scene input of its own); runs in the editor graph"
+disposition = "keep: marks which shadow casters changed; reads the skin cache's instance table (skin_cache_rows) and no authored scene row; runs in the editor graph"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
 test = "plugins/installed/tests/render_acceptance.rs (every_pass_of_the_editor_graph_runs)"
 status = "verified"
@@ -499,7 +499,7 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-transparent"
 in_default_graph = false
-reads = ["builtin_mesh_index", "builtin_mesh_vertex", "materials", "scene_lights", "skeletal_bone_palette", "skeletal_skin_vertices"]
+reads = ["builtin_mesh_index", "builtin_mesh_vertex", "materials", "scene_lights", "skin_cache", "skin_cache_rows"]
 owner = "helio-presets (mapping); helio-pass-transparent (algorithm)"
 disposition = "keep: reads the authored mesh pools, materials and joined lights, all verified upstream; the pass runs in the editor graph"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -559,7 +559,7 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-vg"
 in_default_graph = false
-reads = ["materials", "static_objects"]
+reads = ["materials", "static_objects", "vg_instances"]
 owner = "helio-pass-vg"
 disposition = "keep: the kind's own, moved with it into its plugin (plugin-migration.md Phases B and C)"
 target_contract = "Phase C; plugin-migration.md"
@@ -631,7 +631,7 @@ status = "unverified"
 [[site]]
 pattern = "change-cursor"
 file = "plugins/vendor/meshes/host/src/ray_tracing.rs"
-count = 8
+count = 9
 owner = "plugins/vendor/meshes/host/src/ray_tracing.rs"
 disposition = "keep: the kind's own, moved with it into its plugin (plugin-migration.md Phases B and C)"
 target_contract = "Phase C; plugin-migration.md"
@@ -703,31 +703,75 @@ test = "plugins/vendor/meshes/snapshot (thumbnails); plugins/vendor/meshes/edito
 status = "verified"
 
 [[buffer]]
-key = "skeletal_bone_palette::handles"
-producers = []
-consumers = ["meshes_component"]
-owner = "meshes plugin (skeletal bone palette pool handles)"
-disposition = "keep: each skinned mesh's palette range, written by meshes_component; seen since the scan follows contract consts (p22)"
-target_contract = "Phase 3; .agents/PLUGIN_API_REFACTOR_PLAN.md section 14"
-test = "none: no test covers SkeletalMeshComponent yet"
-status = "unverified"
-
-[[buffer]]
-key = "skeletal_skin_vertices::handles"
-producers = []
-consumers = ["meshes_component"]
-owner = "meshes plugin (skin vertex pool handles)"
-disposition = "keep: each skinned mesh's skin stream range, written by meshes_component; seen since the scan follows contract consts (p22)"
-target_contract = "Phase 3; .agents/PLUGIN_API_REFACTOR_PLAN.md section 14"
-test = "none: no test covers SkeletalMeshComponent yet"
-status = "unverified"
-
-[[buffer]]
 key = "vg_instances"
 producers = []
-consumers = ["helio-pass-vg-bvh", "meshes_component"]
+consumers = ["helio-pass-vg", "helio-pass-vg-bvh", "meshes_component"]
 owner = "meshes plugin (virtual geometry instances; contract helio_mesh_api::VG_INSTANCE_ROWS)"
 disposition = "keep: the virtual-geometry instances, read through the meshes' contract const since p22"
 target_contract = "Phase 3; .agents/PLUGIN_API_REFACTOR_PLAN.md section 14"
 test = "plugins/installed/tests/virtual_geometry_acceptance.rs"
 status = "verified"
+
+# ── Skin cache and selection ────────────────────────────────────
+
+[[buffer]]
+key = "skin_cache"
+producers = []
+consumers = ["helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-shadow", "helio-pass-transparent", "meshes_component"]
+owner = "helio_mesh_api (contract SKIN_CACHE); written by meshes_component::skin_cache"
+disposition = "keep: every resident skinned instance's posed vertices, written by one compute pass for the instances whose pose changed; every drawer and the ray-traced scene read it. Execution data, not a second scene owner"
+target_contract = "SceneDB#84; 03-gpu-reflection-and-rendering.md"
+test = "plugins/vendor/meshes/component/tests/skin_cache.rs (the_skin_cache_poses_settles_and_skips_unchanged_poses)"
+status = "verified"
+
+[[buffer]]
+key = "skin_cache_rows"
+producers = []
+consumers = ["helio-pass-forward-lit", "helio-pass-gbuffer", "helio-pass-shadow", "helio-pass-shadow-dirty", "helio-pass-transparent", "meshes_component"]
+owner = "helio_mesh_api (contract SKIN_CACHE_ROWS); written by meshes_component::skin_cache"
+disposition = "keep: the instance table by entity row that drawers find a skinned instance's vertex range by"
+target_contract = "SceneDB#84; 03-gpu-reflection-and-rendering.md"
+test = "plugins/vendor/meshes/component/tests/skin_cache.rs (the_skin_cache_poses_settles_and_skips_unchanged_poses)"
+status = "verified"
+
+[[buffer]]
+key = "static_object_owners"
+producers = []
+consumers = ["helio-pass-gbuffer", "helio-pass-object-batch"]
+owner = "helio_mesh_api (contract STATIC_OBJECT_OWNERS); written by the meshes' scene join"
+disposition = "keep: which object each joined draw row belongs to; the selection drawers match it against object_selected, so a selection change rewrites no join row"
+target_contract = "Phase 2; 03-gpu-reflection-and-rendering.md"
+test = "plugins/installed/tests/render_acceptance.rs (a_selected_mesh_is_outlined_in_the_editor_and_the_outline_leaves_with_the_selection)"
+status = "verified"
+
+# ── Journal cursors ─────────────────────────────────────────────
+
+[[site]]
+pattern = "change-cursor"
+file = "plugins/vendor/meshes/component/src/ray_scene.rs"
+count = 11
+owner = "meshes_component::ray_scene (WorldRayScene)"
+disposition = "keep: independent cursors over the meshes, their materials, owners, visibility, hierarchy, transforms and spaces; a change re-evaluates or re-places only the meshes it touches, an overflow looks at everything"
+target_contract = "Phase 5; 04-state-notifications.md"
+test = "none: no test is known to prove this cursor's behaviour (plugins/installed/tests/ray_tier_acceptance.rs covers the ray tiers and was not run for this row)"
+status = "unverified"
+
+[[site]]
+pattern = "change-cursor"
+file = "plugins/vendor/meshes/component/src/skin_cache.rs"
+count = 2
+owner = "meshes_component::skin_cache (SkinCache)"
+disposition = "keep: an independent SkeletalMeshComponent cursor; the first frame or an overflow scans every instance"
+target_contract = "Phase 5; 04-state-notifications.md"
+test = "plugins/vendor/meshes/component/tests/skin_cache.rs (the_skin_cache_poses_settles_and_skips_unchanged_poses)"
+status = "verified"
+
+[[site]]
+pattern = "change-cursor"
+file = "plugins/vendor/meshes/component/src/virtual_geometry_host.rs"
+count = 2
+owner = "meshes_component::virtual_geometry_host (VirtualGeometryHost::follow)"
+disposition = "keep: an independent StaticMeshComponent cursor for the instances that want virtual geometry; no cursor, an overflow or another world rescans, opening the cursor first"
+target_contract = "Phase 5; 04-state-notifications.md"
+test = "none: no test is known to prove this cursor's behaviour (plugins/installed/tests/virtual_geometry_acceptance.rs covers virtual geometry and was not run for this row)"
+status = "unverified"

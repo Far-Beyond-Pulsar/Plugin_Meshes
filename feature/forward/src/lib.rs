@@ -1,7 +1,6 @@
 pub mod feature;
 pub use feature::ForwardDrawers;
 
-
 use bytemuck::{Pod, Zeroable};
 use helio_core::graph::{ResourceBuilder, ResourceSize};
 use helio_core::{PassContext, PrepareContext, RenderPass, Result as HelioResult};
@@ -330,40 +329,9 @@ impl ForwardLitPass {
                             compilation_options: Default::default(),
                             buffers: &[
                                 Some(wgpu::VertexBufferLayout {
-                                    array_stride: 40,
+                                    array_stride: helio_mesh_api::PackedVertex::STRIDE,
                                     step_mode: wgpu::VertexStepMode::Vertex,
-                                    attributes: &[
-                                        wgpu::VertexAttribute {
-                                            format: wgpu::VertexFormat::Float32x3,
-                                            offset: 0,
-                                            shader_location: 0,
-                                        },
-                                        wgpu::VertexAttribute {
-                                            format: wgpu::VertexFormat::Float32,
-                                            offset: 12,
-                                            shader_location: 1,
-                                        },
-                                        wgpu::VertexAttribute {
-                                            format: wgpu::VertexFormat::Float32x2,
-                                            offset: 16,
-                                            shader_location: 2,
-                                        },
-                                        wgpu::VertexAttribute {
-                                            format: wgpu::VertexFormat::Float32x2,
-                                            offset: 24,
-                                            shader_location: 5,
-                                        },
-                                        wgpu::VertexAttribute {
-                                            format: wgpu::VertexFormat::Uint32,
-                                            offset: 32,
-                                            shader_location: 3,
-                                        },
-                                        wgpu::VertexAttribute {
-                                            format: wgpu::VertexFormat::Uint32,
-                                            offset: 36,
-                                            shader_location: 4,
-                                        },
-                                    ],
+                                    attributes: &helio_mesh_api::PackedVertex::ATTRIBUTES,
                                 }),
                                 Some(helio_mesh_api::DRAW_SLOT_LAYOUT),
                             ],
@@ -744,8 +712,7 @@ impl RenderPass for ForwardLitPass {
                 graph_hash: 0,
                 feature_flags: if self.render_all_opaque { 1 << 31 } else { 0 },
             };
-            if let Some(pipeline) =
-                self.drawable_pipeline(&ctx.device, key, self.render_all_opaque)
+            if let Some(pipeline) = self.drawable_pipeline(&ctx.device, key, self.render_all_opaque)
             {
                 pass.set_pipeline(pipeline);
                 helio_mesh_api::multi_draw_indexed_indirect(

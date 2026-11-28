@@ -51,8 +51,8 @@ const SKIN_FRESH: u32 = 0u;
 // once.
 const SKIN_POSE: u32 = 1u;
 // `helio_mesh_api::PackedVertex` in `u32` words: position (0-2), the snorm8x4
-// normal (8) and tangent (9).
-const PACKED_VERTEX_WORDS: u32 = 10u;
+// normal (6) and tangent (7).
+const PACKED_VERTEX_WORDS: u32 = 8u;
 const LANES: u32 = 64u;
 
 @group(0) @binding(0) var<uniform> frame: SkinFrame;
@@ -92,8 +92,8 @@ fn skin(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let at = (job.mesh_vertex + i) * PACKED_VERTEX_WORDS;
     let rest = vec3<f32>(bitcast<f32>(mesh_vertices[at]), bitcast<f32>(mesh_vertices[at + 1u]), bitcast<f32>(mesh_vertices[at + 2u]));
     var position = rest;
-    var normal = unpack4x8snorm(mesh_vertices[at + 8u]).xyz;
-    var tangent = unpack4x8snorm(mesh_vertices[at + 9u]).xyz;
+    var normal = unpack4x8snorm(mesh_vertices[at + 6u]).xyz;
+    var tangent = unpack4x8snorm(mesh_vertices[at + 7u]).xyz;
     let skin = skin_vertices[job.skin_vertex + i];
     let pose = job.mode == SKIN_POSE;
     var blended = mat4x4<f32>(vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0));

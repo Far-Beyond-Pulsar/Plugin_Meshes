@@ -245,7 +245,7 @@ fn rasterize_preview(
                     -relative.dot(forward),
                     world,
                     Vec2::from_array(vertex.tex_coords0),
-                    Vec2::from_array(vertex.tex_coords1),
+                    Vec2::from_array(vertex.lightmap_uv()),
                 )
             })
             .collect();

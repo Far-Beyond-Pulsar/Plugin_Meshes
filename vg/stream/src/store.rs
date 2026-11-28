@@ -147,6 +147,7 @@ pub struct VgAssetStore {
     pending: Option<Pending>,
     content_version: u64,
     feedback_overflows: u64,
+    largest: GpuAssetHeader,
 }
 
 fn make_staging(device: &wgpu::Device, bytes: u64) -> wgpu::Buffer {
@@ -232,6 +233,7 @@ impl VgAssetStore {
             pending: None,
             content_version: 1,
             feedback_overflows: 0,
+            largest: GpuAssetHeader::default(),
         }
     }
 
@@ -248,6 +250,10 @@ impl VgAssetStore {
         self.sync_capacities();
         if let Some((nodes, refs)) = &reg.data {
             let a = self.core.asset(reg.slot).expect("registered asset");
+            let largest = &mut self.largest;
+            largest.cluster_count = largest.cluster_count.max(a.header.cluster_count);
+            largest.node_count = largest.node_count.max(a.header.node_count);
+            largest.group_count = largest.group_count.max(a.header.group_count);
             self.queue.write_buffer(
                 &self.nodes.buffer,
                 u64::from(reg.nodes.start) * 96,
@@ -322,6 +328,13 @@ impl VgAssetStore {
     /// Bytes of the page pool the asset holds (its resident pages).
     pub fn resident_page_bytes(&self, handle: VgAssetHandle) -> u64 {
         u64::from(self.core.resident_pages(handle.0)) * u64::from(PAGE_BYTES)
+    }
+
+    /// The most clusters, nodes and groups any asset registered so far has,
+    /// each on its own (the other fields are zero): what bounds the work of an
+    /// instance whose asset only the GPU knows. It never goes down.
+    pub fn largest_asset(&self) -> GpuAssetHeader {
+        self.largest
     }
 
     pub fn header(&self, handle: VgAssetHandle) -> Option<GpuAssetHeader> {

@@ -398,22 +398,17 @@ impl ShadowPass {
                     module: &shader,
                     entry_point: Some("vs_main"),
                     compilation_options: Default::default(),
-                    // Shared mesh vertex buffer layout (stride = 40 bytes, matches GBuffer pass).
-                    // Only position (Float32x3 at offset 0) is needed for depth projection.
+                    // The shared mesh vertex pool (`PackedVertex`), as the GBuffer pass binds it.
+                    // Position for depth projection, UV0 for cutouts.
                     buffers: &[
                         Some(wgpu::VertexBufferLayout {
-                            array_stride: 40,
+                            array_stride: helio_mesh_api::PackedVertex::STRIDE,
                             step_mode: wgpu::VertexStepMode::Vertex,
                             attributes: &[
+                                helio_mesh_api::PackedVertex::POSITION,
                                 wgpu::VertexAttribute {
-                                    format: wgpu::VertexFormat::Float32x3,
-                                    offset: 0,
-                                    shader_location: 0,
-                                },
-                                wgpu::VertexAttribute {
-                                    format: wgpu::VertexFormat::Float32x2,
-                                    offset: 16,
                                     shader_location: 1,
+                                    ..helio_mesh_api::PackedVertex::UV0
                                 },
                             ],
                         }),
@@ -566,11 +561,13 @@ impl ShadowPass {
             device,
             wgpu::ComputePipelineDescriptor {
                 label: Some("Shadow/Retire Pipeline"),
-                layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Shadow/Retire PL"),
-                    bind_group_layouts: &[Some(&retire_layout)],
-                    immediate_size: 0,
-                })),
+                layout: Some(
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Shadow/Retire PL"),
+                        bind_group_layouts: &[Some(&retire_layout)],
+                        immediate_size: 0,
+                    }),
+                ),
                 module: &retire_shader,
                 entry_point: Some("retire"),
                 compilation_options: Default::default(),
@@ -1061,9 +1058,7 @@ impl RenderPass for ShadowPass {
         // this frame's changes and before the faces serviced below clear
         // theirs: what the next frames' selection reads (one copy in flight).
         if self.dirty_readback.is_none() {
-            let buffer = self
-                .readbacks
-                .get(ctx.device, MAX_SHADOW_FACES as u64 * 4);
+            let buffer = self.readbacks.get(ctx.device, MAX_SHADOW_FACES as u64 * 4);
             cmds.copy_buffer_to_buffer(
                 &self.face_dirty_buf,
                 0,
@@ -1123,7 +1118,11 @@ impl RenderPass for ShadowPass {
                     multiview_mask: None,
                 });
                 if serviced > 0 {
-                    let first = if is_static { 0 } else { serviced * PAGES_PER_FACE };
+                    let first = if is_static {
+                        0
+                    } else {
+                        serviced * PAGES_PER_FACE
+                    };
                     pass.set_pipeline(&self.depth_clear_pipeline);
                     pass.set_bind_group(0, &self.clear_group, &[]);
                     pass.draw(0..6, first..first + serviced * PAGES_PER_FACE);
@@ -1140,7 +1139,11 @@ impl RenderPass for ShadowPass {
                         } else {
                             batch.shadow_movable_indirect
                         };
-                        let counts_region = if is_static { STATIC_COUNTS } else { MOVABLE_COUNTS };
+                        let counts_region = if is_static {
+                            STATIC_COUNTS
+                        } else {
+                            MOVABLE_COUNTS
+                        };
                         pass.set_pipeline(&self.pipeline);
                         pass.set_bind_group(1, self.depth_materials.group.as_ref().unwrap(), &[]);
                         pass.set_vertex_buffer(0, vertices.buffer.slice(..));
@@ -1252,8 +1255,8 @@ impl RenderPass for ShadowPass {
             self.scratch.retire = retire;
             let key = [desired.clone(), data.shadow_matrices.clone()];
             if self.retire_group_key.as_ref() != Some(&key) {
-                self.retire_group = Some(ctx.device.create_bind_group(
-                    &wgpu::BindGroupDescriptor {
+                self.retire_group =
+                    Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("Shadow/Retire group"),
                         layout: &self.retire_layout,
                         entries: &[
@@ -1282,8 +1285,7 @@ impl RenderPass for ShadowPass {
                                 resource: self.face_geom_count_buf.as_entire_binding(),
                             },
                         ],
-                    },
-                ));
+                    }));
                 self.retire_group_key = Some(key);
             }
             ctx.begin_gpu_scope(&mut cmds, "Shadow: activate faces");

@@ -584,7 +584,7 @@ fn merge_sectioned(name: String, subs: &[&ConvertedMesh]) -> ConvertedSectionedM
                 norm.into(),
                 v.tex_coords0,
                 tan.into(),
-                v.bitangent_sign * handedness_sign,
+                v.bitangent_sign() * handedness_sign,
             );
             mv.tex_coords1 = v.tex_coords1;
             group_verts[bucket].push(mv);

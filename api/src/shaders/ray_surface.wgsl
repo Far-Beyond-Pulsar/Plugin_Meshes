@@ -17,9 +17,10 @@
 // octahedral normal (3, `scene_pack_unit`: the reader has `frame_ray_stream`),
 // the octahedral tangent (7).
 const SKINNED_VERTEX_WORDS: u32 = 8u;
-// `helio_mesh_api::PackedVertex` in `u32` words: position (words 0-2), the
-// bitangent's sign (3), UV0 (4-5), the snorm8x4 normal (8) and tangent (9).
-const MESH_VERTEX_WORDS: u32 = 10u;
+// `helio_mesh_api::PackedVertex` in `u32` words: position (words 0-2), UV0
+// (3-4), UV1 (5, unorm16x2), the snorm8x4 normal (6) and tangent (7), whose
+// w is the bitangent's sign.
+const MESH_VERTEX_WORDS: u32 = 8u;
 // A proxy pool vertex in floats (`helio_mesh_api::RAY_PROXY_VERTEX_BYTES`):
 // position, then UV0.
 const RAY_PROXY_FLOATS: u32 = 5u;
@@ -30,20 +31,20 @@ fn mesh_vertex_position(v: u32) -> vec3<f32> {
 }
 
 fn mesh_vertex_uv(v: u32) -> vec2<f32> {
-    let at = v * MESH_VERTEX_WORDS + 4u;
+    let at = v * MESH_VERTEX_WORDS + 3u;
     return vec2<f32>(bitcast<f32>(vertices[at]), bitcast<f32>(vertices[at + 1u]));
 }
 
 fn mesh_vertex_normal(v: u32) -> vec3<f32> {
-    return unpack4x8snorm(vertices[v * MESH_VERTEX_WORDS + 8u]).xyz;
+    return unpack4x8snorm(vertices[v * MESH_VERTEX_WORDS + 6u]).xyz;
 }
 
 fn mesh_vertex_tangent(v: u32) -> vec3<f32> {
-    return unpack4x8snorm(vertices[v * MESH_VERTEX_WORDS + 9u]).xyz;
+    return unpack4x8snorm(vertices[v * MESH_VERTEX_WORDS + 7u]).xyz;
 }
 
 fn mesh_vertex_bitangent_sign(v: u32) -> f32 {
-    return bitcast<f32>(vertices[v * MESH_VERTEX_WORDS + 3u]);
+    return unpack4x8snorm(vertices[v * MESH_VERTEX_WORDS + 7u]).w;
 }
 
 fn skinned_vertex_position(v: u32) -> vec3<f32> {

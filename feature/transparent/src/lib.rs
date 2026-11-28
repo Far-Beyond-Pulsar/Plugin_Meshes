@@ -1160,40 +1160,9 @@ impl TransparentPass {
                             compilation_options: Default::default(),
                             buffers: &[
                                 Some(wgpu::VertexBufferLayout {
-                                    array_stride: 40,
+                                    array_stride: helio_mesh_api::PackedVertex::STRIDE,
                                     step_mode: wgpu::VertexStepMode::Vertex,
-                                    attributes: &[
-                                        wgpu::VertexAttribute {
-                                            format: wgpu::VertexFormat::Float32x3,
-                                            offset: 0,
-                                            shader_location: 0,
-                                        },
-                                        wgpu::VertexAttribute {
-                                            format: wgpu::VertexFormat::Float32,
-                                            offset: 12,
-                                            shader_location: 1,
-                                        },
-                                        wgpu::VertexAttribute {
-                                            format: wgpu::VertexFormat::Float32x2,
-                                            offset: 16,
-                                            shader_location: 2,
-                                        },
-                                        wgpu::VertexAttribute {
-                                            format: wgpu::VertexFormat::Float32x2,
-                                            offset: 24,
-                                            shader_location: 5,
-                                        },
-                                        wgpu::VertexAttribute {
-                                            format: wgpu::VertexFormat::Uint32,
-                                            offset: 32,
-                                            shader_location: 3,
-                                        },
-                                        wgpu::VertexAttribute {
-                                            format: wgpu::VertexFormat::Uint32,
-                                            offset: 36,
-                                            shader_location: 4,
-                                        },
-                                    ],
+                                    attributes: &helio_mesh_api::PackedVertex::ATTRIBUTES,
                                 }),
                                 Some(helio_mesh_api::DRAW_SLOT_LAYOUT),
                             ],

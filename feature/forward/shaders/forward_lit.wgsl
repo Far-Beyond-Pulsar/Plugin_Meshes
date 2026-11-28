@@ -52,7 +52,6 @@ struct Globals {
 
 struct Vertex {
     @location(0) position:       vec3<f32>,
-    @location(1) bitangent_sign: f32,
     @location(2) tex_coords:     vec2<f32>,
     @location(3) normal:         u32,
     @location(4) tangent:        u32,
@@ -102,7 +101,7 @@ fn vs_main(v: Vertex, @location(15) slot: u32, @builtin(vertex_index) vertex_ind
     out.world_position = world_pos.xyz;
     out.world_normal   = normalize(normal_mat  * local_normal);
     out.world_tangent  = normalize(model_mat3  * local_tangent);
-    out.bitangent_sign = v.bitangent_sign;
+    out.bitangent_sign = unpack4x8snorm(v.tangent).w;
     out.tex_coords     = v.tex_coords;
     out.material_id    = inst.material_id;
     return out;

@@ -13,8 +13,8 @@ use helio_core::{CommandRecorder, GpuCameraUniforms};
 use helio_pass_vg_bvh::gpu_types::{GpuBvhHeader, GpuBvhNode, NODE_LEAF_BIT};
 use helio_pass_vg_cull::reference::{choose_bin, select_clusters, RefInstance, RefView};
 use helio_pass_vg_cull::{
-    state, stats, TileValve, TileValveSample, VgCullConfig, VgCullCore, VgCullFrame,
-    VgCullInputs, BIN_COUNT, TILE_WORDS,
+    state, stats, TileValve, TileValveSample, VgCullConfig, VgCullCore, VgCullDemand, VgCullFrame,
+    VgCullInputs, BIN_COUNT, MAX_BIN_CAPACITY, QUEUE_DEMAND_CEILING, TILE_WORDS,
 };
 use helio_vg_format::*;
 use helio_vg_stream::feedback::{self, FeedbackLayout};
@@ -165,6 +165,7 @@ impl Resources {
             dense_mask: None,
             materials: self.materials.as_ref(),
             instance_count: self.instance_count,
+            demand: VgCullDemand::default(),
             dense_tiles: [1, 1],
             remaps: None,
         }
@@ -430,6 +431,11 @@ fn run_phase(g: &Gpu, core: &mut VgCullCore, r: &Resources, phase: u32) {
 }
 
 fn begin(g: &Gpu, core: &mut VgCullCore, r: &Resources) {
+    begin_with(g, core, r, VgCullDemand::default());
+}
+
+/// [`begin`] for a frame that names what it can ask of the cull.
+fn begin_with(g: &Gpu, core: &mut VgCullCore, r: &Resources, demand: VgCullDemand) {
     core.begin_frame(
         &g.device,
         &g.queue,
@@ -437,7 +443,10 @@ fn begin(g: &Gpu, core: &mut VgCullCore, r: &Resources) {
             width: W,
             height: H,
         },
-        &r.inputs(),
+        &VgCullInputs {
+            demand,
+            ..r.inputs()
+        },
     );
 }
 
@@ -1721,7 +1730,11 @@ fn the_tile_valve_readback_samples_every_watched_frame_as_the_valve_steps() {
     frame_at(&g, &mut core, &r, eye);
     assert!(core.tile_valve_samples_blocking(&g.device).is_empty());
     let frames: Vec<u64> = samples.iter().map(|s| s.frame).collect();
-    assert_eq!(frames, (3..3 + WATCHED).collect::<Vec<_>>(), "missing or out-of-order frames");
+    assert_eq!(
+        frames,
+        (3..3 + WATCHED).collect::<Vec<_>>(),
+        "missing or out-of-order frames"
+    );
 
     let tiles = core.buffers().tiles;
     for pair in samples.windows(2) {
@@ -1741,18 +1754,35 @@ fn the_tile_valve_readback_samples_every_watched_frame_as_the_valve_steps() {
     }
     let last = samples.last().unwrap();
     let peak = last.valve.iter().map(|t| t.scale).fold(1.0f32, f32::max);
-    assert!(peak > 1.5 && peak <= TILE_SCALE_MAX, "the stack did not engage the valve: {peak}");
+    assert!(
+        peak > 1.5 && peak <= TILE_SCALE_MAX,
+        "the stack did not engage the valve: {peak}"
+    );
 }
 
 /// One valve step on the GPU with a test-written estimate: tile `tile` gets
 /// `density` triangles per covered pixel (a full tile), every other tile none,
 /// and nothing is drawn (no instances), so `cs_tiles` steps from exactly that.
 /// Returns the tile's valve after the frame.
-fn valve_frame(g: &Gpu, core: &mut VgCullCore, r: &Resources, tile: u32, density: f32) -> TileValve {
+fn valve_frame(
+    g: &Gpu,
+    core: &mut VgCullCore,
+    r: &Resources,
+    tile: u32,
+    density: f32,
+) -> TileValve {
     use helio_pass_vg_cull::{tile_word, TILE_FIXED, TILE_PIXELS};
     let mut inputs = r.inputs();
     inputs.instance_count = 0;
-    core.begin_frame(&g.device, &g.queue, &VgCullFrame { width: W, height: H }, &inputs);
+    core.begin_frame(
+        &g.device,
+        &g.queue,
+        &VgCullFrame {
+            width: W,
+            height: H,
+        },
+        &inputs,
+    );
     let b = core.buffers().clone();
     let word = |w: u32| u64::from(b.tile_base() + tile * TILE_WORDS + w) * 4;
     let fixed = |v: f32| (v * TILE_FIXED).round() as u32;
@@ -1796,23 +1826,24 @@ fn the_valve_parks_at_a_cliff_in_the_cut_and_settles() {
     const TILE: u32 = 5;
     // Runs `frames` frames of `plant` (density from the scale the frame's cut
     // used), checking each step against the reference; returns the scales.
-    let run = |core: &mut VgCullCore, prev: &mut TileValve, frames: usize, plant: &dyn Fn(f32) -> f32| {
-        let mut scales = Vec::new();
-        for _ in 0..frames {
-            let d = plant(prev.scale);
-            let got = valve_frame(&g, core, &r, TILE, d);
-            let want = tile_valve_step(prev, d, limit);
-            assert!(
-                (got.scale - want.scale).abs() <= want.scale * 1e-5
-                    && (got.park - want.park).abs() <= want.park * 1e-4
-                    && got.step == want.step,
-                "GPU {got:?} vs reference {want:?} after {prev:?} at density {d}"
-            );
-            *prev = got;
-            scales.push(got.scale);
-        }
-        scales
-    };
+    let run =
+        |core: &mut VgCullCore, prev: &mut TileValve, frames: usize, plant: &dyn Fn(f32) -> f32| {
+            let mut scales = Vec::new();
+            for _ in 0..frames {
+                let d = plant(prev.scale);
+                let got = valve_frame(&g, core, &r, TILE, d);
+                let want = tile_valve_step(prev, d, limit);
+                assert!(
+                    (got.scale - want.scale).abs() <= want.scale * 1e-5
+                        && (got.park - want.park).abs() <= want.park * 1e-4
+                        && got.step == want.step,
+                    "GPU {got:?} vs reference {want:?} after {prev:?} at density {d}"
+                );
+                *prev = got;
+                scales.push(got.scale);
+            }
+            scales
+        };
     let reversals = |scales: &[f32]| {
         let dirs: Vec<i32> = scales
             .windows(2)
@@ -1826,11 +1857,21 @@ fn the_valve_parks_at_a_cliff_in_the_cut_and_settles() {
     // upper edge, 20), coarser 8.6 (under its lower edge, 12.8).
     let cliff = |g: f32| if g < 25.5 { 20.5 } else { 8.6 };
     let mut core = VgCullCore::new(&g.device, config.clone());
-    let mut prev = TileValve { scale: 1.0, ..Default::default() };
+    let mut prev = TileValve {
+        scale: 1.0,
+        ..Default::default()
+    };
     let scales = run(&mut core, &mut prev, 120, &cliff);
     let tail = &scales[60..];
-    assert_eq!(reversals(tail), 0, "the valve cycles at the cliff: {tail:?}");
-    assert!(prev.park > 0.0 && prev.scale >= 25.5, "not parked on the coarse side: {prev:?}");
+    assert_eq!(
+        reversals(tail),
+        0,
+        "the valve cycles at the cliff: {tail:?}"
+    );
+    assert!(
+        prev.park > 0.0 && prev.scale >= 25.5,
+        "not parked on the coarse side: {prev:?}"
+    );
 
     // The content changes (the camera moved, the tile got cheap): the park is
     // released and the tile relaxes.
@@ -1842,9 +1883,16 @@ fn the_valve_parks_at_a_cliff_in_the_cut_and_settles() {
     // A continuous density (here ~ g^-1.5) never parks: it settles in the band.
     let smooth = |g: f32| 400.0 * g.powf(-1.5);
     let mut core = VgCullCore::new(&g.device, config);
-    let mut prev = TileValve { scale: 1.0, ..Default::default() };
+    let mut prev = TileValve {
+        scale: 1.0,
+        ..Default::default()
+    };
     let scales = run(&mut core, &mut prev, 120, &smooth);
-    assert_eq!(reversals(&scales), 0, "a smooth density oscillated: {scales:?}");
+    assert_eq!(
+        reversals(&scales),
+        0,
+        "a smooth density oscillated: {scales:?}"
+    );
     let d = smooth(prev.scale);
     assert!(
         (limit / 1.25..=limit * 1.25).contains(&d) && prev.park == 0.0,
@@ -2065,7 +2113,10 @@ fn dense_tiles_are_coarsened_like_any_other() {
         plain * 10 < triangles(&open_out.items) * 9,
         "the stack was not coarsened, so the test proves nothing"
     );
-    assert_eq!(dense, plain, "the dense tiles were not coarsened like the others");
+    assert_eq!(
+        dense, plain,
+        "the dense tiles were not coarsened like the others"
+    );
     assert_eq!(dense_scales, plain_scales);
     assert!(hot.iter().all(|&t| dense_scales[t as usize] > 1.0));
 }
@@ -2160,4 +2211,82 @@ fn the_tile_estimate_leaves_out_clusters_wider_than_the_limit() {
     println!("frames with small clusters: {counted} (mixed with large: {mixed}), only large: {all_large}");
     assert!(counted > 0, "no frame had clusters within the limit");
     assert!(all_large > 0, "no frame had only large clusters");
+}
+
+#[test]
+fn a_frame_that_names_its_demand_grows_ahead_of_it_and_loses_nothing() {
+    let Some(g) = gpu() else {
+        return;
+    };
+    let s = scene(false);
+    let r = upload(&g, &s);
+    let mut core = VgCullCore::new(
+        &g.device,
+        VgCullConfig {
+            two_phase_occlusion: false,
+            initial_bin_capacity: 16,
+            initial_queue_capacity: 256,
+            tau_px: 0.01,
+            ..Default::default()
+        },
+    );
+    let v = set_camera(&g, &r, [31.0, 0.0, 400.0]);
+    let (want, _) = expected(&s, &v, 0.01, VgMode::Auto);
+    assert!(want.len() > 16, "the starting bins cannot hold the view");
+    // The first frame also sizes the tile block for the screen.
+    begin(&g, &mut core, &r);
+    let state = core.buffers().state.clone();
+    let demand = VgCullDemand {
+        clusters: want.len() as u64,
+        jobs: 5000,
+    };
+    begin_with(&g, &mut core, &r, demand);
+    assert!(core.buffers().bin_capacity as usize >= want.len());
+    assert_eq!(core.buffers().queue_capacity, 8192);
+    assert_eq!(core.buffers().state, state, "the history is kept");
+    run_phase(&g, &mut core, &r, 0);
+    let (out, _) = collect(&g, &core, &r, 0);
+    assert_eq!(
+        out.state[(state::STATS + stats::VISIBLE_OVERFLOW) as usize],
+        0
+    );
+    assert_eq!(out.items, want, "the first frame already has all of it");
+
+    // A smaller frame keeps what it has; a larger one stops at the ceiling.
+    let grown = core.buffers().clone();
+    begin_with(&g, &mut core, &r, VgCullDemand::default());
+    assert_eq!(core.buffers().visible, grown.visible);
+    begin_with(
+        &g,
+        &mut core,
+        &r,
+        VgCullDemand {
+            clusters: u64::MAX,
+            jobs: u64::MAX,
+        },
+    );
+    assert_eq!(core.buffers().bin_capacity, MAX_BIN_CAPACITY);
+    assert_eq!(core.buffers().queue_capacity, QUEUE_DEMAND_CEILING);
+}
+
+#[test]
+fn demand_follows_the_instances_and_the_largest_asset() {
+    let largest = helio_vg_format::GpuAssetHeader {
+        cluster_count: 100,
+        node_count: 10,
+        group_count: 20,
+        ..Default::default()
+    };
+    assert_eq!(
+        VgCullDemand::for_instances(4, largest),
+        VgCullDemand {
+            clusters: 400,
+            jobs: 4 * 133,
+        }
+    );
+    assert_eq!(
+        VgCullDemand::for_instances(4, Default::default()),
+        VgCullDemand::default(),
+        "no asset, nothing to draw"
+    );
 }

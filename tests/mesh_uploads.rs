@@ -46,7 +46,7 @@ fn gpu_mesh_upload_preserves_uv0_uv1_normals_and_stride() {
                 [1.0, 0.0, 0.0],
                 -1.0,
             );
-            v.tex_coords1 = [0.125, i as f32 * 0.5];
+            v.set_lightmap_uv([0.125, i as f32 * 0.25]);
             v
         })
         .collect();
@@ -65,27 +65,27 @@ fn gpu_mesh_upload_preserves_uv0_uv1_normals_and_stride() {
         .unwrap()
         .underlying()
         .clone();
-    assert_eq!(std::mem::size_of::<helio_mesh_api::PackedVertex>(), 40);
+    assert_eq!(std::mem::size_of::<helio_mesh_api::PackedVertex>(), 32);
     assert_eq!(
         std::mem::offset_of!(helio_mesh_api::PackedVertex, tex_coords0),
-        16
+        12
     );
     assert_eq!(
         std::mem::offset_of!(helio_mesh_api::PackedVertex, tex_coords1),
-        24
+        20
     );
     assert_eq!(
         std::mem::offset_of!(helio_mesh_api::PackedVertex, normal),
-        32
+        24
     );
     let staging = context.device().create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 120,
+        size: 96,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
     let mut encoder = context.device().create_command_encoder(&Default::default());
-    pool.with_buffer(&mut |b| encoder.copy_buffer_to_buffer(b, 0, &staging, 0, 120));
+    pool.with_buffer(&mut |b| encoder.copy_buffer_to_buffer(b, 0, &staging, 0, 96));
     context.queue().submit([encoder.finish()]);
     staging
         .slice(..)
@@ -104,13 +104,11 @@ fn fbx_import_and_native_cache_preserve_uvs_normals_and_sections() {
         .join("../../../assets/meshes/primitives/SM_Cube.fbx");
     let asset = meshes_component::mesh_files::load_mesh_asset_upload(&path).expect("bundled FBX");
     assert!(!asset.sections.is_empty());
-    assert!(
-        asset
-            .geometry
-            .vertices
-            .iter()
-            .any(|v| v.tex_coords0 != asset.geometry.vertices[0].tex_coords0)
-    );
+    assert!(asset
+        .geometry
+        .vertices
+        .iter()
+        .any(|v| v.tex_coords0 != asset.geometry.vertices[0].tex_coords0));
     assert!(asset.geometry.vertices.iter().all(|v| v.normal != 0));
     let bytes = meshes_component::mesh_cache::encode_asset(&asset, 123);
     let (decoded, id) = meshes_component::mesh_cache::decode_asset(&bytes).unwrap();
@@ -163,11 +161,9 @@ fn inspect_local_mesh_uvs_and_sections() {
         assert_eq!(min, [0.0; 2]);
         assert_eq!(max, [0.0; 2]);
     }
-    assert!(
-        asset
-            .geometry
-            .indices
-            .iter()
-            .all(|i| (*i as usize) < vertices.len())
-    );
+    assert!(asset
+        .geometry
+        .indices
+        .iter()
+        .all(|i| (*i as usize) < vertices.len()));
 }

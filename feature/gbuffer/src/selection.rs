@@ -295,14 +295,9 @@ impl SelectionMaskPass {
                     compilation_options: Default::default(),
                     buffers: &[
                         Some(wgpu::VertexBufferLayout {
-                            array_stride: std::mem::size_of::<helio_mesh_api::PackedVertex>()
-                                as u64,
+                            array_stride: helio_mesh_api::PackedVertex::STRIDE,
                             step_mode: wgpu::VertexStepMode::Vertex,
-                            attributes: &[wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x3,
-                                offset: 0,
-                                shader_location: 0,
-                            }],
+                            attributes: &[helio_mesh_api::PackedVertex::POSITION],
                         }),
                         Some(DRAW_SLOT_LAYOUT),
                     ],

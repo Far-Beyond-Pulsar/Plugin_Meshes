@@ -190,9 +190,25 @@ fn tlas_transform(m: Mat4) -> [f32; 12] {
     std::array::from_fn(|i| r[i])
 }
 
+/// Words of a mesh pool vertex.
+const VERTEX_WORDS: usize = std::mem::size_of::<helio_mesh_api::PackedVertex>() / 4;
+
+/// A mesh pool vertex with a positive bitangent sign and these packed normal
+/// and tangent words, as the pool holds it.
+fn vertex_words(position: Vec3, uv: [f32; 2], normal: u32, tangent: u32) -> [u32; VERTEX_WORDS] {
+    let mut vertex = helio_mesh_api::PackedVertex {
+        position: position.to_array(),
+        tex_coords0: uv,
+        normal,
+        tangent,
+        ..Default::default()
+    };
+    vertex.set_bitangent_sign(1.0);
+    bytemuck::cast(vertex)
+}
+
 fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
-    // `PackedVertex` rows: position, bitangent sign, two UVs, normal, tangent;
-    // the proxy pool: position, UV.
+    // The mesh pool in words; the proxy pool: position, UV.
     let mut vertices = Vec::<u32>::new();
     let mut indices = Vec::<u32>::new();
     let mut proxy_vertices = Vec::<f32>::new();
@@ -212,20 +228,14 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
             proxy_indices.extend_from_slice(&QUAD_INDICES);
             at
         } else {
-            let at = (indices.len() as u32, (vertices.len() / 10) as u32);
+            let at = (indices.len() as u32, (vertices.len() / VERTEX_WORDS) as u32);
             for (p, [s, t]) in q.corners().into_iter().zip(uvs) {
-                vertices.extend_from_slice(&[
-                    p.x.to_bits(),
-                    p.y.to_bits(),
-                    p.z.to_bits(),
-                    1f32.to_bits(),
-                    f32::to_bits(s),
-                    f32::to_bits(t),
-                    0,
-                    0,
+                vertices.extend_from_slice(&vertex_words(
+                    p,
+                    [s, t],
                     q.normal.map_or(0, snorm8),
                     snorm8(q.u.normalize()),
-                ]);
+                ));
             }
             indices.extend_from_slice(&QUAD_INDICES);
             at
@@ -247,7 +257,7 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
         );
     }
     // Never-empty pools (a binding each).
-    vertices.resize(vertices.len().max(10), 0);
+    vertices.resize(vertices.len().max(VERTEX_WORDS), 0);
     indices.resize(indices.len().max(4), 0);
     let usage =
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::COPY_DST;
@@ -304,7 +314,11 @@ fn scene(gpu: &Gpu, quads: &[Quad]) -> Scene {
         let opaque = row.flags & RAY_INSTANCE_MASKED == 0 && q.transmission == Vec3::ZERO;
         let (vertices, indices, stride) = match &proxies {
             Some((v, i)) if q.proxy() => (v, i, 20),
-            _ => (&vertex_buffer, &index_buffer, 40),
+            _ => (
+                &vertex_buffer,
+                &index_buffer,
+                helio_mesh_api::PackedVertex::STRIDE,
+            ),
         };
         blas.build(
             k as u64,
@@ -1449,18 +1463,7 @@ fn a_skinned_instance_is_traced_where_its_pose_puts_it() {
         .iter()
         .zip([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0f32]])
     {
-        vertices.extend_from_slice(&[
-            p.x.to_bits(),
-            p.y.to_bits(),
-            p.z.to_bits(),
-            1f32.to_bits(),
-            s.to_bits(),
-            t.to_bits(),
-            0,
-            0,
-            snorm8(Vec3::Z),
-            0,
-        ]);
+        vertices.extend_from_slice(&vertex_words(*p, [s, t], snorm8(Vec3::Z), 0));
     }
     let usage =
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::COPY_DST;
@@ -2651,7 +2654,10 @@ mod graph {
         // A texture store: the materials' table the drawers and the hit
         // programs sample.
         let textures = Arc::new(std::sync::RwLock::new(
-            pulsar_scenedb::gpu::TextureStore::new(16),
+            pulsar_scenedb::gpu::TextureStore::with_reserved_slots(
+                16,
+                helio_core::TEXTURE_TABLE_RESERVED_SLOTS,
+            ),
         ));
         scene_db.world.attach_gpu_mirror(
             pulsar_scenedb::gpu::GpuMirrorHandle::new(Arc::new(store), queue.clone())
